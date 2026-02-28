@@ -2,5 +2,7 @@ setuptools>=82.0.0
 wheel
 Flask==2.2.5
 Flask-SQLAlchemy==3.0.3
+Flask-SocketIO==6.7.2
 gunicorn==25.1.0
 requests==2.31.0
+eventlet==0.33.3   # optional but recommended for WebSockets
