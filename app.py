@@ -522,40 +522,74 @@ ADMIN_LOGIN_HTML = """
 </html>
 """
 
+# Enhanced friendly admin UI: search/filter + leaflet map + live-updating device detail
 FRIENDLY_HTML = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>Beacon Admin — Devices</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-sA+qH6t3n0lI3lJ5uJ6a2h5Gxv4nDAn3vYkP7kGQm0A=" crossorigin=""/>
   <style>
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 12px; }
+    .topbar { display:flex; gap:12px; align-items:center; margin-bottom:10px; }
+    .controls { display:flex; gap:8px; align-items:center; }
+    input[type="search"] { padding:6px; border-radius:6px; border:1px solid #ccc; width:320px; }
     table { border-collapse: collapse; width: 100%; margin-top: 12px; }
-    th, td { border: 1px solid #ddd; padding: 8px; }
+    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: middle; }
     th { background: #f6f6f6; text-align: left; }
     .muted { color: #666; font-size: 0.9em; }
-    .controls { margin-bottom: 10px; }
     .btn { padding: 6px 10px; border-radius: 6px; cursor: pointer; border: 1px solid #ccc; background: #fff; }
+    #panel { display:flex; gap:12px; margin-top: 12px; }
+    #map { height: 360px; width: 60%; border: 1px solid #ddd; border-radius:6px; }
+    #detail { width: 40%; max-height: 360px; overflow:auto; border:1px solid #eee; padding:8px; border-radius:6px; background:#fafafa; }
+    pre { background:#fff; padding:8px; border-radius:6px; overflow:auto; }
   </style>
 </head>
 <body>
   <h2>Beacon — Admin Console</h2>
-  <div class="controls">
-    <button id="btnRefresh" class="btn">Refresh</button>
-    <button id="btnLogout" class="btn">Logout</button>
-    <span class="muted">Connected via socket: <span id="connectedCount">0</span></span>
+  <div class="topbar">
+    <div class="controls">
+      <button id="btnRefresh" class="btn">Refresh</button>
+      <button id="btnLogout" class="btn">Logout</button>
+      <span class="muted">Connected via socket: <span id="connectedCount">0</span></span>
+    </div>
+    <div style="flex:1"></div>
+    <div>
+      <input id="search" type="search" placeholder="Search by owner, car, plate, or device id">
+    </div>
   </div>
 
   <table id="devicesTbl">
     <thead><tr>
-      <th>Device ID</th><th>Owner</th><th>Car</th><th>Plate</th><th>Last seen</th><th>Location</th><th>Speed</th><th>Socket</th><th>Actions</th>
+      <th style="width:240px">Device ID / Owner</th><th>Car</th><th>Plate</th><th>Last seen</th><th>Location</th><th>Speed</th><th>Socket</th><th>Actions</th>
     </tr></thead>
     <tbody></tbody>
   </table>
 
-  <div id="detail" style="margin-top:12px;"></div>
+  <div id="panel">
+    <div id="map"></div>
+    <div id="detail"><em>Select a device to view details & live position.</em></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-o9N1j8wE5fhb3aC9t1gqgk4FpaNqB1h4Gxv7m2b0v4g=" crossorigin=""></script>
 
   <script>
+    let devicesCache = [];
+    let selectedDeviceId = null;
+    let detailRefreshTimer = null;
+
+    // init map
+    const map = L.map('map', { center: [0,0], zoom: 2 });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+    let marker = null;
+    let accuracyCircle = null;
+
     async function fetchDevices(){
       const res = await fetch('/admin/devices');
       if (!res.ok) {
@@ -564,20 +598,38 @@ FRIENDLY_HTML = """
         return;
       }
       const data = await res.json();
+      devicesCache = data.devices || [];
+      renderTable(devicesCache);
+      const connected = devicesCache.filter(d => d.connected).length;
+      document.getElementById('connectedCount').innerText = connected;
+    }
+
+    function renderTable(list){
       const tbody = document.querySelector('#devicesTbl tbody');
       tbody.innerHTML = '';
-      let connected = 0;
-      for (const d of data.devices){
+      const q = (document.getElementById('search').value || '').toLowerCase().trim();
+      for (const d of list){
+        // filter by search
+        const owner = (d.owner || '').toLowerCase();
+        const car = ((d.car_name||'') + ' ' + (d.car_model||'')).toLowerCase();
+        const plate = (d.plate||'').toLowerCase();
+        const id = (d.id||'').toLowerCase();
+        if (q) {
+          if (!(owner.includes(q) || car.includes(q) || plate.includes(q) || id.includes(q))) continue;
+        }
+
         const tr = document.createElement('tr');
         const last = d.last_snapshot ? new Date(d.last_snapshot.ts).toLocaleString() : '—';
         const lat = d.last_snapshot ? d.last_snapshot.lat.toFixed(6) : null;
         const lon = d.last_snapshot ? d.last_snapshot.lon.toFixed(6) : null;
         const speed = d.last_snapshot ? ( (d.last_snapshot.speed_mps || 0) * 3.6 ).toFixed(1) + ' km/h' : '—';
         const socketStatus = d.connected ? 'yes' : 'no';
-        if (d.connected) connected++;
+
         tr.innerHTML = `
-          <td><code style="font-size:0.85em;">${d.id}</code></td>
-          <td>${d.owner || '—'}</td>
+          <td>
+            <div style="font-size:0.85em;"><code>${d.id}</code></div>
+            <div class="muted">${d.owner || '—'}</div>
+          </td>
           <td>${d.car_name || '—'}${d.car_model ? ' / ' + d.car_model : ''}</td>
           <td>${d.plate || '—'}</td>
           <td>${last}</td>
@@ -591,15 +643,40 @@ FRIENDLY_HTML = """
         `;
         tbody.appendChild(tr);
       }
-      document.getElementById('connectedCount').innerText = connected;
     }
 
+    document.getElementById('search').addEventListener('input', () => renderTable(devicesCache));
+    document.getElementById('btnRefresh').addEventListener('click', fetchDevices);
+    document.getElementById('btnLogout').addEventListener('click', () => { window.location = '/admin/logout'; });
+
     async function showDetails(id){
+      selectedDeviceId = id;
+      // clear previous timer
+      if (detailRefreshTimer) { clearInterval(detailRefreshTimer); detailRefreshTimer = null; }
+      await loadDeviceDetailsOnce(id);
+      // start live refresh every 3s for the detail panel & map
+      detailRefreshTimer = setInterval(() => loadDeviceDetailsOnce(id), 3000);
+    }
+
+    async function loadDeviceDetailsOnce(id){
       const res = await fetch('/admin/device/' + id + '/json');
-      if (!res.ok) { alert('Failed to fetch device'); return; }
+      if (!res.ok) { if (res.status === 401) window.location='/admin/login'; return; }
       const d = await res.json();
-      const el = document.getElementById('detail');
+      renderDetailPanel(d);
+      // update marker
+      if (d.last_snapshot) {
+        const lat = d.last_snapshot.lat;
+        const lon = d.last_snapshot.lon;
+        const speed = (d.last_snapshot.speed_mps || 0) * 3.6;
+        placeMarker(lat, lon, speed, d.last_snapshot.ts);
+      } else {
+        clearMarker();
+      }
+    }
+
+    function renderDetailPanel(d){
       const snapsHtml = (d.snapshots || []).map(s => `<li>${new Date(s.ts).toLocaleString()} — lat:${s.lat.toFixed(6)}, lon:${s.lon.toFixed(6)} — ${(s.speed_mps*3.6).toFixed(1)} km/h</li>`).join('');
+      const el = document.getElementById('detail');
       el.innerHTML = `
         <h3>Device ${d.device.id} details</h3>
         <div><strong>Owner:</strong> ${d.device.owner || '—'}</div>
@@ -608,9 +685,8 @@ FRIENDLY_HTML = """
         <div><strong>Extra JSON:</strong> <pre>${d.device.extra || '—'}</pre></div>
         <div><strong>Connected socket:</strong> ${d.connected ? 'yes' : 'no'}</div>
         <div><strong>Last snapshot:</strong> ${d.last_snapshot ? new Date(d.last_snapshot.ts).toLocaleString() : '—'}</div>
-        <div><strong>Recent snapshots:</strong> <ul>${snapsHtml}</ul></div>
+        <div style="margin-top:8px;"><strong>Recent snapshots:</strong><ul>${snapsHtml}</ul></div>
       `;
-      window.scrollTo(0, document.body.scrollHeight);
     }
 
     async function revokeDevice(id){
@@ -619,14 +695,42 @@ FRIENDLY_HTML = """
       if (!res.ok) { alert('Revoke failed'); return; }
       alert('Revoked');
       fetchDevices();
+      if (selectedDeviceId === id) {
+        clearMarker();
+        document.getElementById('detail').innerHTML = '<em>Device revoked.</em>';
+      }
     }
 
-    document.getElementById('btnRefresh').addEventListener('click', fetchDevices);
-    document.getElementById('btnLogout').addEventListener('click', () => { window.location = '/admin/logout'; });
+    function placeMarker(lat, lon, speed, ts){
+      if (!marker) {
+        marker = L.marker([lat, lon]).addTo(map);
+      } else {
+        marker.setLatLng([lat, lon]);
+      }
+      if (!accuracyCircle) {
+        accuracyCircle = L.circle([lat, lon], {radius: 5}).addTo(map);
+      } else {
+        accuracyCircle.setLatLng([lat, lon]);
+      }
+      // popup content
+      const popup = `<div><strong>${selectedDeviceId || ''}</strong><br/>${new Date(ts).toLocaleString()}<br/>Speed: ${speed.toFixed(1)} km/h</div>`;
+      marker.bindPopup(popup);
+      // center map to marker (only pan when not already zoomed in too tightly)
+      if (map.getZoom() < 15) {
+        map.setView([lat, lon], 15);
+      } else {
+        map.panTo([lat, lon], {animate: true});
+      }
+    }
+
+    function clearMarker(){
+      if (marker) { map.removeLayer(marker); marker = null; }
+      if (accuracyCircle) { map.removeLayer(accuracyCircle); accuracyCircle = null; }
+    }
 
     // initial load
     fetchDevices();
-    // refresh every 5s so admin sees live movement
+    // global refresh every 5s so admin sees device list changes
     setInterval(fetchDevices, 5000);
   </script>
 </body>
@@ -736,12 +840,6 @@ def admin_device_revoke(device_id):
     # also drop any connected socket sids for this device
     sids = connected_sockets.pop(device_id, None)
     return jsonify({"ok": True, "revoked": True})
-
-# -------------------------
-# Admin/UI (friendly) templates (unchanged, keep your implementation)
-# -------------------------
-# (other admin routes you previously had remain valid and untouched)
-# -------------------------
 
 # -------------------------
 # Socket.IO events (unchanged, preserved)
