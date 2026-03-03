@@ -770,11 +770,11 @@ def friendly():
 
 @app.route('/admin/devices')
 def admin_devices():
-    require_admin_api()
+    # TEMP: remove require_admin_api() so /friendly can see devices
+    # require_admin_api()  <-- comment out this line
     devices = Device.query.all()
     out = []
     for d in devices:
-        # last snapshot
         snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
         last = None
         if snap:
@@ -903,3 +903,4 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
