@@ -523,6 +523,7 @@ ADMIN_LOGIN_HTML = """
 """
 
 # Enhanced friendly admin UI: search/filter + leaflet map + live-updating device detail
+# (modified to display raw heartbeat JSON)
 FRIENDLY_HTML = """
 <!doctype html>
 <html>
@@ -675,17 +676,28 @@ FRIENDLY_HTML = """
     }
 
     function renderDetailPanel(d){
-      const snapsHtml = (d.snapshots || []).map(s => `<li>${new Date(s.ts).toLocaleString()} — lat:${s.lat.toFixed(6)}, lon:${s.lon.toFixed(6)} — ${(s.speed_mps*3.6).toFixed(1)} km/h</li>`).join('');
+      // recent snapshots list with raw JSON (if present)
+      const snapsHtml = (d.snapshots || []).map(s => {
+        const time = new Date(s.ts).toLocaleString();
+        const loc = `lat:${s.lat.toFixed(6)}, lon:${s.lon.toFixed(6)}`;
+        const spd = ((s.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
+        const rawPre = `<pre>${JSON.stringify(s.raw || {}, null, 2)}</pre>`;
+        return `<li>${time} — ${loc} — ${spd}${rawPre}</li>`;
+      }).join('');
+
+      const lastRawPretty = d.last_snapshot && d.last_snapshot.raw ? JSON.stringify(d.last_snapshot.raw, null, 2) : null;
+
       const el = document.getElementById('detail');
       el.innerHTML = `
         <h3>Device ${d.device.id} details</h3>
         <div><strong>Owner:</strong> ${d.device.owner || '—'}</div>
         <div><strong>Car:</strong> ${d.device.car_name || '—'} ${d.device.car_model ? (' / ' + d.device.car_model) : ''}</div>
         <div><strong>Plate:</strong> ${d.device.plate || '—'}</div>
-        <div><strong>Extra JSON:</strong> <pre>${d.device.extra || '—'}</pre></div>
+        <div><strong>Extra JSON (onboard):</strong> <pre>${d.device.extra || '—'}</pre></div>
         <div><strong>Connected socket:</strong> ${d.connected ? 'yes' : 'no'}</div>
         <div><strong>Last snapshot:</strong> ${d.last_snapshot ? new Date(d.last_snapshot.ts).toLocaleString() : '—'}</div>
-        <div style="margin-top:8px;"><strong>Recent snapshots:</strong><ul>${snapsHtml}</ul></div>
+        <div style="margin-top:8px;"><strong>Raw heartbeat (last):</strong> ${ lastRawPretty ? `<pre>${lastRawPretty}</pre>` : '<em>—</em>' }</div>
+        <div style="margin-top:8px;"><strong>Recent snapshots:</strong><ul>${snapsHtml || '<li>—</li>'}</ul></div>
       `;
     }
 
@@ -776,12 +788,20 @@ def admin_devices():
         snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
         last = None
         if snap:
+            # attempt to parse raw safely for the listing
+            parsed_raw = None
+            if snap.raw:
+                try:
+                    parsed_raw = json.loads(snap.raw)
+                except Exception:
+                    parsed_raw = snap.raw
             last = {
                 "ts": snap.ts.isoformat(),
                 "lat": snap.lat,
                 "lon": snap.lon,
                 "speed_mps": round(snap.speed_mps, 3),
-                "bearing_deg": round(snap.bearing_deg, 1)
+                "bearing_deg": round(snap.bearing_deg, 1),
+                "raw": parsed_raw
             }
         out.append({
             "id": d.id,
@@ -804,13 +824,21 @@ def admin_device_json(device_id):
     snaps = _recent_snapshots_for_device(device_id, limit=20)
     snaps_out = []
     for s in snaps:
+        # safe parse of raw JSON if possible, otherwise return the raw string
+        parsed_raw = None
+        if s.raw:
+            try:
+                parsed_raw = json.loads(s.raw)
+            except Exception:
+                parsed_raw = s.raw
         snaps_out.append({
             "ts": s.ts.isoformat(),
             "lat": s.lat,
             "lon": s.lon,
             "speed_mps": s.speed_mps,
             "bearing_deg": s.bearing_deg,
-            "source": s.source
+            "source": s.source,
+            "raw": parsed_raw
         })
     last = snaps_out[0] if snaps_out else None
     return jsonify({
