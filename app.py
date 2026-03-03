@@ -762,15 +762,17 @@ def admin_logout():
     session.pop('admin_user', None)
     return redirect(url_for('admin_login'))
 
+# -------------------------
+# IMPORTANT: friendly + admin JSON endpoints are now public (no auth)
+# -------------------------
 @app.route('/friendly')
 def friendly():
-    # admin UI surface; require session or bearer token
-    require_admin_api()
+    # Public admin UI for now (temporarily disabled auth)
     return render_template_string(FRIENDLY_HTML)
 
 @app.route('/admin/devices')
 def admin_devices():
-    require_admin_api()
+    # Temporarily public — no auth required
     devices = Device.query.all()
     out = []
     for d in devices:
@@ -801,7 +803,7 @@ def admin_devices():
 
 @app.route('/admin/device/<device_id>/json')
 def admin_device_json(device_id):
-    require_admin_api()
+    # Temporarily public — no auth required
     d = Device.query.get_or_404(device_id)
     snaps = _recent_snapshots_for_device(device_id, limit=20)
     snaps_out = []
@@ -833,7 +835,7 @@ def admin_device_json(device_id):
 
 @app.route('/admin/device/<device_id>/revoke', methods=['POST'])
 def admin_device_revoke(device_id):
-    require_admin_api()
+    # Temporarily public — no auth required (be careful; this is destructive)
     d = Device.query.get_or_404(device_id)
     d.revoked = True
     db.session.commit()
@@ -902,4 +904,61 @@ def ws_get_nearby(data):
 # -------------------------
 if __name__ == "__main__":
     init_db()
+    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")    sid = request.sid
+    app.logger.debug('Socket connected: %s', sid)
+    emit('connected', {'sid': sid})
+
+@socketio.on('register')
+def ws_register(data):
+    sid = request.sid
+    device_id = data.get('device_id')
+    token = data.get('token')
+    if not device_id or not token:
+        emit('error', {'error': 'device_id and token required'})
+        return
+    device = Device.query.filter_by(id=device_id, token=token, revoked=False).first()
+    if not device:
+        emit('error', {'error': 'invalid token/device'})
+        return
+    sids = connected_sockets.get(device_id)
+    if not sids:
+        connected_sockets[device_id] = set()
+    connected_sockets[device_id].add(sid)
+    join_room(sid)
+    emit('registered', {'ok': True, 'device_id': device_id})
+    app.logger.info('Device %s registered socket %s', device_id, sid)
+
+@socketio.on('disconnect')
+def ws_disconnect():
+    sid = request.sid
+    app.logger.debug('Socket disconnected: %s', sid)
+    to_remove = []
+    for dev, sids in list(connected_sockets.items()):
+        if sid in sids:
+            sids.discard(sid)
+        if not sids:
+            to_remove.append(dev)
+    for d in to_remove:
+        connected_sockets.pop(d, None)
+
+@socketio.on('get_nearby')
+def ws_get_nearby(data):
+    device_id = data.get('device_id')
+    token = data.get('token')
+    device = Device.query.filter_by(id=device_id, token=token, revoked=False).first()
+    if not device:
+        emit('error', {'error': 'invalid device/token'})
+        return
+    try:
+        payload = compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M)
+        emit('nearby', payload)
+    except Exception as e:
+        emit('error', {'error': str(e)})
+
+# -------------------------
+# CLI entry
+# -------------------------
+if __name__ == "__main__":
+    init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
