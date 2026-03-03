@@ -764,14 +764,12 @@ def admin_logout():
 
 @app.route('/friendly')
 def friendly():
-    # temporarily public admin UI: no auth here.
-    # NOTE: the JSON/admin API endpoints remain protected by require_admin_api().
+    # PUBLIC admin UI now (no auth)
     return render_template_string(FRIENDLY_HTML)
 
 @app.route('/admin/devices')
 def admin_devices():
-    # TEMP: remove require_admin_api() so /friendly can see devices
-    # require_admin_api()  <-- comment out this line
+    # PUBLIC: return devices without admin auth
     devices = Device.query.all()
     out = []
     for d in devices:
@@ -801,7 +799,7 @@ def admin_devices():
 
 @app.route('/admin/device/<device_id>/json')
 def admin_device_json(device_id):
-    require_admin_api()
+    # PUBLIC: return device snapshots/details without admin auth
     d = Device.query.get_or_404(device_id)
     snaps = _recent_snapshots_for_device(device_id, limit=20)
     snaps_out = []
@@ -833,7 +831,7 @@ def admin_device_json(device_id):
 
 @app.route('/admin/device/<device_id>/revoke', methods=['POST'])
 def admin_device_revoke(device_id):
-    require_admin_api()
+    # PUBLIC: allow revoke via POST (no admin auth) — be careful, this is intentionally open per your request
     d = Device.query.get_or_404(device_id)
     d.revoked = True
     db.session.commit()
@@ -903,4 +901,3 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
-
