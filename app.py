@@ -594,8 +594,7 @@ DASHBOARD_HTML = """
   <meta charset="utf-8">
   <title>Beacon — Dashboard</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-sA+qH6t3n0lI3lJ5uJ6a2h5Gxv4nDAn3vYkP7kGQm0A=" crossorigin=""/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     :root{ --bg:#f7f9fb; --card:#ffffff; --muted:#6b7280; --accent:#0b84ff; }
     body{ font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin:0; background:var(--bg); color:#111827;}
@@ -619,6 +618,7 @@ DASHBOARD_HTML = """
     .small{ font-size:12px; padding:6px 8px; border-radius:6px; }
     a.osm{ color:var(--accent); text-decoration:none; font-weight:600; }
     footer { font-size:12px; color:var(--muted); padding:8px 16px; text-align:right; }
+    #statusBar { font-size:13px; color:#08306B; margin-top:8px; }
   </style>
 </head>
 <body>
@@ -639,6 +639,8 @@ DASHBOARD_HTML = """
             <button id="btnRefresh" class="btn small">Refresh</button>
           </div>
         </div>
+
+        <div id="statusBar" class="muted">Status: idle</div>
 
         <hr style="margin:10px 0; border:none; border-top:1px solid #f1f5f9;" />
         <ul id="devicesList"></ul>
@@ -683,13 +685,13 @@ DASHBOARD_HTML = """
 
   <footer>Beacon — simple live tracking dashboard</footer>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-  integrity="sha256-o9N1j8wE5fhb3aC9t1gqgk4FpaNqB1h4Gxv7m2b0v4g=" crossorigin=""></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script>
   const devicesListEl = document.getElementById('devicesList');
   const devicesCountEl = document.getElementById('devicesCount');
   const btnRefresh = document.getElementById('btnRefresh');
+  const statusBar = document.getElementById('statusBar');
 
   let devicesCache = [];
   let selectedId = null;
@@ -697,34 +699,50 @@ DASHBOARD_HTML = """
 
   // Leaflet map init
   const map = L.map('map', { center: [0,0], zoom: 2, preferCanvas:true });
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '© OpenStreetMap contributors'
-  }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
   let marker = null;
   let circle = null;
 
   btnRefresh.addEventListener('click', fetchDevices);
 
   async function fetchDevices(){
+    statusBar.innerText = "Status: fetching /admin/devices...";
     try {
-      const res = await fetch('/admin/devices');
-      if (!res.ok) {
-        alert('Failed to fetch devices: ' + res.status);
-        return;
+      const res = await fetch('/admin/devices', { cache: "no-store" });
+      const txt = await res.text();
+      // show debug size to the user for transparency
+      statusBar.innerText = `Status: HTTP ${res.status} — response ${txt.length} bytes`;
+      let data;
+      try {
+        data = JSON.parse(txt);
+      } catch (e) {
+        // fallback: sometimes frameworks return single quotes / weird content; try safe JSON extraction
+        console.warn("JSON.parse failed, trying fallback:", e);
+        // attempt to extract a JSON-looking substring
+        const m = txt.match(/\\{\\s*"?devices"?:[\\s\\S]*\\}/);
+        if (m) {
+          data = JSON.parse(m[0]);
+        } else {
+          throw new Error("Response not valid JSON");
+        }
       }
-      const data = await res.json();
       devicesCache = data.devices || [];
+      statusBar.innerText = `Status: fetched ${devicesCache.length} device(s)`;
       renderList();
-    } catch (e) {
-      console.error(e);
-      alert('Error fetching devices');
+    } catch (err) {
+      console.error("fetchDevices error:", err);
+      statusBar.innerText = "Status: fetch error — see console for details";
+      devicesCache = [];
+      renderList(); // render empty state
     }
   }
 
   function renderList(){
     devicesListEl.innerHTML = '';
-    devicesCountEl.innerText = (devicesCache.length === 1) ? "1 device" : (devicesCache.length + " devices");
+    const count = devicesCache.length || 0;
+    devicesCountEl.innerText = (count === 1) ? "1 device" : (count + " devices");
+
+    // Sort newest first (use timestamp if present; 'never' fallback keeps them last)
     devicesCache.sort((a,b) => {
       const ta = a.last_snapshot && a.last_snapshot.ts ? new Date(a.last_snapshot.ts).getTime() : 0;
       const tb = b.last_snapshot && b.last_snapshot.ts ? new Date(b.last_snapshot.ts).getTime() : 0;
@@ -735,22 +753,21 @@ DASHBOARD_HTML = """
       const li = document.createElement('li');
       li.dataset.id = d.id;
       const name = d.car_name || d.car_model || d.id;
-      const last = d.last_snapshot ? new Date(d.last_snapshot.ts).toLocaleString() : 'never';
-      const speed = d.last_snapshot ? ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h' : '—';
+      const last = d.last_snapshot ? (d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen') : 'never';
+      const speed = d.last_snapshot ? (((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h') : '—';
       li.innerHTML = `<div style="min-width:0;">
-                        <div class="big">${name}</div>
-                        <div class="dev-meta">${d.owner || ''} — ${d.plate || ''}</div>
+                        <div class="big">${escapeHtml(name)}</div>
+                        <div class="dev-meta">${escapeHtml(d.owner || '')} — ${escapeHtml(d.plate || '')}</div>
                       </div>
                       <div style="text-align:right;">
-                        <div class="muted">${last}</div>
-                        <div class="muted">${speed}</div>
+                        <div class="muted">${escapeHtml(last)}</div>
+                        <div class="muted">${escapeHtml(speed)}</div>
                       </div>`;
       li.addEventListener('click', () => selectDevice(d.id));
       if (d.id === selectedId) li.classList.add('selected');
       devicesListEl.appendChild(li);
     }
 
-    // If nothing selected, auto-select the most recent device
     if (!selectedId && devicesCache.length > 0) {
       selectDevice(devicesCache[0].id);
     }
@@ -765,9 +782,10 @@ DASHBOARD_HTML = """
     if (!d) return;
     showDetail(d);
     if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
-      const lat = d.last_snapshot.lat;
-      const lon = d.last_snapshot.lon;
-      placeMarker(lat, lon, d);
+      placeMarker(d.last_snapshot.lat, d.last_snapshot.lon, d);
+    } else {
+      // center to world but keep marker cleared if none
+      clearMarker();
     }
   }
 
@@ -778,14 +796,16 @@ DASHBOARD_HTML = """
     document.getElementById('detailName').innerText = d.car_name || d.car_model || d.id;
     document.getElementById('detailOwner').innerText = d.owner || '';
     if (d.last_snapshot) {
-      document.getElementById('detailTs').innerText = new Date(d.last_snapshot.ts).toLocaleString();
+      document.getElementById('detailTs').innerText = d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen';
       const spd = ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
       document.getElementById('detailSpeed').innerText = spd;
-      document.getElementById('detailLoc').innerText = (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6));
-      document.getElementById('osmLink').href = `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`;
+      document.getElementById('detailLoc').innerText = (typeof d.last_snapshot.lat === 'number' && typeof d.last_snapshot.lon === 'number')
+        ? (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6)) : '—';
+      document.getElementById('osmLink').href = (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon)
+        ? `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`
+        : '#';
       document.getElementById('detailRaw').innerText = JSON.stringify(d.last_snapshot.raw || d.last_snapshot, null, 2);
-      const revokeBtn = document.getElementById('btnRevoke');
-      revokeBtn.onclick = async () => {
+      document.getElementById('btnRevoke').onclick = async () => {
         if (!confirm('Revoke device token? This prevents the app from authenticating with that token.')) return;
         try {
           const res = await fetch('/admin/device/' + d.id + '/revoke', { method: 'POST' });
@@ -815,7 +835,17 @@ DASHBOARD_HTML = """
       circle.setLatLng([lat, lon]);
     }
     map.setView([lat, lon], 15, { animate: true });
-    marker.bindPopup(`<strong>${d.car_name || d.id}</strong><br/>${new Date(d.last_snapshot.ts).toLocaleString()}`).openPopup();
+    marker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
+  }
+
+  function clearMarker(){
+    if (marker) { map.removeLayer(marker); marker = null; }
+    if (circle) { map.removeLayer(circle); circle = null; }
+  }
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/[&<>"'`]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',"`":'&#96;'})[c]);
   }
 
   // auto-refresh
@@ -1039,3 +1069,4 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
