@@ -90,7 +90,6 @@ _last_heartbeat_at = {}  # device_id -> timestamp (float)
 # -------------------------
 # In-memory active device cache (thread-safe)
 # -------------------------
-# Structure: { device_id: { "ts": datetime, "lat": float, "lon": float, "speed_mps": float, "bearing_deg": float, "raw": obj } }
 active_devices = {}
 active_devices_lock = threading.Lock()
 
@@ -108,7 +107,6 @@ def update_active_device_from_snapshot(snap):
                 "raw": (json.loads(snap.raw) if snap.raw else None)
             }
     except Exception:
-        # best-effort; avoid breaking heartbeat
         pass
 
 def prune_active_devices():
@@ -155,7 +153,6 @@ def classify_direction(bearing_self, bearing_other):
     return "cross"
 
 def closing_speed_mps(lat1, lon1, v1, bearing1, lat2, lon2, v2, bearing2):
-    # project velocities onto the line joining vehicles, sum projections (approx)
     bearing_line = radians(bearing_between(lat1, lon1, lat2, lon2))
     theta1 = abs((bearing1 - degrees(bearing_line) + 540) % 360 - 180)
     theta2 = abs((bearing2 - (degrees(bearing_line)+180) + 540) % 360 - 180)
@@ -170,7 +167,6 @@ def estimate_overtake_time_mps(your_speed_mps, target_speed_mps):
 
 # -------------------------
 # New: Confidence + Decision logic (cloud authoritative)
-# (unchanged from your original code)
 # -------------------------
 def _recent_snapshots_for_device(device_id, limit=5):
     return Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).limit(limit).all()
@@ -339,10 +335,8 @@ def require_admin_api():
     API-level admin check: allow if logged in via session OR provide ADMIN_API_TOKEN in Bearer header.
     Use this for JSON admin endpoints. UI routes rely on session.
     """
-    # session-based admin
     if session.get('admin_logged'):
         return True
-    # bearer token fallback
     auth = request.headers.get("Authorization", "")
     if auth and auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
@@ -393,10 +387,6 @@ def onboard():
 
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    """
-    Device heartbeat endpoint. Server is authoritative: computes nearby & decisions and pushes back via socket.io.
-    Returns saved_at and optionally immediate nearby decision payload for REST callers.
-    """
     device = require_auth_token()
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id") or device.id
@@ -405,11 +395,9 @@ def heartbeat():
     now_ts = time.time()
     last = _last_heartbeat_at.get(device_id)
     if last and (now_ts - last) < HEARTBEAT_MIN_INTERVAL_S:
-        # ignore or drop duplicates; respond success but do not spam DB
         return jsonify({"ok": True, "saved_at": None, "note": "rate_limited"}), 202
     _last_heartbeat_at[device_id] = now_ts
 
-    # Validate coordinates / basic sanity checks
     try:
         lat = float(payload.get("lat"))
         lon = float(payload.get("lon"))
@@ -464,7 +452,6 @@ def heartbeat():
     # compute authoritative nearby + decisions and push via socket
     try:
         nearby_payload = compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M)
-        # Push: 'nearby_update' preserves compatibility but each nearby entry now includes decision+confidence
         send_ws_to_device(device_id, 'nearby_update', nearby_payload)
     except Exception as e:
         app.logger.exception("compute_nearby error: %s", e)
@@ -473,9 +460,6 @@ def heartbeat():
 
 @app.route("/nearby", methods=["GET"])
 def nearby():
-    """
-    REST nearby — returns authoritative decisions for nearby vehicles
-    """
     token_device = None
     try:
         token_device = require_auth_token()
@@ -494,11 +478,9 @@ def nearby():
 def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
     self_snap = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).first()
     if not self_snap:
-        # fallback: try in-memory active_devices
         with active_devices_lock:
             entry = active_devices.get(device_id)
         if entry:
-            # create a synthetic Snapshot-like object (lightweight)
             class _Tmp:
                 pass
             t = _Tmp()
@@ -516,16 +498,13 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
     cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
     other_snaps = Snapshot.query.filter(Snapshot.device_id != device_id, Snapshot.ts >= cutoff).all()
 
-    # Also include in-memory active_devices for other devices (in case DB didn't yet persist)
     with active_devices_lock:
         for did, entry in active_devices.items():
             if did == device_id:
                 continue
-            # skip if DB snapshot already included (based on device_id)
             seen = any(s.device_id == did for s in other_snaps)
             if seen:
                 continue
-            # only include if recent enough
             if entry.get("ts") >= cutoff:
                 class _Tmp2:
                     pass
@@ -605,15 +584,256 @@ ADMIN_LOGIN_HTML = """
 </html>
 """
 
-# (FRIENDLY_HTML unchanged — omitted here for brevity in comment, but keep your original string variable)
-FRIENDLY_HTML = """..."""  # keep original HTML exactly as you had it
+# -------------------------
+# New: Friendly Dashboard HTML (for /dashboard and /friendly)
+# -------------------------
+DASHBOARD_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Beacon — Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-sA+qH6t3n0lI3lJ5uJ6a2h5Gxv4nDAn3vYkP7kGQm0A=" crossorigin=""/>
+  <style>
+    :root{ --bg:#f7f9fb; --card:#ffffff; --muted:#6b7280; --accent:#0b84ff; }
+    body{ font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin:0; background:var(--bg); color:#111827;}
+    header{ background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding:18px 20px; display:flex; align-items:center; gap:12px;}
+    header h1{ font-size:18px; margin:0;}
+    .wrap{ display:flex; gap:12px; padding:12px; height: calc(100vh - 72px); box-sizing:border-box;}
+    .left{ width:360px; display:flex; flex-direction:column; gap:12px; }
+    .card{ background:var(--card); border-radius:10px; padding:12px; box-shadow:0 6px 18px rgba(15,23,42,0.06); overflow:auto; }
+    #devicesList{ list-style:none; margin:0; padding:0; }
+    #devicesList li{ padding:10px; border-radius:8px; margin-bottom:8px; cursor:pointer; border:1px solid #eef2f7; display:flex; justify-content:space-between; align-items:center; gap:8px;}
+    #devicesList li.selected{ background:#eef8ff; border-color:#cfe9ff; }
+    .dev-meta{ font-size:13px; color:var(--muted); }
+    .big{ font-weight:600; font-size:14px; }
+    .muted{ color:var(--muted); font-size:13px; }
+    #mapWrap{ flex:1; display:flex; flex-direction:column; gap:12px; }
+    #map{ flex:1; border-radius:10px; overflow:hidden; }
+    #detailCard{ height:200px; min-height:160px; }
+    .row{ display:flex; justify-content:space-between; gap:8px; margin-top:6px; }
+    .btn{ background:var(--accent); color:white; padding:8px 10px; border-radius:8px; border:none; cursor:pointer;}
+    .btn.ghost{ background:transparent; color:var(--accent); border:1px solid #e6f2ff;}
+    .small{ font-size:12px; padding:6px 8px; border-radius:6px; }
+    a.osm{ color:var(--accent); text-decoration:none; font-weight:600; }
+    footer { font-size:12px; color:var(--muted); padding:8px 16px; text-align:right; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Beacon — Live Dashboard</h1>
+    <div style="margin-left:auto; font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</div>
+  </header>
+
+  <div class="wrap">
+    <div class="left">
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div class="muted">Devices</div>
+            <div class="big" id="devicesCount">0 devices</div>
+          </div>
+          <div>
+            <button id="btnRefresh" class="btn small">Refresh</button>
+          </div>
+        </div>
+
+        <hr style="margin:10px 0; border:none; border-top:1px solid #f1f5f9;" />
+        <ul id="devicesList"></ul>
+      </div>
+
+      <div id="detailCard" class="card">
+        <div id="placeholderDetail"><em>Select a device to see details & map</em></div>
+        <div id="deviceDetail" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <div id="detailName" class="big"></div>
+              <div id="detailOwner" class="muted"></div>
+            </div>
+            <div>
+              <button id="btnRevoke" class="btn ghost small">Revoke</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div><div class="muted">Last seen</div><div id="detailTs" class="big"></div></div>
+            <div><div class="muted">Speed</div><div id="detailSpeed" class="big">—</div></div>
+          </div>
+
+          <div class="row">
+            <div><div class="muted">Location</div><div id="detailLoc" class="muted"></div></div>
+            <div><a id="osmLink" class="osm" target="_blank">Open in OSM ↗</a></div>
+          </div>
+
+          <div style="margin-top:8px;">
+            <div class="muted">Raw heartbeat (last)</div>
+            <pre id="detailRaw" style="background:#fbfdff; padding:8px; border-radius:6px; max-height:80px; overflow:auto;">—</pre>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="mapWrap" class="card">
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <footer>Beacon — simple live tracking dashboard</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-o9N1j8wE5fhb3aC9t1gqgk4FpaNqB1h4Gxv7m2b0v4g=" crossorigin=""></script>
+
+<script>
+  const devicesListEl = document.getElementById('devicesList');
+  const devicesCountEl = document.getElementById('devicesCount');
+  const btnRefresh = document.getElementById('btnRefresh');
+
+  let devicesCache = [];
+  let selectedId = null;
+  let refreshTimer = null;
+
+  // Leaflet map init
+  const map = L.map('map', { center: [0,0], zoom: 2, preferCanvas:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap contributors'
+  }).addTo(map);
+  let marker = null;
+  let circle = null;
+
+  btnRefresh.addEventListener('click', fetchDevices);
+
+  async function fetchDevices(){
+    try {
+      const res = await fetch('/admin/devices');
+      if (!res.ok) {
+        alert('Failed to fetch devices: ' + res.status);
+        return;
+      }
+      const data = await res.json();
+      devicesCache = data.devices || [];
+      renderList();
+    } catch (e) {
+      console.error(e);
+      alert('Error fetching devices');
+    }
+  }
+
+  function renderList(){
+    devicesListEl.innerHTML = '';
+    devicesCountEl.innerText = (devicesCache.length === 1) ? "1 device" : (devicesCache.length + " devices");
+    devicesCache.sort((a,b) => {
+      const ta = a.last_snapshot && a.last_snapshot.ts ? new Date(a.last_snapshot.ts).getTime() : 0;
+      const tb = b.last_snapshot && b.last_snapshot.ts ? new Date(b.last_snapshot.ts).getTime() : 0;
+      return tb - ta;
+    });
+
+    for (const d of devicesCache) {
+      const li = document.createElement('li');
+      li.dataset.id = d.id;
+      const name = d.car_name || d.car_model || d.id;
+      const last = d.last_snapshot ? new Date(d.last_snapshot.ts).toLocaleString() : 'never';
+      const speed = d.last_snapshot ? ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h' : '—';
+      li.innerHTML = `<div style="min-width:0;">
+                        <div class="big">${name}</div>
+                        <div class="dev-meta">${d.owner || ''} — ${d.plate || ''}</div>
+                      </div>
+                      <div style="text-align:right;">
+                        <div class="muted">${last}</div>
+                        <div class="muted">${speed}</div>
+                      </div>`;
+      li.addEventListener('click', () => selectDevice(d.id));
+      if (d.id === selectedId) li.classList.add('selected');
+      devicesListEl.appendChild(li);
+    }
+
+    // If nothing selected, auto-select the most recent device
+    if (!selectedId && devicesCache.length > 0) {
+      selectDevice(devicesCache[0].id);
+    }
+  }
+
+  function selectDevice(id) {
+    selectedId = id;
+    document.querySelectorAll('#devicesList li').forEach(li => {
+      li.classList.toggle('selected', li.dataset.id === id);
+    });
+    const d = devicesCache.find(x => x.id === id);
+    if (!d) return;
+    showDetail(d);
+    if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
+      const lat = d.last_snapshot.lat;
+      const lon = d.last_snapshot.lon;
+      placeMarker(lat, lon, d);
+    }
+  }
+
+  function showDetail(d) {
+    document.getElementById('placeholderDetail').style.display = 'none';
+    const panel = document.getElementById('deviceDetail');
+    panel.style.display = 'block';
+    document.getElementById('detailName').innerText = d.car_name || d.car_model || d.id;
+    document.getElementById('detailOwner').innerText = d.owner || '';
+    if (d.last_snapshot) {
+      document.getElementById('detailTs').innerText = new Date(d.last_snapshot.ts).toLocaleString();
+      const spd = ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
+      document.getElementById('detailSpeed').innerText = spd;
+      document.getElementById('detailLoc').innerText = (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6));
+      document.getElementById('osmLink').href = `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`;
+      document.getElementById('detailRaw').innerText = JSON.stringify(d.last_snapshot.raw || d.last_snapshot, null, 2);
+      const revokeBtn = document.getElementById('btnRevoke');
+      revokeBtn.onclick = async () => {
+        if (!confirm('Revoke device token? This prevents the app from authenticating with that token.')) return;
+        try {
+          const res = await fetch('/admin/device/' + d.id + '/revoke', { method: 'POST' });
+          if (!res.ok) { alert('Revoke failed'); return; }
+          alert('Device revoked');
+          fetchDevices();
+        } catch (e) { alert('Revoke error'); }
+      };
+    } else {
+      document.getElementById('detailTs').innerText = '—';
+      document.getElementById('detailSpeed').innerText = '—';
+      document.getElementById('detailLoc').innerText = '—';
+      document.getElementById('detailRaw').innerText = '—';
+      document.getElementById('osmLink').href = '#';
+    }
+  }
+
+  function placeMarker(lat, lon, d) {
+    if (!marker) {
+      marker = L.marker([lat, lon]).addTo(map);
+    } else {
+      marker.setLatLng([lat, lon]);
+    }
+    if (!circle) {
+      circle = L.circle([lat, lon], { radius: (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
+    } else {
+      circle.setLatLng([lat, lon]);
+    }
+    map.setView([lat, lon], 15, { animate: true });
+    marker.bindPopup(`<strong>${d.car_name || d.id}</strong><br/>${new Date(d.last_snapshot.ts).toLocaleString()}`).openPopup();
+  }
+
+  // auto-refresh
+  refreshTimer = setInterval(fetchDevices, 5000);
+
+  // initial load
+  fetchDevices();
+
+</script>
+</body>
+</html>
+"""
 
 # Admin web pages / endpoints
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if request.method == 'GET':
         return render_template_string(ADMIN_LOGIN_HTML)
-    # POST
     username = request.form.get('username')
     password = request.form.get('password')
     if not username or not password:
@@ -625,7 +845,7 @@ def admin_login():
         return render_template_string(ADMIN_LOGIN_HTML), 401
     session['admin_logged'] = True
     session['admin_user'] = admin.username
-    return redirect(url_for('friendly'))
+    return redirect(url_for('dashboard'))
 
 @app.route('/admin/logout')
 def admin_logout():
@@ -633,23 +853,25 @@ def admin_logout():
     session.pop('admin_user', None)
     return redirect(url_for('admin_login'))
 
+@app.route('/dashboard')
+def dashboard():
+    # friendly dashboard for non-technical users
+    return render_template_string(DASHBOARD_HTML)
+
+# keep /friendly for compatibility
 @app.route('/friendly')
 def friendly():
-    # PUBLIC admin UI now (no auth)
-    return render_template_string(FRIENDLY_HTML)
+    return render_template_string(DASHBOARD_HTML)
 
 @app.route('/admin/devices')
 def admin_devices():
-    # PUBLIC: return devices without admin auth
     devices = Device.query.all()
     out = []
-    # prune cache proactively
     prune_active_devices()
     for d in devices:
         snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
         last = None
         if snap:
-            # attempt to parse raw safely for the listing
             parsed_raw = None
             if snap.raw:
                 try:
@@ -665,7 +887,6 @@ def admin_devices():
                 "raw": parsed_raw
             }
         else:
-            # fallback to in-memory cache entry if available
             with active_devices_lock:
                 entry = active_devices.get(d.id)
             if entry:
@@ -695,12 +916,10 @@ def admin_devices():
 
 @app.route('/admin/device/<device_id>/json')
 def admin_device_json(device_id):
-    # PUBLIC: return device snapshots/details without admin auth
     d = Device.query.get_or_404(device_id)
     snaps = _recent_snapshots_for_device(device_id, limit=20)
     snaps_out = []
     for s in snaps:
-        # safe parse of raw JSON if possible, otherwise return the raw string
         parsed_raw = None
         if s.raw:
             try:
@@ -717,7 +936,6 @@ def admin_device_json(device_id):
             "raw": parsed_raw
         })
 
-    # If DB has no snapshots, try the in-memory cache for one recent snapshot
     if not snaps_out:
         with active_devices_lock:
             entry = active_devices.get(device_id)
@@ -751,13 +969,10 @@ def admin_device_json(device_id):
 
 @app.route('/admin/device/<device_id>/revoke', methods=['POST'])
 def admin_device_revoke(device_id):
-    # PUBLIC: allow revoke via POST (no admin auth) — be careful, this is intentionally open per your request
     d = Device.query.get_or_404(device_id)
     d.revoked = True
     db.session.commit()
-    # also drop any connected socket sids for this device
     sids = connected_sockets.pop(device_id, None)
-    # also remove from in-memory active cache
     with active_devices_lock:
         active_devices.pop(device_id, None)
     return jsonify({"ok": True, "revoked": True})
