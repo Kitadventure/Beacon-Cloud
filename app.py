@@ -107,7 +107,7 @@ class AccidentEvent(db.Model):
     confirmed = db.Column(db.Boolean, default=False)
     confirmed_at = db.Column(db.DateTime, nullable=True)
     severity = db.Column(db.String(32), default="unknown")
-    metadata = db.Column(db.Text)
+    metadata_json = db.Column(db.Text)
 
 class Hotspot(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -397,7 +397,7 @@ def create_or_update_accident_event_from_report(rep: EventReport):
                     reporters.append(rep.device_id)
                     ev.reporters = json.dumps(reporters)
                     ev.reports_count = len(reporters)
-                meta = json.loads(ev.metadata or "{}")
+                meta = json.loads(ev.metadata_json or "{}")
                 meta.setdefault("last_report_at", datetime.utcnow().isoformat())
                 meta.setdefault("samples", []).append({
                     "report_id": rep.id,
@@ -407,7 +407,7 @@ def create_or_update_accident_event_from_report(rep: EventReport):
                     "speed_after": rep.speed_after,
                     "ts": rep.ts.isoformat()
                 })
-                ev.metadata = json.dumps(meta)
+                ev.metadata_json = json.dumps(meta)
                 sev = ev.severity or "unknown"
                 try:
                     for s in meta.get("samples", []):
@@ -458,7 +458,7 @@ def create_or_update_accident_event_from_report(rep: EventReport):
             confirmed=(len(reporters) >= REPORTS_TO_CONFIRM),
             confirmed_at=(datetime.utcnow() if len(reporters) >= REPORTS_TO_CONFIRM else None),
             severity=sev,
-            metadata=json.dumps(meta)
+            metadata_json=json.dumps(meta)
         )
         db.session.add(ev)
         db.session.commit()
@@ -914,7 +914,7 @@ def admin_events():
         except Exception:
             reporters = []
         try:
-            meta = json.loads(e.metadata or "{}")
+            meta = json.loads(e.metadata_json or "{}")
         except Exception:
             meta = {}
         out.append({
@@ -1203,3 +1203,4 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
