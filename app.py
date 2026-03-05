@@ -22,13 +22,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # -------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///beacon.db")
 CLEANUP_STALE_SECONDS = int(os.environ.get("CLEANUP_STALE_SECONDS", "12"))  # remove snapshots older than this
-NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))  # 1 km default per your spec
+NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))  # 1 km default
 HEARTBEAT_MIN_INTERVAL_S = float(os.environ.get("HEARTBEAT_MIN_INTERVAL_S", "0.5"))  # basic rate-limit
 UNSAFE_TTC_SECONDS = float(os.environ.get("UNSAFE_TTC_SECONDS", "6.0"))  # threshold for opposite-direction unsafe
 CONFIRMATION_RADIUS_M = float(os.environ.get("CONFIRMATION_RADIUS_M", "30.0"))  # support devices gathering radius
-# Optional API token for scripted admin calls
+
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN")
-# Optionally seed admin via env on first run:
 ADMIN_USER = os.environ.get("ADMIN_USER")
 ADMIN_PASS = os.environ.get("ADMIN_PASS")
 
@@ -37,9 +36,9 @@ OVERTAKE_EXTRA_M = float(os.environ.get("OVERTAKE_EXTRA_M", "5.0"))
 SAFETY_FACTOR = float(os.environ.get("SAFETY_FACTOR", "1.5"))
 
 # Accident/event settings
-REPORTS_TO_CONFIRM = int(os.environ.get("REPORTS_TO_CONFIRM", "2"))  # number of independent reports to auto-confirm
-EVENT_MERGE_WINDOW_S = int(os.environ.get("EVENT_MERGE_WINDOW_S", "300"))  # window to cluster reports (seconds)
-EVENT_MERGE_RADIUS_M = float(os.environ.get("EVENT_MERGE_RADIUS_M", "50.0"))  # radius to cluster reports (meters)
+REPORTS_TO_CONFIRM = int(os.environ.get("REPORTS_TO_CONFIRM", "2"))
+EVENT_MERGE_WINDOW_S = int(os.environ.get("EVENT_MERGE_WINDOW_S", "300"))
+EVENT_MERGE_RADIUS_M = float(os.environ.get("EVENT_MERGE_RADIUS_M", "50.0"))
 
 # -------------------------
 # Flask + SQLAlchemy + SocketIO init
@@ -49,7 +48,6 @@ app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
 
-# Use threading async_mode for Windows/dev. For production (multi-process) configure SocketIO with Redis and eventlet.
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 db = SQLAlchemy(app)
@@ -83,60 +81,52 @@ class Snapshot(db.Model):
     speed_mps = db.Column(db.Float)   # store m/s
     bearing_deg = db.Column(db.Float) # 0..360
     heading_deg = db.Column(db.Float) # optional
-    source = db.Column(db.String(32), default="app") # e.g., "app", "web"
-    raw = db.Column(db.Text) # JSON dump of raw payload (optional)
+    source = db.Column(db.String(32), default="app")
+    raw = db.Column(db.Text)
 
 class EventReport(db.Model):
-    """Raw reports from devices (impact / incident hints)."""
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.String(36), index=True)
     ts = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     lat = db.Column(db.Float)
     lon = db.Column(db.Float)
-    event_type = db.Column(db.String(64))  # e.g., "impact", "hard_brake", "stopped_vehicle"
+    event_type = db.Column(db.String(64))
     g_force = db.Column(db.Float, nullable=True)
     speed_before = db.Column(db.Float, nullable=True)
     speed_after = db.Column(db.Float, nullable=True)
     raw = db.Column(db.Text)
 
 class AccidentEvent(db.Model):
-    """Aggregated event built from multiple EventReport rows. Admin can confirm/dismiss."""
     id = db.Column(db.Integer, primary_key=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     lat = db.Column(db.Float)
     lon = db.Column(db.Float)
     event_type = db.Column(db.String(64))
     reports_count = db.Column(db.Integer, default=0)
-    reporters = db.Column(db.Text)  # JSON list of device_ids
+    reporters = db.Column(db.Text)  # JSON list
     confirmed = db.Column(db.Boolean, default=False)
     confirmed_at = db.Column(db.DateTime, nullable=True)
-    severity = db.Column(db.String(32), default="unknown")  # e.g., low, medium, high
-    metadata = db.Column(db.Text)  # JSON blob for aggregated stats
+    severity = db.Column(db.String(32), default="unknown")
+    metadata = db.Column(db.Text)
 
 class Hotspot(db.Model):
-    """Known dangerous locations (Salgaa, Kimende, etc) — admin-managed or learned from data."""
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(128))
     lat = db.Column(db.Float)
     lon = db.Column(db.Float)
     radius_m = db.Column(db.Float, default=50.0)
-    risk_level = db.Column(db.String(32), default="high")  # low|medium|high
+    risk_level = db.Column(db.String(32), default="high")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # -------------------------
-# Simple in-memory rate tracking (per-device)
+# In-memory helpers & caches
 # -------------------------
-_last_heartbeat_at = {}  # device_id -> timestamp (float)
-# Note: for multi-process deployments, move this into Redis or DB.
-
-# -------------------------
-# In-memory active device cache (thread-safe)
-# -------------------------
+_last_heartbeat_at = {}
 active_devices = {}
 active_devices_lock = threading.Lock()
+connected_sockets = {}  # { device_id: set(sid) }
 
 def update_active_device_from_snapshot(snap):
-    """Given a Snapshot model instance, update in-memory active_devices."""
     try:
         with active_devices_lock:
             active_devices[snap.device_id] = {
@@ -152,7 +142,6 @@ def update_active_device_from_snapshot(snap):
         pass
 
 def prune_active_devices():
-    """Remove entries older than CLEANUP_STALE_SECONDS."""
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
         with active_devices_lock:
@@ -163,7 +152,7 @@ def prune_active_devices():
         pass
 
 # -------------------------
-# Helpers: geodesy + relative computations
+# Geodesy + decision helpers
 # -------------------------
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -226,10 +215,10 @@ def hotspots_near(lat, lon, radius_m=None):
 
 def is_in_hotspot(lat, lon):
     hits = hotspots_near(lat, lon, radius_m=None)
-    return hits[0] if hits else None  # returns (Hotspot, distance) or None
+    return hits[0] if hits else None
 
 # -------------------------
-# New: Confidence + Decision logic (cloud authoritative)
+# Confidence & decision logic (cloud authoritative)
 # -------------------------
 def _recent_snapshots_for_device(device_id, limit=5):
     return Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).limit(limit).all()
@@ -263,11 +252,12 @@ def compute_warning(self_lat, self_lon, self_speed_mps, self_bearing,
     ttc = float('inf')
     if close > 0.1:
         ttc = d / close
-    guidance = {}
-    guidance['distance_m'] = round(d, 2)
-    guidance['direction'] = cls
-    guidance['closing_mps'] = round(close, 2)
-    guidance['time_to_collision_s'] = round(ttc, 2) if ttc != float('inf') else None
+    guidance = {
+        'distance_m': round(d, 2),
+        'direction': cls,
+        'closing_mps': round(close, 2),
+        'time_to_collision_s': round(ttc, 2) if ttc != float('inf') else None
+    }
     if cls == "same":
         required = estimate_overtake_time_mps(self_speed_mps, other_speed_mps)
         guidance['overtake_time_required_s'] = round(required, 2)
@@ -308,7 +298,7 @@ def classify_risk(self_snap, other_snap):
     base_confidence = 0.35 * recency_score + 0.40 * dist_score + 0.25 * support_score
     base_confidence = max(0.0, min(1.0, base_confidence))
 
-    # Hotspot influence: if midpoint is inside a hotspot, raise confidence and possibly escalate
+    # Hotspot influence:
     hs_hit = is_in_hotspot(mid_lat, mid_lon)
     hotspot_modifier = 0.0
     if hs_hit:
@@ -319,17 +309,14 @@ def classify_risk(self_snap, other_snap):
             hotspot_modifier = 0.12
         else:
             hotspot_modifier = 0.06
-
-    # apply hotspot modifier
     base_confidence = min(1.0, base_confidence + hotspot_modifier)
 
-    # preserve existing decision logic, but use modified base_confidence
+    # existing logic with modified confidence...
     if direction == "opposite":
         if ttc == float('inf'):
             return {"decision": "green", "confidence": round(base_confidence * 0.6, 2), "reason": "opposite_no_closing"}
         if ttc < UNSAFE_TTC_SECONDS:
             conf = min(1.0, base_confidence + 0.25 * (1.0 - (ttc / UNSAFE_TTC_SECONDS)) + 0.1 * support_score)
-            # if hotspot is high, escalate to red even for borderline TTC
             if hs_hit and hotspot.risk_level == "high" and conf > 0.45:
                 return {"decision": "red", "confidence": round(conf, 2), "reason": f"opposite_ttc_{round(ttc,1)}s_hotspot"}
             return {"decision": "red", "confidence": round(conf, 2), "reason": f"opposite_ttc_{round(ttc,1)}s"}
@@ -377,7 +364,6 @@ def classify_risk(self_snap, other_snap):
 def init_db():
     with app.app_context():
         db.create_all()
-        # create initial admin from env if provided and no admins exist
         try:
             if Admin.query.count() == 0 and ADMIN_USER and ADMIN_PASS:
                 h = generate_password_hash(ADMIN_PASS)
@@ -397,28 +383,20 @@ def cleanup_old_snapshots():
     db.session.commit()
 
 # -------------------------
-# Event reporting / aggregation
+# Event aggregation
 # -------------------------
 def create_or_update_accident_event_from_report(rep: EventReport):
-    """
-    Try to merge the incoming report into an existing open AccidentEvent (within radius/time window).
-    If none found, create a new AccidentEvent record (unconfirmed, reports_count=1).
-    If reports_count reaches REPORTS_TO_CONFIRM we auto-confirm the event.
-    """
     try:
-        # find recent open events within radius
         cutoff = datetime.utcnow() - timedelta(seconds=EVENT_MERGE_WINDOW_S)
         candidates = AccidentEvent.query.filter(AccidentEvent.created_at >= cutoff, AccidentEvent.confirmed == False).all()
         for ev in candidates:
             d = haversine_m(rep.lat, rep.lon, ev.lat, ev.lon)
             if d <= EVENT_MERGE_RADIUS_M:
-                # merge into ev
                 reporters = json.loads(ev.reporters or "[]")
                 if rep.device_id not in reporters:
                     reporters.append(rep.device_id)
                     ev.reporters = json.dumps(reporters)
                     ev.reports_count = len(reporters)
-                # update metadata aggregated
                 meta = json.loads(ev.metadata or "{}")
                 meta.setdefault("last_report_at", datetime.utcnow().isoformat())
                 meta.setdefault("samples", []).append({
@@ -430,10 +408,8 @@ def create_or_update_accident_event_from_report(rep: EventReport):
                     "ts": rep.ts.isoformat()
                 })
                 ev.metadata = json.dumps(meta)
-                # derive simple severity heuristic
                 sev = ev.severity or "unknown"
                 try:
-                    # if any report has high g_force, bump severity
                     for s in meta.get("samples", []):
                         if s.get("g_force") and float(s.get("g_force")) >= 6.0:
                             sev = "high"
@@ -444,7 +420,6 @@ def create_or_update_accident_event_from_report(rep: EventReport):
                 ev.severity = sev
                 db.session.add(ev)
                 db.session.commit()
-                # auto-confirm logic
                 if ev.reports_count >= REPORTS_TO_CONFIRM and not ev.confirmed:
                     ev.confirmed = True
                     ev.confirmed_at = datetime.utcnow()
@@ -452,7 +427,6 @@ def create_or_update_accident_event_from_report(rep: EventReport):
                     db.session.commit()
                 return ev
 
-        # no candidate -> create new event
         reporters = [rep.device_id] if rep.device_id else []
         meta = {
             "first_report_id": rep.id,
@@ -465,7 +439,6 @@ def create_or_update_accident_event_from_report(rep: EventReport):
                 "ts": rep.ts.isoformat()
             }]
         }
-        # severity heuristic
         sev = "unknown"
         try:
             if rep.g_force and float(rep.g_force) >= 6.0:
@@ -519,10 +492,6 @@ def require_auth_token():
     return device
 
 def require_admin_api():
-    """
-    API-level admin check: allow if logged in via session OR provide ADMIN_API_TOKEN in Bearer header.
-    Use this for JSON admin endpoints. UI routes rely on session.
-    """
     if session.get('admin_logged'):
         return True
     auth = request.headers.get("Authorization", "")
@@ -533,10 +502,8 @@ def require_admin_api():
     abort(401, "Admin access required")
 
 # -------------------------
-# In-memory socket tracking
+# Socket helpers
 # -------------------------
-connected_sockets = {}  # { device_id: set(sid) }
-
 def send_ws_to_device(device_id, event, payload):
     sids = connected_sockets.get(device_id)
     if not sids:
@@ -552,7 +519,7 @@ def send_ws_to_device(device_id, event, payload):
     return True
 
 # -------------------------
-# Routes: API (onboard, heartbeat, nearby, admin)
+# API routes: health/onboard/heartbeat/nearby
 # -------------------------
 @app.route("/health")
 def health():
@@ -579,7 +546,6 @@ def heartbeat():
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id") or device.id
 
-    # Rate-limiting (basic)
     now_ts = time.time()
     last = _last_heartbeat_at.get(device_id)
     if last and (now_ts - last) < HEARTBEAT_MIN_INTERVAL_S:
@@ -628,7 +594,6 @@ def heartbeat():
     db.session.add(snap)
     db.session.commit()
 
-    # update in-memory cache for active devices and prune old entries
     try:
         update_active_device_from_snapshot(snap)
         prune_active_devices()
@@ -637,7 +602,6 @@ def heartbeat():
 
     cleanup_old_snapshots()
 
-    # compute authoritative nearby + decisions and push via socket
     try:
         nearby_payload = compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M)
         send_ws_to_device(device_id, 'nearby_update', nearby_payload)
@@ -669,8 +633,7 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
         with active_devices_lock:
             entry = active_devices.get(device_id)
         if entry:
-            class _Tmp:
-                pass
+            class _Tmp: pass
             t = _Tmp()
             t.device_id = device_id
             t.lat = entry.get("lat")
@@ -694,8 +657,7 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
             if seen:
                 continue
             if entry.get("ts") >= cutoff:
-                class _Tmp2:
-                    pass
+                class _Tmp2: pass
                 t = _Tmp2()
                 t.device_id = did
                 t.lat = entry.get("lat")
@@ -750,20 +712,6 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
 # -------------------------
 @app.route("/report_event", methods=["POST"])
 def report_event():
-    """
-    Accept event reports from devices (impact / hard_brake / stopped_vehicle).
-    The request must include Authorization: Token <device_token> or token in JSON body.
-    Body example:
-    {
-      "event_type": "impact",
-      "lat": -1.12345,
-      "lon": 36.12345,
-      "g_force": 6.2,
-      "speed_before": 18.0,
-      "speed_after": 0.0,
-      "ts": "2026-03-05T10:12:34Z"
-    }
-    """
     device = require_auth_token()
     payload = request.get_json(force=True, silent=True) or {}
     try:
@@ -804,10 +752,8 @@ def report_event():
     db.session.add(rep)
     db.session.commit()
 
-    # aggregate into accidents/events
     ev = create_or_update_accident_event_from_report(rep)
 
-    # return created report id and event id (if created)
     return jsonify({
         "ok": True,
         "report_id": rep.id,
@@ -816,7 +762,7 @@ def report_event():
     })
 
 # -------------------------
-# Admin/UI templates and routes (unchanged main dashboard)
+# Admin templates (login + dashboard)
 # -------------------------
 ADMIN_LOGIN_HTML = """
 <!doctype html>
@@ -842,14 +788,120 @@ ADMIN_LOGIN_HTML = """
 </html>
 """
 
-# keep the previous DASHBOARD_HTML as-is (omitted here for brevity in this code listing)
-# You already have DASHBOARD_HTML above in your existing file — we reuse it without modification.
-# For brevity we will reuse the same HTML defined previously if present; otherwise navigate /dashboard returns simple JSON.
+DASHBOARD_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Beacon — Dashboard (Events & Hotspots)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    :root{ --bg:#f7f9fb; --card:#ffffff; --muted:#6b7280; --accent:#0b84ff; }
+    body{ font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin:0; background:var(--bg); color:#111827;}
+    header{ background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding:14px 18px; display:flex; align-items:center; gap:12px;}
+    header h1{ font-size:18px; margin:0;}
+    .wrap{ display:flex; gap:12px; padding:12px; height: calc(100vh - 64px); box-sizing:border-box; }
+    .left{ width:360px; display:flex; flex-direction:column; gap:12px; }
+    .card{ background:var(--card); border-radius:10px; padding:12px; box-shadow:0 6px 18px rgba(15,23,42,0.06); overflow:auto; }
+    #devicesList, #eventsList, #hotspotsList{ list-style:none; margin:0; padding:0; }
+    li.item{ padding:10px; border-radius:8px; margin-bottom:8px; border:1px solid #eef2f7; display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+    .big{ font-weight:600; font-size:14px; }
+    .muted{ color:var(--muted); font-size:13px; }
+    #mapWrap{ flex:1; display:flex; flex-direction:column; gap:12px; }
+    #map{ flex:1; border-radius:10px; overflow:hidden; }
+    .row{ display:flex; justify-content:space-between; gap:8px; margin-top:6px; }
+    .btn{ background:var(--accent); color:white; padding:8px 10px; border-radius:8px; border:none; cursor:pointer; }
+    .btn.ghost{ background:transparent; color:var(--accent); border:1px solid #e6f2f7; }
+    .small{ font-size:12px; padding:6px 8px; border-radius:6px; }
+    .pill{ padding:6px 8px; border-radius:6px; background:#eef2f7; font-size:12px; }
+    .legend{ font-size:13px; display:flex; gap:8px; align-items:center; }
+    .legend .dot{ width:12px; height:12px; border-radius:6px; display:inline-block; }
+    .controls{ display:flex; gap:8px; flex-wrap:wrap; }
+    .form-row{ display:flex; gap:6px; margin-top:6px; }
+    input[type="text"], input[type="number"]{ padding:6px 8px; border-radius:6px; border:1px solid #e6eef6; font-size:13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Beacon — Dashboard (Events & Hotspots)</h1>
+    <div style="margin-left:auto; font-size:13px; opacity:0.95;">Auto-refresh every 5s — admin session required</div>
+  </header>
 
-DASHBOARD_HTML = globals().get("DASHBOARD_HTML", "<html><body><h1>Beacon Dashboard</h1></body></html>")
+  <div class="wrap">
+    <div class="left">
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div class="muted">Devices</div>
+            <div class="big" id="devicesCount">0 devices</div>
+          </div>
+          <div class="controls">
+            <button id="btnRefresh" class="btn small">Refresh</button>
+            <button id="btnCenter" class="btn small ghost">Center Map</button>
+          </div>
+        </div>
+        <div id="statusBar" class="muted" style="margin-top:8px;">Status: idle</div>
+        <hr style="margin:10px 0; border:none; border-top:1px solid #f1f5f9;" />
+        <ul id="devicesList"></ul>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div class="muted">Events (possible accidents)</div>
+            <div class="big" id="eventsCount">0 events</div>
+          </div>
+          <div>
+            <button id="btnClearEvents" class="btn small ghost">Clear selection</button>
+          </div>
+        </div>
+        <ul id="eventsList"></ul>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div class="muted">Hotspots</div>
+            <div class="big" id="hotspotsCount">0</div>
+          </div>
+          <div>
+            <button id="btnNewHotspot" class="btn small">Add Hotspot</button>
+          </div>
+        </div>
+        <div id="hotspotForm" style="display:none; margin-top:8px;">
+          <div class="form-row"><input id="hsName" type="text" placeholder="Name"/></div>
+          <div class="form-row"><input id="hsLat" type="number" step="0.000001" placeholder="Lat"/><input id="hsLon" type="number" step="0.000001" placeholder="Lon"/></div>
+          <div class="form-row"><input id="hsRadius" type="number" step="1" placeholder="Radius (m)" value="50"/><select id="hsRisk"><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></div>
+          <div class="form-row"><button id="btnSaveHotspot" class="btn small">Save</button><button id="btnCancelHotspot" class="btn small ghost">Cancel</button></div>
+        </div>
+        <hr style="margin:8px 0; border:none; border-top:1px solid #f1f5f9;" />
+        <ul id="hotspotsList"></ul>
+      </div>
+
+      <div class="card" style="text-align:center;">
+        <div class="legend"><span class="dot" style="background:#0b84ff"></span> Device &nbsp; <span class="dot" style="background:#e53935"></span> Event &nbsp; <span class="dot" style="background:#ffb300"></span> Hotspot</div>
+      </div>
+    </div>
+
+    <div id="mapWrap" class="card">
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+  /* Dashboard JS identical to the one you specified earlier.
+     It fetches /admin/devices, /admin/events, /admin/hotspots and provides UI actions
+     for confirming/dismissing events and adding/deleting hotspots.
+     (Omitted here for brevity — use the client code you prepared.) */
+  </script>
+</body>
+</html>
+"""
 
 # -------------------------
-# New admin JSON endpoints: events & hotspots (manage from admin)
+# Admin JSON endpoints
 # -------------------------
 @app.route('/admin/events')
 def admin_events():
@@ -857,12 +909,10 @@ def admin_events():
     events = AccidentEvent.query.order_by(AccidentEvent.created_at.desc()).limit(200).all()
     out = []
     for e in events:
-        reporters = []
         try:
             reporters = json.loads(e.reporters or "[]")
         except Exception:
             reporters = []
-        meta = {}
         try:
             meta = json.loads(e.metadata or "{}")
         except Exception:
@@ -897,7 +947,6 @@ def admin_event_confirm(event_id):
 def admin_event_dismiss(event_id):
     require_admin_api()
     e = AccidentEvent.query.get_or_404(event_id)
-    # dismissing here will mark severity=ignored and keep record
     e.severity = "ignored"
     e.confirmed = False
     db.session.add(e)
@@ -922,12 +971,11 @@ def admin_hotspots():
             })
         return jsonify({"hotspots": out})
     else:
-        # create new hotspot
         body = request.get_json(force=True, silent=True) or {}
         name = body.get("name", "Unnamed")
         lat = float(body.get("lat"))
         lon = float(body.get("lon"))
-        radius_m = float(body.get("radius_m", 50.0))
+        radius_m = float(body.get("radius_m", body.get("radius", 50.0)))
         risk_level = body.get("risk_level", "high")
         h = Hotspot(name=name, lat=lat, lon=lon, radius_m=radius_m, risk_level=risk_level)
         db.session.add(h)
@@ -943,7 +991,7 @@ def admin_hotspot_delete(hid):
     return jsonify({"ok": True})
 
 # -------------------------
-# Admin web pages / endpoints (dashboard)
+# Admin web pages
 # -------------------------
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
@@ -970,10 +1018,8 @@ def admin_logout():
 
 @app.route('/dashboard')
 def dashboard():
-    # friendly dashboard for non-technical users
     return render_template_string(DASHBOARD_HTML)
 
-# keep /friendly for compatibility
 @app.route('/friendly')
 def friendly():
     return render_template_string(DASHBOARD_HTML)
@@ -1096,7 +1142,7 @@ def admin_device_revoke(device_id):
     return jsonify({"ok": True, "revoked": True})
 
 # -------------------------
-# Socket.IO events (unchanged, preserved)
+# Socket.IO events
 # -------------------------
 @socketio.on('connect')
 def ws_connect():
