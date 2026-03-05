@@ -1016,7 +1016,12 @@ DASHBOARD_HTML = """
   </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-
+<script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
+<script>
+  const DateTime = luxon.DateTime;
+  const dt = DateTime.fromISO(d.last_snapshot.ts, { zone: 'utc' }).setZone('Africa/Nairobi');
+  document.getElementById('detailTs').innerText = dt.toLocaleString(DateTime.DATETIME_MED);
+</script>
 <script>
   const devicesListEl = document.getElementById('devicesList');
   const devicesCountEl = document.getElementById('devicesCount');
@@ -1434,3 +1439,4 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
