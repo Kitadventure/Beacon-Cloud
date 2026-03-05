@@ -22,23 +22,19 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # -------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///beacon.db")
 CLEANUP_STALE_SECONDS = int(os.environ.get("CLEANUP_STALE_SECONDS", "12"))  # remove snapshots older than this
-NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))  # 1 km default
+NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))  # 1 km default per your spec
 HEARTBEAT_MIN_INTERVAL_S = float(os.environ.get("HEARTBEAT_MIN_INTERVAL_S", "0.5"))  # basic rate-limit
 UNSAFE_TTC_SECONDS = float(os.environ.get("UNSAFE_TTC_SECONDS", "6.0"))  # threshold for opposite-direction unsafe
 CONFIRMATION_RADIUS_M = float(os.environ.get("CONFIRMATION_RADIUS_M", "30.0"))  # support devices gathering radius
-
+# Optional API token for scripted admin calls
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN")
+# Optionally seed admin via env on first run:
 ADMIN_USER = os.environ.get("ADMIN_USER")
 ADMIN_PASS = os.environ.get("ADMIN_PASS")
 
 VEHICLE_LENGTH_M = float(os.environ.get("VEHICLE_LENGTH_M", "5.0"))
 OVERTAKE_EXTRA_M = float(os.environ.get("OVERTAKE_EXTRA_M", "5.0"))
 SAFETY_FACTOR = float(os.environ.get("SAFETY_FACTOR", "1.5"))
-
-# Accident/event settings
-REPORTS_TO_CONFIRM = int(os.environ.get("REPORTS_TO_CONFIRM", "2"))
-EVENT_MERGE_WINDOW_S = int(os.environ.get("EVENT_MERGE_WINDOW_S", "300"))
-EVENT_MERGE_RADIUS_M = float(os.environ.get("EVENT_MERGE_RADIUS_M", "50.0"))
 
 # -------------------------
 # Flask + SQLAlchemy + SocketIO init
@@ -48,6 +44,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
 
+# Use threading async_mode for Windows/dev. For production (multi-process) configure SocketIO with Redis and eventlet.
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 db = SQLAlchemy(app)
@@ -81,52 +78,23 @@ class Snapshot(db.Model):
     speed_mps = db.Column(db.Float)   # store m/s
     bearing_deg = db.Column(db.Float) # 0..360
     heading_deg = db.Column(db.Float) # optional
-    source = db.Column(db.String(32), default="app")
-    raw = db.Column(db.Text)
-
-class EventReport(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    device_id = db.Column(db.String(36), index=True)
-    ts = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    lat = db.Column(db.Float)
-    lon = db.Column(db.Float)
-    event_type = db.Column(db.String(64))
-    g_force = db.Column(db.Float, nullable=True)
-    speed_before = db.Column(db.Float, nullable=True)
-    speed_after = db.Column(db.Float, nullable=True)
-    raw = db.Column(db.Text)
-
-class AccidentEvent(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    lat = db.Column(db.Float)
-    lon = db.Column(db.Float)
-    event_type = db.Column(db.String(64))
-    reports_count = db.Column(db.Integer, default=0)
-    reporters = db.Column(db.Text)  # JSON list
-    confirmed = db.Column(db.Boolean, default=False)
-    confirmed_at = db.Column(db.DateTime, nullable=True)
-    severity = db.Column(db.String(32), default="unknown")
-    metadata_json = db.Column(db.Text)
-
-class Hotspot(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(128))
-    lat = db.Column(db.Float)
-    lon = db.Column(db.Float)
-    radius_m = db.Column(db.Float, default=50.0)
-    risk_level = db.Column(db.String(32), default="high")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    source = db.Column(db.String(32), default="app") # e.g., "app", "web"
+    raw = db.Column(db.Text) # JSON dump of raw payload (optional)
 
 # -------------------------
-# In-memory helpers & caches
+# Simple in-memory rate tracking (per-device)
 # -------------------------
-_last_heartbeat_at = {}
+_last_heartbeat_at = {}  # device_id -> timestamp (float)
+# Note: for multi-process deployments, move this into Redis or DB.
+
+# -------------------------
+# In-memory active device cache (thread-safe)
+# -------------------------
 active_devices = {}
 active_devices_lock = threading.Lock()
-connected_sockets = {}  # { device_id: set(sid) }
 
 def update_active_device_from_snapshot(snap):
+    """Given a Snapshot model instance, update in-memory active_devices."""
     try:
         with active_devices_lock:
             active_devices[snap.device_id] = {
@@ -142,6 +110,7 @@ def update_active_device_from_snapshot(snap):
         pass
 
 def prune_active_devices():
+    """Remove entries older than CLEANUP_STALE_SECONDS."""
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
         with active_devices_lock:
@@ -152,7 +121,7 @@ def prune_active_devices():
         pass
 
 # -------------------------
-# Geodesy + decision helpers
+# Helpers: geodesy + relative computations
 # -------------------------
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -197,28 +166,7 @@ def estimate_overtake_time_mps(your_speed_mps, target_speed_mps):
     return dist / rel
 
 # -------------------------
-# Hotspot helpers
-# -------------------------
-def hotspots_near(lat, lon, radius_m=None):
-    if radius_m is None:
-        radius_m = CONFIRMATION_RADIUS_M
-    res = []
-    try:
-        hs = Hotspot.query.all()
-        for h in hs:
-            d = haversine_m(lat, lon, h.lat, h.lon)
-            if d <= max(radius_m, h.radius_m):
-                res.append((h, d))
-    except Exception:
-        pass
-    return res
-
-def is_in_hotspot(lat, lon):
-    hits = hotspots_near(lat, lon, radius_m=None)
-    return hits[0] if hits else None
-
-# -------------------------
-# Confidence & decision logic (cloud authoritative)
+# New: Confidence + Decision logic (cloud authoritative)
 # -------------------------
 def _recent_snapshots_for_device(device_id, limit=5):
     return Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).limit(limit).all()
@@ -252,12 +200,11 @@ def compute_warning(self_lat, self_lon, self_speed_mps, self_bearing,
     ttc = float('inf')
     if close > 0.1:
         ttc = d / close
-    guidance = {
-        'distance_m': round(d, 2),
-        'direction': cls,
-        'closing_mps': round(close, 2),
-        'time_to_collision_s': round(ttc, 2) if ttc != float('inf') else None
-    }
+    guidance = {}
+    guidance['distance_m'] = round(d, 2)
+    guidance['direction'] = cls
+    guidance['closing_mps'] = round(close, 2)
+    guidance['time_to_collision_s'] = round(ttc, 2) if ttc != float('inf') else None
     if cls == "same":
         required = estimate_overtake_time_mps(self_speed_mps, other_speed_mps)
         guidance['overtake_time_required_s'] = round(required, 2)
@@ -268,10 +215,6 @@ def compute_warning(self_lat, self_lon, self_speed_mps, self_bearing,
     return guidance
 
 def classify_risk(self_snap, other_snap):
-    """
-    Existing logic preserved — we add a small hotspot modifier:
-    - if the midpoint lies inside an admin hotspot, increase confidence and possibly promote to RED if hotspot is high risk.
-    """
     if not self_snap or not other_snap:
         return {"decision": "yellow", "confidence": 0.2, "reason": "missing_data"}
 
@@ -298,27 +241,11 @@ def classify_risk(self_snap, other_snap):
     base_confidence = 0.35 * recency_score + 0.40 * dist_score + 0.25 * support_score
     base_confidence = max(0.0, min(1.0, base_confidence))
 
-    # Hotspot influence:
-    hs_hit = is_in_hotspot(mid_lat, mid_lon)
-    hotspot_modifier = 0.0
-    if hs_hit:
-        hotspot, hd = hs_hit
-        if hotspot.risk_level == "high":
-            hotspot_modifier = 0.25
-        elif hotspot.risk_level == "medium":
-            hotspot_modifier = 0.12
-        else:
-            hotspot_modifier = 0.06
-    base_confidence = min(1.0, base_confidence + hotspot_modifier)
-
-    # existing logic with modified confidence...
     if direction == "opposite":
         if ttc == float('inf'):
-            return {"decision": "green", "confidence": round(base_confidence * 0.6, 2), "reason": "opposite_no_closing"}
+            return {"decision": "green", "confidence": base_confidence * 0.6, "reason": "opposite_no_closing"}
         if ttc < UNSAFE_TTC_SECONDS:
             conf = min(1.0, base_confidence + 0.25 * (1.0 - (ttc / UNSAFE_TTC_SECONDS)) + 0.1 * support_score)
-            if hs_hit and hotspot.risk_level == "high" and conf > 0.45:
-                return {"decision": "red", "confidence": round(conf, 2), "reason": f"opposite_ttc_{round(ttc,1)}s_hotspot"}
             return {"decision": "red", "confidence": round(conf, 2), "reason": f"opposite_ttc_{round(ttc,1)}s"}
         else:
             conf = base_confidence * (0.6 + 0.4 * max(0.0, (NEARBY_DEFAULT_RADIUS_M - d) / NEARBY_DEFAULT_RADIUS_M))
@@ -327,7 +254,7 @@ def classify_risk(self_snap, other_snap):
     if direction == "same":
         required = estimate_overtake_time_mps(self_snap.speed_mps, other_snap.speed_mps)
         if self_snap.speed_mps <= other_snap.speed_mps + 0.01:
-            return {"decision": "green", "confidence": round(base_confidence * 0.6, 2), "reason": "same_no_overtake_possible"}
+            return {"decision": "green", "confidence": base_confidence * 0.6, "reason": "same_no_overtake_possible"}
         cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
         other_snaps = Snapshot.query.filter(Snapshot.device_id != self_snap.device_id, Snapshot.ts >= cutoff).all()
         imminent_opposing = False
@@ -364,6 +291,7 @@ def classify_risk(self_snap, other_snap):
 def init_db():
     with app.app_context():
         db.create_all()
+        # create initial admin from env if provided and no admins exist
         try:
             if Admin.query.count() == 0 and ADMIN_USER and ADMIN_PASS:
                 h = generate_password_hash(ADMIN_PASS)
@@ -381,95 +309,6 @@ def cleanup_old_snapshots():
     cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
     Snapshot.query.filter(Snapshot.ts < cutoff).delete()
     db.session.commit()
-
-# -------------------------
-# Event aggregation
-# -------------------------
-def create_or_update_accident_event_from_report(rep: EventReport):
-    try:
-        cutoff = datetime.utcnow() - timedelta(seconds=EVENT_MERGE_WINDOW_S)
-        candidates = AccidentEvent.query.filter(AccidentEvent.created_at >= cutoff, AccidentEvent.confirmed == False).all()
-        for ev in candidates:
-            d = haversine_m(rep.lat, rep.lon, ev.lat, ev.lon)
-            if d <= EVENT_MERGE_RADIUS_M:
-                reporters = json.loads(ev.reporters or "[]")
-                if rep.device_id not in reporters:
-                    reporters.append(rep.device_id)
-                    ev.reporters = json.dumps(reporters)
-                    ev.reports_count = len(reporters)
-                meta = json.loads(ev.metadata_json or "{}")
-                meta.setdefault("last_report_at", datetime.utcnow().isoformat())
-                meta.setdefault("samples", []).append({
-                    "report_id": rep.id,
-                    "device_id": rep.device_id,
-                    "g_force": rep.g_force,
-                    "speed_before": rep.speed_before,
-                    "speed_after": rep.speed_after,
-                    "ts": rep.ts.isoformat()
-                })
-                ev.metadata_json = json.dumps(meta)
-                sev = ev.severity or "unknown"
-                try:
-                    for s in meta.get("samples", []):
-                        if s.get("g_force") and float(s.get("g_force")) >= 6.0:
-                            sev = "high"
-                        elif s.get("g_force") and float(s.get("g_force")) >= 3.0 and sev != "high":
-                            sev = "medium"
-                except Exception:
-                    pass
-                ev.severity = sev
-                db.session.add(ev)
-                db.session.commit()
-                if ev.reports_count >= REPORTS_TO_CONFIRM and not ev.confirmed:
-                    ev.confirmed = True
-                    ev.confirmed_at = datetime.utcnow()
-                    db.session.add(ev)
-                    db.session.commit()
-                return ev
-
-        reporters = [rep.device_id] if rep.device_id else []
-        meta = {
-            "first_report_id": rep.id,
-            "samples": [{
-                "report_id": rep.id,
-                "device_id": rep.device_id,
-                "g_force": rep.g_force,
-                "speed_before": rep.speed_before,
-                "speed_after": rep.speed_after,
-                "ts": rep.ts.isoformat()
-            }]
-        }
-        sev = "unknown"
-        try:
-            if rep.g_force and float(rep.g_force) >= 6.0:
-                sev = "high"
-            elif rep.g_force and float(rep.g_force) >= 3.0:
-                sev = "medium"
-            elif rep.g_force:
-                sev = "low"
-        except Exception:
-            pass
-        ev = AccidentEvent(
-            lat=rep.lat,
-            lon=rep.lon,
-            event_type=rep.event_type or "impact",
-            reports_count=len(reporters),
-            reporters=json.dumps(reporters),
-            confirmed=(len(reporters) >= REPORTS_TO_CONFIRM),
-            confirmed_at=(datetime.utcnow() if len(reporters) >= REPORTS_TO_CONFIRM else None),
-            severity=sev,
-            metadata_json=json.dumps(meta)
-        )
-        db.session.add(ev)
-        db.session.commit()
-        return ev
-    except Exception:
-        app.logger.exception("create_or_update_accident_event_from_report error")
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return None
 
 # -------------------------
 # Authentication helpers
@@ -492,6 +331,10 @@ def require_auth_token():
     return device
 
 def require_admin_api():
+    """
+    API-level admin check: allow if logged in via session OR provide ADMIN_API_TOKEN in Bearer header.
+    Use this for JSON admin endpoints. UI routes rely on session.
+    """
     if session.get('admin_logged'):
         return True
     auth = request.headers.get("Authorization", "")
@@ -502,8 +345,10 @@ def require_admin_api():
     abort(401, "Admin access required")
 
 # -------------------------
-# Socket helpers
+# In-memory socket tracking
 # -------------------------
+connected_sockets = {}  # { device_id: set(sid) }
+
 def send_ws_to_device(device_id, event, payload):
     sids = connected_sockets.get(device_id)
     if not sids:
@@ -519,7 +364,7 @@ def send_ws_to_device(device_id, event, payload):
     return True
 
 # -------------------------
-# API routes: health/onboard/heartbeat/nearby
+# Routes: API (onboard, heartbeat, nearby, admin)
 # -------------------------
 @app.route("/health")
 def health():
@@ -546,6 +391,7 @@ def heartbeat():
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id") or device.id
 
+    # Rate-limiting (basic)
     now_ts = time.time()
     last = _last_heartbeat_at.get(device_id)
     if last and (now_ts - last) < HEARTBEAT_MIN_INTERVAL_S:
@@ -594,6 +440,7 @@ def heartbeat():
     db.session.add(snap)
     db.session.commit()
 
+    # update in-memory cache for active devices and prune old entries
     try:
         update_active_device_from_snapshot(snap)
         prune_active_devices()
@@ -602,6 +449,7 @@ def heartbeat():
 
     cleanup_old_snapshots()
 
+    # compute authoritative nearby + decisions and push via socket
     try:
         nearby_payload = compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M)
         send_ws_to_device(device_id, 'nearby_update', nearby_payload)
@@ -633,7 +481,8 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
         with active_devices_lock:
             entry = active_devices.get(device_id)
         if entry:
-            class _Tmp: pass
+            class _Tmp:
+                pass
             t = _Tmp()
             t.device_id = device_id
             t.lat = entry.get("lat")
@@ -657,7 +506,8 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
             if seen:
                 continue
             if entry.get("ts") >= cutoff:
-                class _Tmp2: pass
+                class _Tmp2:
+                    pass
                 t = _Tmp2()
                 t.device_id = did
                 t.lat = entry.get("lat")
@@ -708,61 +558,7 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
     }
 
 # -------------------------
-# Event reporting endpoint (from app)
-# -------------------------
-@app.route("/report_event", methods=["POST"])
-def report_event():
-    device = require_auth_token()
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        lat = float(payload.get("lat"))
-        lon = float(payload.get("lon"))
-    except Exception:
-        return jsonify({"error": "lat & lon required"}), 400
-    event_type = payload.get("event_type", "impact")
-    try:
-        g_force = float(payload.get("g_force")) if payload.get("g_force") is not None else None
-    except Exception:
-        g_force = None
-    try:
-        spb = float(payload.get("speed_before")) if payload.get("speed_before") is not None else None
-    except Exception:
-        spb = None
-    try:
-        spa = float(payload.get("speed_after")) if payload.get("speed_after") is not None else None
-    except Exception:
-        spa = None
-    ts_str = payload.get("ts")
-    try:
-        ts = datetime.fromisoformat(ts_str) if ts_str else datetime.utcnow()
-    except Exception:
-        ts = datetime.utcnow()
-
-    rep = EventReport(
-        device_id=device.id,
-        ts=ts,
-        lat=lat,
-        lon=lon,
-        event_type=event_type,
-        g_force=g_force,
-        speed_before=spb,
-        speed_after=spa,
-        raw=json.dumps(payload)
-    )
-    db.session.add(rep)
-    db.session.commit()
-
-    ev = create_or_update_accident_event_from_report(rep)
-
-    return jsonify({
-        "ok": True,
-        "report_id": rep.id,
-        "event_id": ev.id if ev else None,
-        "event_confirmed": bool(ev.confirmed) if ev else False
-    })
-
-# -------------------------
-# Admin templates (login + dashboard)
+# Admin/UI templates and routes
 # -------------------------
 ADMIN_LOGIN_HTML = """
 <!doctype html>
@@ -788,44 +584,47 @@ ADMIN_LOGIN_HTML = """
 </html>
 """
 
+# -------------------------
+# New: Friendly Dashboard HTML (for /dashboard and /friendly)
+# -------------------------
 DASHBOARD_HTML = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Beacon — Dashboard (Events & Hotspots)</title>
+  <title>Beacon — Dashboard</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     :root{ --bg:#f7f9fb; --card:#ffffff; --muted:#6b7280; --accent:#0b84ff; }
     body{ font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin:0; background:var(--bg); color:#111827;}
-    header{ background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding:14px 18px; display:flex; align-items:center; gap:12px;}
+    header{ background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding:18px 20px; display:flex; align-items:center; gap:12px;}
     header h1{ font-size:18px; margin:0;}
-    .wrap{ display:flex; gap:12px; padding:12px; height: calc(100vh - 64px); box-sizing:border-box; }
+    .wrap{ display:flex; gap:12px; padding:12px; height: calc(100vh - 72px); box-sizing:border-box;}
     .left{ width:360px; display:flex; flex-direction:column; gap:12px; }
     .card{ background:var(--card); border-radius:10px; padding:12px; box-shadow:0 6px 18px rgba(15,23,42,0.06); overflow:auto; }
-    #devicesList, #eventsList, #hotspotsList{ list-style:none; margin:0; padding:0; }
-    li.item{ padding:10px; border-radius:8px; margin-bottom:8px; border:1px solid #eef2f7; display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+    #devicesList{ list-style:none; margin:0; padding:0; }
+    #devicesList li{ padding:10px; border-radius:8px; margin-bottom:8px; cursor:pointer; border:1px solid #eef2f7; display:flex; justify-content:space-between; align-items:center; gap:8px;}
+    #devicesList li.selected{ background:#eef8ff; border-color:#cfe9ff; }
+    .dev-meta{ font-size:13px; color:var(--muted); }
     .big{ font-weight:600; font-size:14px; }
     .muted{ color:var(--muted); font-size:13px; }
     #mapWrap{ flex:1; display:flex; flex-direction:column; gap:12px; }
     #map{ flex:1; border-radius:10px; overflow:hidden; }
+    #detailCard{ height:200px; min-height:160px; }
     .row{ display:flex; justify-content:space-between; gap:8px; margin-top:6px; }
-    .btn{ background:var(--accent); color:white; padding:8px 10px; border-radius:8px; border:none; cursor:pointer; }
-    .btn.ghost{ background:transparent; color:var(--accent); border:1px solid #e6f2f7; }
+    .btn{ background:var(--accent); color:white; padding:8px 10px; border-radius:8px; border:none; cursor:pointer;}
+    .btn.ghost{ background:transparent; color:var(--accent); border:1px solid #e6f2ff;}
     .small{ font-size:12px; padding:6px 8px; border-radius:6px; }
-    .pill{ padding:6px 8px; border-radius:6px; background:#eef2f7; font-size:12px; }
-    .legend{ font-size:13px; display:flex; gap:8px; align-items:center; }
-    .legend .dot{ width:12px; height:12px; border-radius:6px; display:inline-block; }
-    .controls{ display:flex; gap:8px; flex-wrap:wrap; }
-    .form-row{ display:flex; gap:6px; margin-top:6px; }
-    input[type="text"], input[type="number"]{ padding:6px 8px; border-radius:6px; border:1px solid #e6eef6; font-size:13px; }
+    a.osm{ color:var(--accent); text-decoration:none; font-weight:600; }
+    footer { font-size:12px; color:var(--muted); padding:8px 16px; text-align:right; }
+    #statusBar { font-size:13px; color:#08306B; margin-top:8px; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Beacon — Dashboard (Events & Hotspots)</h1>
-    <div style="margin-left:auto; font-size:13px; opacity:0.95;">Auto-refresh every 5s — admin session required</div>
+    <h1>Beacon — Live Dashboard</h1>
+    <div style="margin-left:auto; font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</div>
   </header>
 
   <div class="wrap">
@@ -836,52 +635,47 @@ DASHBOARD_HTML = """
             <div class="muted">Devices</div>
             <div class="big" id="devicesCount">0 devices</div>
           </div>
-          <div class="controls">
+          <div>
             <button id="btnRefresh" class="btn small">Refresh</button>
-            <button id="btnCenter" class="btn small ghost">Center Map</button>
           </div>
         </div>
-        <div id="statusBar" class="muted" style="margin-top:8px;">Status: idle</div>
+
+        <div id="statusBar" class="muted">Status: idle</div>
+
         <hr style="margin:10px 0; border:none; border-top:1px solid #f1f5f9;" />
         <ul id="devicesList"></ul>
       </div>
 
-      <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <div class="muted">Events (possible accidents)</div>
-            <div class="big" id="eventsCount">0 events</div>
+      <div id="detailCard" class="card">
+        <div id="placeholderDetail"><em>Select a device to see details & map</em></div>
+        <div id="deviceDetail" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <div id="detailName" class="big"></div>
+              <div id="detailOwner" class="muted"></div>
+            </div>
+            <div>
+              <button id="btnRevoke" class="btn ghost small">Revoke</button>
+            </div>
           </div>
-          <div>
-            <button id="btnClearEvents" class="btn small ghost">Clear selection</button>
+
+          <div class="row">
+            <div><div class="muted">Last seen</div><div id="detailTs" class="big"></div></div>
+            <div><div class="muted">Speed</div><div id="detailSpeed" class="big">—</div></div>
+          </div>
+
+          <div class="row">
+            <div><div class="muted">Location</div><div id="detailLoc" class="muted"></div></div>
+            <div><a id="osmLink" class="osm" target="_blank">Open in OSM ↗</a></div>
+          </div>
+
+          <div style="margin-top:8px;">
+            <div class="muted">Raw heartbeat (last)</div>
+            <pre id="detailRaw" style="background:#fbfdff; padding:8px; border-radius:6px; max-height:80px; overflow:auto;">—</pre>
           </div>
         </div>
-        <ul id="eventsList"></ul>
       </div>
 
-      <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <div class="muted">Hotspots</div>
-            <div class="big" id="hotspotsCount">0</div>
-          </div>
-          <div>
-            <button id="btnNewHotspot" class="btn small">Add Hotspot</button>
-          </div>
-        </div>
-        <div id="hotspotForm" style="display:none; margin-top:8px;">
-          <div class="form-row"><input id="hsName" type="text" placeholder="Name"/></div>
-          <div class="form-row"><input id="hsLat" type="number" step="0.000001" placeholder="Lat"/><input id="hsLon" type="number" step="0.000001" placeholder="Lon"/></div>
-          <div class="form-row"><input id="hsRadius" type="number" step="1" placeholder="Radius (m)" value="50"/><select id="hsRisk"><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></div>
-          <div class="form-row"><button id="btnSaveHotspot" class="btn small">Save</button><button id="btnCancelHotspot" class="btn small ghost">Cancel</button></div>
-        </div>
-        <hr style="margin:8px 0; border:none; border-top:1px solid #f1f5f9;" />
-        <ul id="hotspotsList"></ul>
-      </div>
-
-      <div class="card" style="text-align:center;">
-        <div class="legend"><span class="dot" style="background:#0b84ff"></span> Device &nbsp; <span class="dot" style="background:#e53935"></span> Event &nbsp; <span class="dot" style="background:#ffb300"></span> Hotspot</div>
-      </div>
     </div>
 
     <div id="mapWrap" class="card">
@@ -889,110 +683,183 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-  /* Dashboard JS identical to the one you specified earlier.
-     It fetches /admin/devices, /admin/events, /admin/hotspots and provides UI actions
-     for confirming/dismissing events and adding/deleting hotspots.
-     (Omitted here for brevity — use the client code you prepared.) */
-  </script>
+  <footer>Beacon — simple live tracking dashboard</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+  const devicesListEl = document.getElementById('devicesList');
+  const devicesCountEl = document.getElementById('devicesCount');
+  const btnRefresh = document.getElementById('btnRefresh');
+  const statusBar = document.getElementById('statusBar');
+
+  let devicesCache = [];
+  let selectedId = null;
+  let refreshTimer = null;
+
+  // Leaflet map init
+  const map = L.map('map', { center: [0,0], zoom: 2, preferCanvas:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  let marker = null;
+  let circle = null;
+
+  btnRefresh.addEventListener('click', fetchDevices);
+
+  async function fetchDevices(){
+    statusBar.innerText = "Status: fetching /admin/devices...";
+    try {
+      const res = await fetch('/admin/devices', { cache: "no-store" });
+      const txt = await res.text();
+      // show debug size to the user for transparency
+      statusBar.innerText = `Status: HTTP ${res.status} — response ${txt.length} bytes`;
+      let data;
+      try {
+        data = JSON.parse(txt);
+      } catch (e) {
+        // fallback: sometimes frameworks return single quotes / weird content; try safe JSON extraction
+        console.warn("JSON.parse failed, trying fallback:", e);
+        // attempt to extract a JSON-looking substring
+        const m = txt.match(/\\{\\s*"?devices"?:[\\s\\S]*\\}/);
+        if (m) {
+          data = JSON.parse(m[0]);
+        } else {
+          throw new Error("Response not valid JSON");
+        }
+      }
+      devicesCache = data.devices || [];
+      statusBar.innerText = `Status: fetched ${devicesCache.length} device(s)`;
+      renderList();
+    } catch (err) {
+      console.error("fetchDevices error:", err);
+      statusBar.innerText = "Status: fetch error — see console for details";
+      devicesCache = [];
+      renderList(); // render empty state
+    }
+  }
+
+  function renderList(){
+    devicesListEl.innerHTML = '';
+    const count = devicesCache.length || 0;
+    devicesCountEl.innerText = (count === 1) ? "1 device" : (count + " devices");
+
+    // Sort newest first (use timestamp if present; 'never' fallback keeps them last)
+    devicesCache.sort((a,b) => {
+      const ta = a.last_snapshot && a.last_snapshot.ts ? new Date(a.last_snapshot.ts).getTime() : 0;
+      const tb = b.last_snapshot && b.last_snapshot.ts ? new Date(b.last_snapshot.ts).getTime() : 0;
+      return tb - ta;
+    });
+
+    for (const d of devicesCache) {
+      const li = document.createElement('li');
+      li.dataset.id = d.id;
+      const name = d.car_name || d.car_model || d.id;
+      const last = d.last_snapshot ? (d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen') : 'never';
+      const speed = d.last_snapshot ? (((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h') : '—';
+      li.innerHTML = `<div style="min-width:0;">
+                        <div class="big">${escapeHtml(name)}</div>
+                        <div class="dev-meta">${escapeHtml(d.owner || '')} — ${escapeHtml(d.plate || '')}</div>
+                      </div>
+                      <div style="text-align:right;">
+                        <div class="muted">${escapeHtml(last)}</div>
+                        <div class="muted">${escapeHtml(speed)}</div>
+                      </div>`;
+      li.addEventListener('click', () => selectDevice(d.id));
+      if (d.id === selectedId) li.classList.add('selected');
+      devicesListEl.appendChild(li);
+    }
+
+    if (!selectedId && devicesCache.length > 0) {
+      selectDevice(devicesCache[0].id);
+    }
+  }
+
+  function selectDevice(id) {
+    selectedId = id;
+    document.querySelectorAll('#devicesList li').forEach(li => {
+      li.classList.toggle('selected', li.dataset.id === id);
+    });
+    const d = devicesCache.find(x => x.id === id);
+    if (!d) return;
+    showDetail(d);
+    if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
+      placeMarker(d.last_snapshot.lat, d.last_snapshot.lon, d);
+    } else {
+      // center to world but keep marker cleared if none
+      clearMarker();
+    }
+  }
+
+  function showDetail(d) {
+    document.getElementById('placeholderDetail').style.display = 'none';
+    const panel = document.getElementById('deviceDetail');
+    panel.style.display = 'block';
+    document.getElementById('detailName').innerText = d.car_name || d.car_model || d.id;
+    document.getElementById('detailOwner').innerText = d.owner || '';
+    if (d.last_snapshot) {
+      document.getElementById('detailTs').innerText = d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen';
+      const spd = ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
+      document.getElementById('detailSpeed').innerText = spd;
+      document.getElementById('detailLoc').innerText = (typeof d.last_snapshot.lat === 'number' && typeof d.last_snapshot.lon === 'number')
+        ? (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6)) : '—';
+      document.getElementById('osmLink').href = (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon)
+        ? `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`
+        : '#';
+      document.getElementById('detailRaw').innerText = JSON.stringify(d.last_snapshot.raw || d.last_snapshot, null, 2);
+      document.getElementById('btnRevoke').onclick = async () => {
+        if (!confirm('Revoke device token? This prevents the app from authenticating with that token.')) return;
+        try {
+          const res = await fetch('/admin/device/' + d.id + '/revoke', { method: 'POST' });
+          if (!res.ok) { alert('Revoke failed'); return; }
+          alert('Device revoked');
+          fetchDevices();
+        } catch (e) { alert('Revoke error'); }
+      };
+    } else {
+      document.getElementById('detailTs').innerText = '—';
+      document.getElementById('detailSpeed').innerText = '—';
+      document.getElementById('detailLoc').innerText = '—';
+      document.getElementById('detailRaw').innerText = '—';
+      document.getElementById('osmLink').href = '#';
+    }
+  }
+
+  function placeMarker(lat, lon, d) {
+    if (!marker) {
+      marker = L.marker([lat, lon]).addTo(map);
+    } else {
+      marker.setLatLng([lat, lon]);
+    }
+    if (!circle) {
+      circle = L.circle([lat, lon], { radius: (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
+    } else {
+      circle.setLatLng([lat, lon]);
+    }
+    map.setView([lat, lon], 15, { animate: true });
+    marker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
+  }
+
+  function clearMarker(){
+    if (marker) { map.removeLayer(marker); marker = null; }
+    if (circle) { map.removeLayer(circle); circle = null; }
+  }
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/[&<>"'`]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',"`":'&#96;'})[c]);
+  }
+
+  // auto-refresh
+  refreshTimer = setInterval(fetchDevices, 5000);
+
+  // initial load
+  fetchDevices();
+
+</script>
 </body>
 </html>
 """
 
-# -------------------------
-# Admin JSON endpoints
-# -------------------------
-@app.route('/admin/events')
-def admin_events():
-    require_admin_api()
-    events = AccidentEvent.query.order_by(AccidentEvent.created_at.desc()).limit(200).all()
-    out = []
-    for e in events:
-        try:
-            reporters = json.loads(e.reporters or "[]")
-        except Exception:
-            reporters = []
-        try:
-            meta = json.loads(e.metadata_json or "{}")
-        except Exception:
-            meta = {}
-        out.append({
-            "id": e.id,
-            "created_at": e.created_at.isoformat() if e.created_at else None,
-            "lat": e.lat,
-            "lon": e.lon,
-            "event_type": e.event_type,
-            "reports_count": e.reports_count,
-            "reporters": reporters,
-            "confirmed": bool(e.confirmed),
-            "confirmed_at": e.confirmed_at.isoformat() if e.confirmed_at else None,
-            "severity": e.severity,
-            "metadata": meta
-        })
-    return jsonify({"events": out})
-
-@app.route('/admin/event/<int:event_id>/confirm', methods=['POST'])
-def admin_event_confirm(event_id):
-    require_admin_api()
-    e = AccidentEvent.query.get_or_404(event_id)
-    if not e.confirmed:
-        e.confirmed = True
-        e.confirmed_at = datetime.utcnow()
-        db.session.add(e)
-        db.session.commit()
-    return jsonify({"ok": True, "confirmed": True, "event_id": e.id})
-
-@app.route('/admin/event/<int:event_id>/dismiss', methods=['POST'])
-def admin_event_dismiss(event_id):
-    require_admin_api()
-    e = AccidentEvent.query.get_or_404(event_id)
-    e.severity = "ignored"
-    e.confirmed = False
-    db.session.add(e)
-    db.session.commit()
-    return jsonify({"ok": True, "dismissed": True, "event_id": e.id})
-
-@app.route('/admin/hotspots', methods=['GET', 'POST'])
-def admin_hotspots():
-    require_admin_api()
-    if request.method == 'GET':
-        hs = Hotspot.query.order_by(Hotspot.created_at.desc()).all()
-        out = []
-        for h in hs:
-            out.append({
-                "id": h.id,
-                "name": h.name,
-                "lat": h.lat,
-                "lon": h.lon,
-                "radius_m": h.radius_m,
-                "risk_level": h.risk_level,
-                "created_at": h.created_at.isoformat() if h.created_at else None
-            })
-        return jsonify({"hotspots": out})
-    else:
-        body = request.get_json(force=True, silent=True) or {}
-        name = body.get("name", "Unnamed")
-        lat = float(body.get("lat"))
-        lon = float(body.get("lon"))
-        radius_m = float(body.get("radius_m", body.get("radius", 50.0)))
-        risk_level = body.get("risk_level", "high")
-        h = Hotspot(name=name, lat=lat, lon=lon, radius_m=radius_m, risk_level=risk_level)
-        db.session.add(h)
-        db.session.commit()
-        return jsonify({"ok": True, "hotspot_id": h.id})
-
-@app.route('/admin/hotspot/<int:hid>/delete', methods=['POST'])
-def admin_hotspot_delete(hid):
-    require_admin_api()
-    h = Hotspot.query.get_or_404(hid)
-    db.session.delete(h)
-    db.session.commit()
-    return jsonify({"ok": True})
-
-# -------------------------
-# Admin web pages
-# -------------------------
+# Admin web pages / endpoints
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if request.method == 'GET':
@@ -1018,15 +885,16 @@ def admin_logout():
 
 @app.route('/dashboard')
 def dashboard():
+    # friendly dashboard for non-technical users
     return render_template_string(DASHBOARD_HTML)
 
+# keep /friendly for compatibility
 @app.route('/friendly')
 def friendly():
     return render_template_string(DASHBOARD_HTML)
 
 @app.route('/admin/devices')
 def admin_devices():
-    require_admin_api()
     devices = Device.query.all()
     out = []
     prune_active_devices()
@@ -1078,7 +946,6 @@ def admin_devices():
 
 @app.route('/admin/device/<device_id>/json')
 def admin_device_json(device_id):
-    require_admin_api()
     d = Device.query.get_or_404(device_id)
     snaps = _recent_snapshots_for_device(device_id, limit=20)
     snaps_out = []
@@ -1132,7 +999,6 @@ def admin_device_json(device_id):
 
 @app.route('/admin/device/<device_id>/revoke', methods=['POST'])
 def admin_device_revoke(device_id):
-    require_admin_api()
     d = Device.query.get_or_404(device_id)
     d.revoked = True
     db.session.commit()
@@ -1142,7 +1008,7 @@ def admin_device_revoke(device_id):
     return jsonify({"ok": True, "revoked": True})
 
 # -------------------------
-# Socket.IO events
+# Socket.IO events (unchanged, preserved)
 # -------------------------
 @socketio.on('connect')
 def ws_connect():
