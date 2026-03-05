@@ -36,6 +36,14 @@ VEHICLE_LENGTH_M = float(os.environ.get("VEHICLE_LENGTH_M", "5.0"))
 OVERTAKE_EXTRA_M = float(os.environ.get("OVERTAKE_EXTRA_M", "5.0"))
 SAFETY_FACTOR = float(os.environ.get("SAFETY_FACTOR", "1.5"))
 
+# Accident detection tuning (server-side inference; no native changes required)
+# thresholds in m/s^2 and m/s
+ACCIDENT_DECEL_HIGH_MPS2 = float(os.environ.get("ACCIDENT_DECEL_HIGH_MPS2", "8.0"))   # strong deceleration ~ -8 m/s^2
+ACCIDENT_DECEL_MED_MPS2 = float(os.environ.get("ACCIDENT_DECEL_MED_MPS2", "5.0"))     # medium ~ -5 m/s^2
+ACCIDENT_SPEED_DROP_MPS = float(os.environ.get("ACCIDENT_SPEED_DROP_MPS", "10.0"))    # drop of 10 m/s (~36 km/h)
+ACCIDENT_BEARING_JUMP_DEG = float(os.environ.get("ACCIDENT_BEARING_JUMP_DEG", "60.0"))# abrupt heading change
+ACCIDENT_TIME_WINDOW_S = float(os.environ.get("ACCIDENT_TIME_WINDOW_S", "3.0"))       # examine last N seconds
+
 # -------------------------
 # Flask + SQLAlchemy + SocketIO init
 # -------------------------
@@ -215,8 +223,11 @@ def compute_warning(self_lat, self_lon, self_speed_mps, self_bearing,
     return guidance
 
 def classify_risk(self_snap, other_snap):
+    """
+    Returns decision in 'red' / 'orange' / 'green' (we use 'orange' instead of 'yellow' per user's colors).
+    """
     if not self_snap or not other_snap:
-        return {"decision": "yellow", "confidence": 0.2, "reason": "missing_data"}
+        return {"decision": "orange", "confidence": 0.2, "reason": "missing_data"}
 
     d = haversine_m(self_snap.lat, self_snap.lon, other_snap.lat, other_snap.lon)
     direction = classify_direction(self_snap.bearing_deg, other_snap.bearing_deg)
@@ -273,7 +284,7 @@ def classify_risk(self_snap, other_snap):
             conf = min(1.0, base_confidence + 0.2 * support_score)
             return {"decision": "red", "confidence": round(conf, 2), "reason": f"same_opposing_imminent_req_{round(required,1)}s"}
         if (d / max(1.0, self_snap.speed_mps*3.6)) < (required + 2.0):
-            return {"decision": "yellow", "confidence": round(base_confidence * 0.6 + 0.2 * support_score, 2), "reason": "same_gap_low"}
+            return {"decision": "orange", "confidence": round(base_confidence * 0.6 + 0.2 * support_score, 2), "reason": "same_gap_low"}
         return {"decision": "green", "confidence": round(base_confidence * 0.8 + 0.1 * support_score, 2), "reason": "same_safe"}
 
     if direction == "cross":
@@ -281,9 +292,127 @@ def classify_risk(self_snap, other_snap):
             conf = min(1.0, base_confidence + 0.15 * support_score)
             return {"decision": "red", "confidence": round(conf, 2), "reason": f"cross_ttc_{round(ttc,1)}s"}
         else:
-            return {"decision": "yellow", "confidence": round(base_confidence * 0.6 + 0.1 * support_score, 2), "reason": "cross_caution"}
+            return {"decision": "orange", "confidence": round(base_confidence * 0.6 + 0.1 * support_score, 2), "reason": "cross_caution"}
 
-    return {"decision": "yellow", "confidence": round(base_confidence, 2), "reason": "fallback_uncertain"}
+    return {"decision": "orange", "confidence": round(base_confidence, 2), "reason": "fallback_uncertain"}
+
+# -------------------------
+# Accident detection (server-side inference)
+# -------------------------
+def detect_accident_for_device(device_id):
+    """
+    Infer a possible accident from recent snapshots for device_id.
+    Returns None or an alert dict:
+      {
+        "accident": True,
+        "severity": "high"|"medium"|"low",
+        "confidence": 0.0..1.0,
+        "reason": "...",
+        "ts": isoformat-of-latest-snap
+      }
+    Uses only existing heartbeat fields (speed_mps, bearing_deg, timestamps).
+    """
+    snaps = _recent_snapshots_for_device(device_id, limit=8)
+    if not snaps or len(snaps) < 2:
+        return None
+
+    # order ascending (oldest -> newest) for deltas
+    snaps = list(reversed(snaps))
+    latest = snaps[-1]
+    latest_ts = latest.ts
+    # only consider recent window
+    window_start = datetime.utcnow() - timedelta(seconds=ACCIDENT_TIME_WINDOW_S)
+    relevant = [s for s in snaps if s.ts >= window_start]
+    if not relevant or len(relevant) < 2:
+        relevant = snaps  # fallback to whatever we have
+
+    # compute decelerations and bearing jumps between successive pairs
+    decel_events = []
+    bearing_jumps = []
+    speed_drops = []
+    for i in range(1, len(relevant)):
+        prev = relevant[i-1]
+        cur = relevant[i]
+        dt = (cur.ts - prev.ts).total_seconds()
+        if dt <= 0:
+            continue
+        dv = cur.speed_mps - prev.speed_mps
+        accel = dv / dt  # m/s^2 (negative = deceleration)
+        decel_events.append(accel)
+        # bearing jump
+        bd = angle_diff(prev.bearing_deg or 0.0, cur.bearing_deg or 0.0)
+        bearing_jumps.append(bd)
+        # speed drop magnitude
+        drop = max(0.0, prev.speed_mps - cur.speed_mps)
+        speed_drops.append((drop, dt))
+
+    max_decel = min(decel_events) if decel_events else 0.0  # most negative (largest decel)
+    max_bearing_jump = max(bearing_jumps) if bearing_jumps else 0.0
+    max_speed_drop = max([s for s,d in speed_drops]) if speed_drops else 0.0
+    earliest_relevant = relevant[0]
+
+    # base confidence from how extreme the metrics are
+    conf = 0.0
+    reason_parts = []
+    if max_decel <= -ACCIDENT_DECEL_HIGH_MPS2:
+        conf += 0.5
+        reason_parts.append(f"high_decel_{abs(max_decel):.1f}m/s2")
+    elif max_decel <= -ACCIDENT_DECEL_MED_MPS2:
+        conf += 0.3
+        reason_parts.append(f"med_decel_{abs(max_decel):.1f}m/s2")
+
+    if max_speed_drop >= ACCIDENT_SPEED_DROP_MPS:
+        conf += 0.25
+        reason_parts.append(f"speed_drop_{max_speed_drop:.1f}mps")
+
+    if max_bearing_jump >= ACCIDENT_BEARING_JUMP_DEG:
+        conf += 0.2
+        reason_parts.append(f"bearing_jump_{int(max_bearing_jump)}deg")
+
+    # corroborate with nearby devices that show abrupt stops within CONFIRMATION_RADIUS_M
+    mid_lat = latest.lat
+    mid_lon = latest.lon
+    supporters = _devices_near_point(mid_lat, mid_lon, CONFIRMATION_RADIUS_M)
+    corroboration = 0
+    for did, s in supporters.items():
+        if did == device_id:
+            continue
+        # check if that support device has recent snapshots showing big drop
+        other_snaps = _recent_snapshots_for_device(did, limit=4)
+        if len(other_snaps) >= 2:
+            o_prev = other_snaps[1]
+            o_last = other_snaps[0]
+            dt_o = (o_last.ts - o_prev.ts).total_seconds() if (o_last.ts and o_prev.ts) else 1.0
+            if dt_o > 0:
+                drop_o = max(0.0, o_prev.speed_mps - o_last.speed_mps)
+                if drop_o >= (ACCIDENT_SPEED_DROP_MPS * 0.6):
+                    corroboration += 1
+    if corroboration > 0:
+        conf += min(0.2, 0.05 * corroboration)
+        reason_parts.append(f"corroboration_{corroboration}")
+
+    conf = max(0.0, min(1.0, conf))
+    if conf < 0.15:
+        return None
+
+    # severity heuristics
+    if conf >= 0.7 or max_decel <= -ACCIDENT_DECEL_HIGH_MPS2 or max_speed_drop >= (ACCIDENT_SPEED_DROP_MPS * 1.5):
+        severity = "high"
+    elif conf >= 0.4:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    return {
+        "accident": True,
+        "severity": severity,
+        "confidence": round(conf, 2),
+        "reason": ",".join(reason_parts) if reason_parts else "inferred",
+        "ts": latest_ts.isoformat() if latest_ts else None,
+        "lat": latest.lat,
+        "lon": latest.lon,
+        "device_id": device_id
+    }
 
 # -------------------------
 # DB helpers
@@ -452,6 +581,34 @@ def heartbeat():
     # compute authoritative nearby + decisions and push via socket
     try:
         nearby_payload = compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M)
+
+        # Accident detection for the reporting device (server-side inferred)
+        try:
+            acc = detect_accident_for_device(device_id)
+            if acc:
+                # attach alerts into nearby payload
+                nearby_payload.setdefault("alerts", []).append(acc)
+                # push device-specific accident alert
+                send_ws_to_device(device_id, 'accident_alert', acc)
+                # push a minimal "accident_nearby" to nearby connected devices so they can react
+                for other in nearby_payload.get("nearby", []):
+                    try:
+                        send_ws_to_device(other["device_id"], 'accident_nearby', {
+                            "accident": True,
+                            "device_id": device_id,
+                            "lat": acc.get("lat"),
+                            "lon": acc.get("lon"),
+                            "severity": acc.get("severity"),
+                            "confidence": acc.get("confidence"),
+                            "reason": acc.get("reason"),
+                            "ts": acc.get("ts")
+                        })
+                    except Exception:
+                        # continue best-effort
+                        pass
+        except Exception:
+            app.logger.exception("accident detection error")
+
         send_ws_to_device(device_id, 'nearby_update', nearby_payload)
     except Exception as e:
         app.logger.exception("compute_nearby error: %s", e)
@@ -471,6 +628,13 @@ def nearby():
     radius_m = float(request.args.get("radius_m", NEARBY_DEFAULT_RADIUS_M))
     try:
         payload = compute_nearby_for_device(device_id, radius_m=radius_m)
+        # include server-side accident inference when requested via HTTP as well
+        try:
+            acc = detect_accident_for_device(device_id)
+            if acc:
+                payload.setdefault("alerts", []).append(acc)
+        except Exception:
+            pass
         return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -545,7 +709,7 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
             "reason": risk.get("reason")
         })
     results.sort(key=lambda x: x["distance_m"])
-    return {
+    payload = {
         "self": {
             "device_id": self_snap.device_id,
             "lat": self_snap.lat,
@@ -556,6 +720,29 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
         },
         "nearby": results
     }
+
+    # include any server-inferred accidents for nearby devices as alerts (best-effort)
+    alerts = []
+    try:
+        # check the reporting device itself
+        acc_self = detect_accident_for_device(device_id)
+        if acc_self:
+            alerts.append(acc_self)
+        # optionally check nearby devices for accidents and attach them too
+        for r in results[:8]:
+            try:
+                a = detect_accident_for_device(r["device_id"])
+                if a:
+                    alerts.append(a)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if alerts:
+        payload["alerts"] = alerts
+
+    return payload
 
 # -------------------------
 # Admin/UI templates and routes
@@ -586,6 +773,7 @@ ADMIN_LOGIN_HTML = """
 
 # -------------------------
 # New: Friendly Dashboard HTML (for /dashboard and /friendly)
+# (unchanged)
 # -------------------------
 DASHBOARD_HTML = """
 <!doctype html>
@@ -1069,4 +1257,3 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
-
