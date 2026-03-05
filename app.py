@@ -445,6 +445,10 @@ def cleanup_old_snapshots():
 from functools import wraps
 
 def require_auth_token():
+    """
+    Traditional strict check: aborts if token missing/invalid.
+    Keep for endpoints where recreation isn't wanted.
+    """
     token = None
     auth = request.headers.get("Authorization")
     if auth and auth.lower().startswith("token "):
@@ -458,6 +462,69 @@ def require_auth_token():
     if not device:
         abort(401, "Invalid or revoked token")
     return device
+
+def find_device_by_token(token):
+    if not token:
+        return None
+    return Device.query.filter_by(token=token, revoked=False).first()
+
+def restore_device_if_missing(device_id, token, payload=None):
+    """
+    If a Device row with (device_id, token) doesn't exist, recreate it using optional payload fields.
+    Returns the Device instance (existing or newly created).
+    """
+    if not device_id or not token:
+        return None
+    existing = Device.query.filter_by(id=device_id).first()
+    if existing:
+        # if token mismatches, avoid clobbering — only create if token matches or no token present
+        if existing.token != token:
+            # token mismatch -> do not restore automatically
+            return None
+        return existing
+    # create new Device row with any provided meta fields
+    owner = None
+    car_name = None
+    car_model = None
+    plate = None
+    extra = None
+    if payload:
+        owner = payload.get("owner")
+        car_name = payload.get("car_name")
+        car_model = payload.get("car_model")
+        plate = payload.get("plate")
+        extra = payload.get("extra")
+    try:
+        d = Device(id=device_id, token=token, owner=owner, car_name=car_name, car_model=car_model, plate=plate, extra=(json.dumps(extra) if extra else None))
+        db.session.add(d)
+        db.session.commit()
+        app.logger.info("Restored Device row for %s using token (auto-restore).", device_id)
+        return d
+    except Exception:
+        db.session.rollback()
+        return None
+
+def find_or_restore_from_request(body=None):
+    """
+    Helper to extract token & device_id from headers or body and return device, possibly restoring the Device row.
+    """
+    body = body or (request.get_json(silent=True) or {})
+    auth = request.headers.get("Authorization", "")
+    token = None
+    if auth and auth.lower().startswith("token "):
+        token = auth.split(" ", 1)[1].strip()
+    if not token:
+        token = body.get("token") or request.args.get("token")
+    device_id = body.get("device_id") or request.args.get("device_id")
+    if not token:
+        return None
+    device = find_device_by_token(token)
+    if device:
+        return device
+    # attempt restore if device_id present
+    if device_id:
+        return restore_device_if_missing(device_id, token, payload=body)
+    return None
 
 def require_admin_api():
     """
@@ -514,10 +581,38 @@ def onboard():
     db.session.commit()
     return jsonify({"device_id": device_id, "token": token})
 
+@app.route("/reconnect", methods=["POST"])
+def reconnect():
+    """
+    Optional explicit reconnect endpoint devices can call to re-create their Device row if the backend forgot it.
+    Accepts device_id & token plus optional meta fields.
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    token = payload.get("token")
+    if not device_id or not token:
+        return jsonify({"error": "device_id and token required"}), 400
+    device = find_device_by_token(token)
+    if device:
+        return jsonify({"ok": True, "note": "device already exists"})
+    restored = restore_device_if_missing(device_id, token, payload=payload)
+    if restored:
+        return jsonify({"ok": True, "note": "device restored"})
+    return jsonify({"error": "could not restore device"}), 500
+
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    device = require_auth_token()
-    payload = request.get_json(force=True, silent=True) or {}
+    # Attempt to find or restore device from Authorization header or body (so devices that kept tokens auto-recreate)
+    body = request.get_json(force=True, silent=True) or {}
+    device = find_or_restore_from_request(body)
+    if not device:
+        # fall back to strict check which will abort
+        try:
+            device = require_auth_token()
+        except Exception:
+            return jsonify({"error": "Missing or invalid token; cannot authenticate device"}), 401
+
+    payload = body
     device_id = payload.get("device_id") or device.id
 
     # Rate-limiting (basic)
@@ -554,6 +649,26 @@ def heartbeat():
     except Exception:
         heading = bearing
     src = payload.get("source", "app")
+
+    # If the device was restored with minimal meta earlier, optionally update meta if provided
+    try:
+        update_meta = False
+        if payload.get("owner") or payload.get("car_name") or payload.get("car_model") or payload.get("plate") or payload.get("extra"):
+            update_meta = True
+        if update_meta:
+            try:
+                drow = Device.query.get(device.id)
+                if drow:
+                    if payload.get("owner"): drow.owner = payload.get("owner")
+                    if payload.get("car_name"): drow.car_name = payload.get("car_name")
+                    if payload.get("car_model"): drow.car_model = payload.get("car_model")
+                    if payload.get("plate"): drow.plate = payload.get("plate")
+                    if payload.get("extra"): drow.extra = json.dumps(payload.get("extra"))
+                    db.session.commit()
+            except Exception:
+                db.session.rollback()
+    except Exception:
+        pass
 
     snap = Snapshot(
         device_id=device_id,
@@ -773,7 +888,7 @@ ADMIN_LOGIN_HTML = """
 
 # -------------------------
 # New: Friendly Dashboard HTML (for /dashboard and /friendly)
-# (unchanged)
+# includes "Expand" modal for full device details
 # -------------------------
 DASHBOARD_HTML = """
 <!doctype html>
@@ -799,7 +914,7 @@ DASHBOARD_HTML = """
     .muted{ color:var(--muted); font-size:13px; }
     #mapWrap{ flex:1; display:flex; flex-direction:column; gap:12px; }
     #map{ flex:1; border-radius:10px; overflow:hidden; }
-    #detailCard{ height:200px; min-height:160px; }
+    #detailCard{ height:220px; min-height:160px; transition: all 0.18s ease; }
     .row{ display:flex; justify-content:space-between; gap:8px; margin-top:6px; }
     .btn{ background:var(--accent); color:white; padding:8px 10px; border-radius:8px; border:none; cursor:pointer;}
     .btn.ghost{ background:transparent; color:var(--accent); border:1px solid #e6f2ff;}
@@ -807,6 +922,17 @@ DASHBOARD_HTML = """
     a.osm{ color:var(--accent); text-decoration:none; font-weight:600; }
     footer { font-size:12px; color:var(--muted); padding:8px 16px; text-align:right; }
     #statusBar { font-size:13px; color:#08306B; margin-top:8px; }
+
+    /* modal (expanded details) */
+    .modal { position: fixed; inset: 0; display:none; align-items:center; justify-content:center; z-index:1200; }
+    .modal.show { display:flex; }
+    .modal-backdrop { position:absolute; inset:0; background: rgba(2,6,23,0.55); }
+    .modal-window { position:relative; width:90%; max-width:1000px; height:85%; background:white; border-radius:12px; padding:16px; overflow:auto; box-shadow:0 18px 46px rgba(2,6,23,0.36); z-index:1210; }
+    .modal .close { position:absolute; right:12px; top:12px; background:#eee; border:none; padding:6px 8px; border-radius:8px; cursor:pointer; }
+
+    pre#detailRaw { background:#fbfdff; padding:12px; border-radius:6px; max-height:120px; overflow:auto; white-space:pre-wrap; word-wrap:break-word; }
+    .meta-row { margin-top:8px; font-size:13px; color:#374151; }
+
   </style>
 </head>
 <body>
@@ -843,6 +969,7 @@ DASHBOARD_HTML = """
               <div id="detailOwner" class="muted"></div>
             </div>
             <div>
+              <button id="btnExpand" class="btn small" title="Expand details">Expand</button>
               <button id="btnRevoke" class="btn ghost small">Revoke</button>
             </div>
           </div>
@@ -859,7 +986,7 @@ DASHBOARD_HTML = """
 
           <div style="margin-top:8px;">
             <div class="muted">Raw heartbeat (last)</div>
-            <pre id="detailRaw" style="background:#fbfdff; padding:8px; border-radius:6px; max-height:80px; overflow:auto;">—</pre>
+            <pre id="detailRaw" style="background:#fbfdff; padding:8px; border-radius:6px; max-height:120px; overflow:auto;">—</pre>
           </div>
         </div>
       </div>
@@ -873,6 +1000,21 @@ DASHBOARD_HTML = """
 
   <footer>Beacon — simple live tracking dashboard</footer>
 
+  <!-- Expanded modal -->
+  <div id="modal" class="modal" role="dialog" aria-hidden="true">
+    <div class="modal-backdrop" onclick="closeModal()"></div>
+    <div class="modal-window" id="modalWindow" role="document">
+      <button class="close" onclick="closeModal()">Close ✕</button>
+      <h2 id="modalTitle">Device details</h2>
+      <div id="modalContent">
+        <div class="meta-row" id="modalMeta">Loading…</div>
+        <hr/>
+        <div><strong>Recent snapshots</strong></div>
+        <pre id="modalSnapshots" style="white-space:pre-wrap; word-break:break-word; background:#fbfdff; padding:12px; border-radius:8px; max-height:60%; overflow:auto;">Loading…</pre>
+      </div>
+    </div>
+  </div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script>
@@ -880,6 +1022,12 @@ DASHBOARD_HTML = """
   const devicesCountEl = document.getElementById('devicesCount');
   const btnRefresh = document.getElementById('btnRefresh');
   const statusBar = document.getElementById('statusBar');
+
+  const btnExpand = document.getElementById('btnExpand');
+  const modal = document.getElementById('modal');
+  const modalTitle = document.getElementById('modalTitle');
+  const modalMeta = document.getElementById('modalMeta');
+  const modalSnapshots = document.getElementById('modalSnapshots');
 
   let devicesCache = [];
   let selectedId = null;
@@ -892,21 +1040,19 @@ DASHBOARD_HTML = """
   let circle = null;
 
   btnRefresh.addEventListener('click', fetchDevices);
+  btnExpand.addEventListener('click', () => { if (selectedId) openModal(selectedId); });
 
   async function fetchDevices(){
     statusBar.innerText = "Status: fetching /admin/devices...";
     try {
       const res = await fetch('/admin/devices', { cache: "no-store" });
       const txt = await res.text();
-      // show debug size to the user for transparency
       statusBar.innerText = `Status: HTTP ${res.status} — response ${txt.length} bytes`;
       let data;
       try {
         data = JSON.parse(txt);
       } catch (e) {
-        // fallback: sometimes frameworks return single quotes / weird content; try safe JSON extraction
         console.warn("JSON.parse failed, trying fallback:", e);
-        // attempt to extract a JSON-looking substring
         const m = txt.match(/\\{\\s*"?devices"?:[\\s\\S]*\\}/);
         if (m) {
           data = JSON.parse(m[0]);
@@ -921,7 +1067,7 @@ DASHBOARD_HTML = """
       console.error("fetchDevices error:", err);
       statusBar.innerText = "Status: fetch error — see console for details";
       devicesCache = [];
-      renderList(); // render empty state
+      renderList();
     }
   }
 
@@ -930,7 +1076,6 @@ DASHBOARD_HTML = """
     const count = devicesCache.length || 0;
     devicesCountEl.innerText = (count === 1) ? "1 device" : (count + " devices");
 
-    // Sort newest first (use timestamp if present; 'never' fallback keeps them last)
     devicesCache.sort((a,b) => {
       const ta = a.last_snapshot && a.last_snapshot.ts ? new Date(a.last_snapshot.ts).getTime() : 0;
       const tb = b.last_snapshot && b.last_snapshot.ts ? new Date(b.last_snapshot.ts).getTime() : 0;
@@ -972,7 +1117,6 @@ DASHBOARD_HTML = """
     if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
       placeMarker(d.last_snapshot.lat, d.last_snapshot.lon, d);
     } else {
-      // center to world but keep marker cleared if none
       clearMarker();
     }
   }
@@ -1034,6 +1178,33 @@ DASHBOARD_HTML = """
   function escapeHtml(s) {
     if (!s) return '';
     return s.replace(/[&<>"'`]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',"`":'&#96;'})[c]);
+  }
+
+  // modal functions
+  async function openModal(deviceId) {
+    modal.classList.add('show');
+    modalTitle.innerText = 'Device details — ' + deviceId;
+    modalMeta.innerText = 'Loading…';
+    modalSnapshots.innerText = 'Loading…';
+    try {
+      const res = await fetch('/admin/device/' + deviceId + '/json', { cache: "no-store" });
+      const j = await res.json();
+      const dev = j.device || {};
+      modalMeta.innerHTML = `
+        <div><strong>Name:</strong> ${escapeHtml(dev.car_name || dev.car_model || dev.id || '')}</div>
+        <div><strong>Owner:</strong> ${escapeHtml(dev.owner || '')}</div>
+        <div><strong>Plate:</strong> ${escapeHtml(dev.plate || '')}</div>
+        <div><strong>Created:</strong> ${escapeHtml(dev.created_at || '')}</div>
+        <div><strong>Connected:</strong> ${j.connected ? 'yes' : 'no'}</div>
+      `;
+      modalSnapshots.innerText = JSON.stringify(j.snapshots || [], null, 2);
+    } catch (err) {
+      modalMeta.innerText = 'Error loading details';
+      modalSnapshots.innerText = String(err);
+    }
+  }
+  function closeModal() {
+    modal.classList.remove('show');
   }
 
   // auto-refresh
@@ -1196,7 +1367,7 @@ def admin_device_revoke(device_id):
     return jsonify({"ok": True, "revoked": True})
 
 # -------------------------
-# Socket.IO events (unchanged, preserved)
+# Socket.IO events (preserved + auto-restore on register)
 # -------------------------
 @socketio.on('connect')
 def ws_connect():
@@ -1214,8 +1385,11 @@ def ws_register(data):
         return
     device = Device.query.filter_by(id=device_id, token=token, revoked=False).first()
     if not device:
-        emit('error', {'error': 'invalid token/device'})
-        return
+        # Attempt to restore silently (device kept token)
+        device = restore_device_if_missing(device_id, token, payload=data)
+        if not device:
+            emit('error', {'error': 'invalid token/device'})
+            return
     sids = connected_sockets.get(device_id)
     if not sids:
         connected_sockets[device_id] = set()
@@ -1242,6 +1416,9 @@ def ws_get_nearby(data):
     device_id = data.get('device_id')
     token = data.get('token')
     device = Device.query.filter_by(id=device_id, token=token, revoked=False).first()
+    if not device:
+        # try restore (best-effort)
+        device = restore_device_if_missing(device_id, token, payload=data)
     if not device:
         emit('error', {'error': 'invalid device/token'})
         return
