@@ -567,13 +567,22 @@ def health():
 def onboard():
     payload = request.get_json(force=True, silent=True) or {}
     owner = payload.get("owner")
-    car_name = payload.get("car_name")
-    car_model = payload.get("car_model")
+    # prefer explicit vehicle_type/vehicle_category if provided (backwards compatible)
+    car_name = payload.get("car_name") or payload.get("vehicle_type")
+    car_model = payload.get("car_model") or payload.get("vehicle_category")
     plate = payload.get("plate")
     extra = payload.get("extra")
     device_id = uuid.uuid4().hex
     token = create_device_token()
-    d = Device(id=device_id, token=token, owner=owner, car_name=car_name, car_model=car_model, plate=plate, extra=(json.dumps(extra) if extra else None))
+    d = Device(
+        id=device_id,
+        token=token,
+        owner=owner,
+        car_name=car_name,
+        car_model=car_model,
+        plate=plate,
+        extra=(json.dumps(extra) if extra else None)
+    )
     db.session.add(d)
     db.session.commit()
     return jsonify({"device_id": device_id, "token": token})
@@ -647,18 +656,21 @@ def heartbeat():
         heading = bearing
     src = payload.get("source", "app")
 
-    # If the device was restored with minimal meta earlier, optionally update meta if provided
+      # If the device was restored with minimal meta earlier, optionally update meta if provided
     try:
         update_meta = False
-        if payload.get("owner") or payload.get("car_name") or payload.get("car_model") or payload.get("plate") or payload.get("extra"):
+        if payload.get("owner") or payload.get("car_name") or payload.get("car_model") or payload.get("plate") or payload.get("extra") or payload.get("vehicle_type") or payload.get("vehicle_category"):
             update_meta = True
         if update_meta:
             try:
                 drow = Device.query.get(device.id)
                 if drow:
                     if payload.get("owner"): drow.owner = payload.get("owner")
+                    # support both the older keys and newer vehicle_type/category keys
                     if payload.get("car_name"): drow.car_name = payload.get("car_name")
                     if payload.get("car_model"): drow.car_model = payload.get("car_model")
+                    if payload.get("vehicle_type") and not payload.get("car_name"): drow.car_name = payload.get("vehicle_type")
+                    if payload.get("vehicle_category") and not payload.get("car_model"): drow.car_model = payload.get("vehicle_category")
                     if payload.get("plate"): drow.plate = payload.get("plate")
                     if payload.get("extra"): drow.extra = json.dumps(payload.get("extra"))
                     db.session.commit()
@@ -666,7 +678,6 @@ def heartbeat():
                 db.session.rollback()
     except Exception:
         pass
-
     snap = Snapshot(
         device_id=device_id,
         ts=datetime.utcnow(),
@@ -752,6 +763,7 @@ def nearby():
         return jsonify({"error": str(e)}), 500
 
 def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
+    # obtain the latest snapshot for the device (or fallback to active_devices cache)
     self_snap = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).first()
     if not self_snap:
         with active_devices_lock:
@@ -771,6 +783,7 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
         else:
             raise RuntimeError("no snapshot for device")
 
+    # gather other recent snapshots (DB + in-memory cache)
     cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
     other_snaps = Snapshot.query.filter(Snapshot.device_id != device_id, Snapshot.ts >= cutoff).all()
 
@@ -796,7 +809,10 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
 
     results = []
     for s in other_snaps:
-        d = haversine_m(self_snap.lat, self_snap.lon, s.lat, s.lon)
+        try:
+            d = haversine_m(self_snap.lat, self_snap.lon, s.lat, s.lon)
+        except Exception:
+            continue
         if d > radius_m:
             continue
         direction = classify_direction(self_snap.bearing_deg, s.bearing_deg)
@@ -805,6 +821,22 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
         guidance = compute_warning(self_snap.lat, self_snap.lon, self_snap.speed_mps, self_snap.bearing_deg,
                                    s.lat, s.lon, s.speed_mps, s.bearing_deg)
         risk = classify_risk(self_snap, s)
+
+        # try to include device metadata from Device row (best-effort)
+        meta_owner = None
+        meta_car_name = None
+        meta_car_model = None
+        meta_plate = None
+        try:
+            drow = Device.query.get(s.device_id)
+            if drow:
+                meta_owner = drow.owner
+                meta_car_name = drow.car_name
+                meta_car_model = drow.car_model
+                meta_plate = drow.plate
+        except Exception:
+            pass
+
         results.append({
             "device_id": s.device_id,
             "ts": s.ts.isoformat() if hasattr(s, "ts") else None,
@@ -818,9 +850,30 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
             "guidance": guidance,
             "decision": risk.get("decision"),
             "confidence": float(risk.get("confidence", 0.0)),
-            "reason": risk.get("reason")
+            "reason": risk.get("reason"),
+            # meta fields (for client convenience)
+            "owner": meta_owner,
+            "car_name": meta_car_name,
+            "car_model": meta_car_model,
+            "plate": meta_plate
         })
+    # sort by distance so client shows closest first
     results.sort(key=lambda x: x["distance_m"])
+
+    # self meta
+    self_meta = {}
+    try:
+        dro = Device.query.get(device_id)
+        if dro:
+            self_meta = {
+                "owner": dro.owner,
+                "car_name": dro.car_name,
+                "car_model": dro.car_model,
+                "plate": dro.plate
+            }
+    except Exception:
+        pass
+
     payload = {
         "self": {
             "device_id": self_snap.device_id,
@@ -828,19 +881,18 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
             "lon": self_snap.lon,
             "speed_mps": round(self_snap.speed_mps, 2),
             "bearing_deg": round(self_snap.bearing_deg, 1),
-            "ts": self_snap.ts.isoformat() if hasattr(self_snap, "ts") else None
+            "ts": self_snap.ts.isoformat() if hasattr(self_snap, "ts") else None,
+            "meta": self_meta
         },
         "nearby": results
     }
 
-    # include any server-inferred accidents for nearby devices as alerts (best-effort)
+    # include server-inferred accidents for reporting + nearby devices (best-effort)
     alerts = []
     try:
-        # check the reporting device itself
         acc_self = detect_accident_for_device(device_id)
         if acc_self:
             alerts.append(acc_self)
-        # optionally check nearby devices for accidents and attach them too
         for r in results[:8]:
             try:
                 a = detect_accident_for_device(r["device_id"])
@@ -1436,5 +1488,6 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
 
 
