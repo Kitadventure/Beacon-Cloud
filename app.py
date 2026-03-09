@@ -1,6 +1,3 @@
-# app.py — Beacon backend with WebSocket (Flask + Flask-SocketIO)
-# Threading async_mode for Windows/dev. For production and multi-worker, use a message queue + eventlet/gevent.
-
 import os
 import uuid
 import threading
@@ -8,7 +5,6 @@ from math import radians, sin, cos, atan2, sqrt, degrees
 from datetime import datetime, timedelta
 import json
 import time
-import sqlite3  # <--- added
 
 from flask import (
     Flask, request, jsonify, render_template_string, abort,
@@ -420,7 +416,6 @@ def detect_accident_for_device(device_id):
 # -------------------------
 def init_db():
     with app.app_context():
-        # create SQLAlchemy models/tables
         db.create_all()
         # create initial admin from env if provided and no admins exist
         try:
@@ -432,28 +427,6 @@ def init_db():
                 app.logger.info("Admin user created from environment variable.")
         except Exception:
             pass
-
-        # --- create a small separate sqlite3 DB for drivers onboarding (drivers.db)
-        try:
-            conn = sqlite3.connect("drivers.db")
-            c = conn.cursor()
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS drivers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                phone TEXT,
-                vehicle_type TEXT,
-                vehicle_plate TEXT,
-                experience_years INTEGER,
-                city TEXT,
-                created_at TEXT
-            )
-            """)
-            conn.commit()
-            conn.close()
-            app.logger.info("drivers.db initialized (drivers table created).")
-        except Exception:
-            app.logger.exception("Failed to initialize drivers.db")
 
 def create_device_token():
     return uuid.uuid4().hex
@@ -604,45 +577,6 @@ def onboard():
     db.session.add(d)
     db.session.commit()
     return jsonify({"device_id": device_id, "token": token})
-
-# --- new: /api/onboard for drivers (separate drivers.db)
-@app.route("/api/onboard", methods=["POST"])
-def onboard_driver():
-    data = request.json or {}
-    name = data.get("name")
-    phone = data.get("phone")
-    vehicle_type = data.get("vehicle_type")
-    vehicle_plate = data.get("vehicle_plate")
-    experience_years = data.get("experience_years")
-    city = data.get("city")
-
-    # basic validation
-    if not name or not phone:
-        return jsonify({"status": "error", "message": "name and phone required"}), 400
-
-    try:
-        conn = sqlite3.connect("drivers.db")
-        c = conn.cursor()
-        c.execute("""
-        INSERT INTO drivers
-        (name, phone, vehicle_type, vehicle_plate, experience_years, city, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            name,
-            phone,
-            vehicle_type,
-            vehicle_plate,
-            experience_years,
-            city,
-            datetime.utcnow().isoformat()
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        app.logger.exception("Failed to insert driver")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    return jsonify({"status": "success"})
 
 @app.route("/reconnect", methods=["POST"])
 def reconnect():
@@ -927,7 +861,9 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
 # -------------------------
 ADMIN_LOGIN_HTML = """
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Admin login</title></head><body style="font-family: sans-serif; margin: 20px;">
+<html>
+<head><meta charset="utf-8"><title>Admin login</title></head>
+<body style="font-family: sans-serif; margin: 20px;">
   <h2>Beacon Admin Login</h2>
   {% with messages = get_flashed_messages() %}
     {% if messages %}
@@ -943,51 +879,346 @@ ADMIN_LOGIN_HTML = """
     If no admin exists, set environment variables <code>ADMIN_USER</code> and <code>ADMIN_PASS</code>
     before first run to create one automatically.
   </p>
-</body></html>
-"""
-
-# Drivers admin HTML (simple table)
-DRIVERS_HTML = """
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Registered Drivers</title></head>
-<body style="font-family: sans-serif; margin: 20px;">
-  <h2>Registered Drivers</h2>
-
-  <table border="1" cellpadding="6" cellspacing="0">
-  <tr>
-  <th>Name</th>
-  <th>Phone</th>
-  <th>Vehicle</th>
-  <th>Plate</th>
-  <th>Experience</th>
-  <th>City</th>
-  <th>Joined</th>
-  </tr>
-
-  {% for d in drivers %}
-  <tr>
-  <td>{{d.name}}</td>
-  <td>{{d.phone}}</td>
-  <td>{{d.vehicle_type}}</td>
-  <td>{{d.vehicle_plate}}</td>
-  <td>{{d.experience_years}}</td>
-  <td>{{d.city}}</td>
-  <td>{{d.created_at}}</td>
-  </tr>
-  {% endfor %}
-  </table>
-
-  <p style="margin-top:12px;"><a href="{{ url_for('dashboard') }}">Back to dashboard</a></p>
 </body>
 </html>
 """
 
 # -------------------------
 # New: Friendly Dashboard HTML (for /dashboard and /friendly)
-# (unchanged ... omitted here for brevity in this snippet but kept above in your original)
+# includes "Expand" modal for full device details
 # -------------------------
-DASHBOARD_HTML = """... (unchanged, same as original above) ..."""
+DASHBOARD_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Beacon — Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    :root{ --bg:#f7f9fb; --card:#ffffff; --muted:#6b7280; --accent:#0b84ff; }
+    body{ font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin:0; background:var(--bg); color:#111827;}
+    header{ background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding:18px 20px; display:flex; align-items:center; gap:12px;}
+    header h1{ font-size:18px; margin:0;}
+    .wrap{ display:flex; gap:12px; padding:12px; height: calc(100vh - 72px); box-sizing:border-box;}
+    .left{ width:360px; display:flex; flex-direction:column; gap:12px; }
+    .card{ background:var(--card); border-radius:10px; padding:12px; box-shadow:0 6px 18px rgba(15,23,42,0.06); overflow:auto; }
+    #devicesList{ list-style:none; margin:0; padding:0; }
+    #devicesList li{ padding:10px; border-radius:8px; margin-bottom:8px; cursor:pointer; border:1px solid #eef2f7; display:flex; justify-content:space-between; align-items:center; gap:8px;}
+    #devicesList li.selected{ background:#eef8ff; border-color:#cfe9ff; }
+    .dev-meta{ font-size:13px; color:var(--muted); }
+    .big{ font-weight:600; font-size:14px; }
+    .muted{ color:var(--muted); font-size:13px; }
+    #mapWrap{ flex:1; display:flex; flex-direction:column; gap:12px; }
+    #map{ flex:1; border-radius:10px; overflow:hidden; }
+    #detailCard{ height:220px; min-height:160px; transition: all 0.18s ease; }
+    .row{ display:flex; justify-content:space-between; gap:8px; margin-top:6px; }
+    .btn{ background:var(--accent); color:white; padding:8px 10px; border-radius:8px; border:none; cursor:pointer;}
+    .btn.ghost{ background:transparent; color:var(--accent); border:1px solid #e6f2ff;}
+    .small{ font-size:12px; padding:6px 8px; border-radius:6px; }
+    a.osm{ color:var(--accent); text-decoration:none; font-weight:600; }
+    footer { font-size:12px; color:var(--muted); padding:8px 16px; text-align:right; }
+    #statusBar { font-size:13px; color:#08306B; margin-top:8px; }
+
+    /* modal (expanded details) */
+    .modal { position: fixed; inset: 0; display:none; align-items:center; justify-content:center; z-index:1200; }
+    .modal.show { display:flex; }
+    .modal-backdrop { position:absolute; inset:0; background: rgba(2,6,23,0.55); }
+    .modal-window { position:relative; width:90%; max-width:1000px; height:85%; background:white; border-radius:12px; padding:16px; overflow:auto; box-shadow:0 18px 46px rgba(2,6,23,0.36); z-index:1210; }
+    .modal .close { position:absolute; right:12px; top:12px; background:#eee; border:none; padding:6px 8px; border-radius:8px; cursor:pointer; }
+
+    pre#detailRaw { background:#fbfdff; padding:12px; border-radius:6px; max-height:120px; overflow:auto; white-space:pre-wrap; word-wrap:break-word; }
+    .meta-row { margin-top:8px; font-size:13px; color:#374151; }
+
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Beacon — Live Dashboard</h1>
+    <div style="margin-left:auto; font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</div>
+  </header>
+
+  <div class="wrap">
+    <div class="left">
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div class="muted">Devices</div>
+            <div class="big" id="devicesCount">0 devices</div>
+          </div>
+          <div>
+            <button id="btnRefresh" class="btn small">Refresh</button>
+          </div>
+        </div>
+
+        <div id="statusBar" class="muted">Status: idle</div>
+
+        <hr style="margin:10px 0; border:none; border-top:1px solid #f1f5f9;" />
+        <ul id="devicesList"></ul>
+      </div>
+
+      <div id="detailCard" class="card">
+        <div id="placeholderDetail"><em>Select a device to see details & map</em></div>
+        <div id="deviceDetail" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <div id="detailName" class="big"></div>
+              <div id="detailOwner" class="muted"></div>
+            </div>
+            <div>
+              <button id="btnExpand" class="btn small" title="Expand details">Expand</button>
+              <button id="btnRevoke" class="btn ghost small">Revoke</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div><div class="muted">Last seen</div><div id="detailTs" class="big"></div></div>
+            <div><div class="muted">Speed</div><div id="detailSpeed" class="big">—</div></div>
+          </div>
+
+          <div class="row">
+            <div><div class="muted">Location</div><div id="detailLoc" class="muted"></div></div>
+            <div><a id="osmLink" class="osm" target="_blank">Open in OSM ↗</a></div>
+          </div>
+
+          <div style="margin-top:8px;">
+            <div class="muted">Raw heartbeat (last)</div>
+            <pre id="detailRaw" style="background:#fbfdff; padding:8px; border-radius:6px; max-height:120px; overflow:auto;">—</pre>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="mapWrap" class="card">
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <footer>Beacon — simple live tracking dashboard</footer>
+
+  <!-- Expanded modal -->
+  <div id="modal" class="modal" role="dialog" aria-hidden="true">
+    <div class="modal-backdrop" onclick="closeModal()"></div>
+    <div class="modal-window" id="modalWindow" role="document">
+      <button class="close" onclick="closeModal()">Close ✕</button>
+      <h2 id="modalTitle">Device details</h2>
+      <div id="modalContent">
+        <div class="meta-row" id="modalMeta">Loading…</div>
+        <hr/>
+        <div><strong>Recent snapshots</strong></div>
+        <pre id="modalSnapshots" style="white-space:pre-wrap; word-break:break-word; background:#fbfdff; padding:12px; border-radius:8px; max-height:60%; overflow:auto;">Loading…</pre>
+      </div>
+    </div>
+  </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
+<script>
+  const DateTime = luxon.DateTime;
+  const dt = DateTime.fromISO(d.last_snapshot.ts, { zone: 'utc' }).setZone('Africa/Nairobi');
+  document.getElementById('detailTs').innerText = dt.toLocaleString(DateTime.DATETIME_MED);
+</script>
+<script>
+  const devicesListEl = document.getElementById('devicesList');
+  const devicesCountEl = document.getElementById('devicesCount');
+  const btnRefresh = document.getElementById('btnRefresh');
+  const statusBar = document.getElementById('statusBar');
+
+  const btnExpand = document.getElementById('btnExpand');
+  const modal = document.getElementById('modal');
+  const modalTitle = document.getElementById('modalTitle');
+  const modalMeta = document.getElementById('modalMeta');
+  const modalSnapshots = document.getElementById('modalSnapshots');
+
+  let devicesCache = [];
+  let selectedId = null;
+  let refreshTimer = null;
+
+  // Leaflet map init
+  const map = L.map('map', { center: [0,0], zoom: 2, preferCanvas:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  let marker = null;
+  let circle = null;
+
+  btnRefresh.addEventListener('click', fetchDevices);
+  btnExpand.addEventListener('click', () => { if (selectedId) openModal(selectedId); });
+
+  async function fetchDevices(){
+    statusBar.innerText = "Status: fetching /admin/devices...";
+    try {
+      const res = await fetch('/admin/devices', { cache: "no-store" });
+      const txt = await res.text();
+      statusBar.innerText = `Status: HTTP ${res.status} — response ${txt.length} bytes`;
+      let data;
+      try {
+        data = JSON.parse(txt);
+      } catch (e) {
+        console.warn("JSON.parse failed, trying fallback:", e);
+        const m = txt.match(/\\{\\s*"?devices"?:[\\s\\S]*\\}/);
+        if (m) {
+          data = JSON.parse(m[0]);
+        } else {
+          throw new Error("Response not valid JSON");
+        }
+      }
+      devicesCache = data.devices || [];
+      statusBar.innerText = `Status: fetched ${devicesCache.length} device(s)`;
+      renderList();
+    } catch (err) {
+      console.error("fetchDevices error:", err);
+      statusBar.innerText = "Status: fetch error — see console for details";
+      devicesCache = [];
+      renderList();
+    }
+  }
+
+  function renderList(){
+    devicesListEl.innerHTML = '';
+    const count = devicesCache.length || 0;
+    devicesCountEl.innerText = (count === 1) ? "1 device" : (count + " devices");
+
+    devicesCache.sort((a,b) => {
+      const ta = a.last_snapshot && a.last_snapshot.ts ? new Date(a.last_snapshot.ts).getTime() : 0;
+      const tb = b.last_snapshot && b.last_snapshot.ts ? new Date(b.last_snapshot.ts).getTime() : 0;
+      return tb - ta;
+    });
+
+    for (const d of devicesCache) {
+      const li = document.createElement('li');
+      li.dataset.id = d.id;
+      const name = d.car_name || d.car_model || d.id;
+      const last = d.last_snapshot ? (d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen') : 'never';
+      const speed = d.last_snapshot ? (((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h') : '—';
+      li.innerHTML = `<div style="min-width:0;">
+                        <div class="big">${escapeHtml(name)}</div>
+                        <div class="dev-meta">${escapeHtml(d.owner || '')} — ${escapeHtml(d.plate || '')}</div>
+                      </div>
+                      <div style="text-align:right;">
+                        <div class="muted">${escapeHtml(last)}</div>
+                        <div class="muted">${escapeHtml(speed)}</div>
+                      </div>`;
+      li.addEventListener('click', () => selectDevice(d.id));
+      if (d.id === selectedId) li.classList.add('selected');
+      devicesListEl.appendChild(li);
+    }
+
+    if (!selectedId && devicesCache.length > 0) {
+      selectDevice(devicesCache[0].id);
+    }
+  }
+
+  function selectDevice(id) {
+    selectedId = id;
+    document.querySelectorAll('#devicesList li').forEach(li => {
+      li.classList.toggle('selected', li.dataset.id === id);
+    });
+    const d = devicesCache.find(x => x.id === id);
+    if (!d) return;
+    showDetail(d);
+    if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
+      placeMarker(d.last_snapshot.lat, d.last_snapshot.lon, d);
+    } else {
+      clearMarker();
+    }
+  }
+
+  function showDetail(d) {
+    document.getElementById('placeholderDetail').style.display = 'none';
+    const panel = document.getElementById('deviceDetail');
+    panel.style.display = 'block';
+    document.getElementById('detailName').innerText = d.car_name || d.car_model || d.id;
+    document.getElementById('detailOwner').innerText = d.owner || '';
+    if (d.last_snapshot) {
+      document.getElementById('detailTs').innerText = d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen';
+      const spd = ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
+      document.getElementById('detailSpeed').innerText = spd;
+      document.getElementById('detailLoc').innerText = (typeof d.last_snapshot.lat === 'number' && typeof d.last_snapshot.lon === 'number')
+        ? (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6)) : '—';
+      document.getElementById('osmLink').href = (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon)
+        ? `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`
+        : '#';
+      document.getElementById('detailRaw').innerText = JSON.stringify(d.last_snapshot.raw || d.last_snapshot, null, 2);
+      document.getElementById('btnRevoke').onclick = async () => {
+        if (!confirm('Revoke device token? This prevents the app from authenticating with that token.')) return;
+        try {
+          const res = await fetch('/admin/device/' + d.id + '/revoke', { method: 'POST' });
+          if (!res.ok) { alert('Revoke failed'); return; }
+          alert('Device revoked');
+          fetchDevices();
+        } catch (e) { alert('Revoke error'); }
+      };
+    } else {
+      document.getElementById('detailTs').innerText = '—';
+      document.getElementById('detailSpeed').innerText = '—';
+      document.getElementById('detailLoc').innerText = '—';
+      document.getElementById('detailRaw').innerText = '—';
+      document.getElementById('osmLink').href = '#';
+    }
+  }
+
+  function placeMarker(lat, lon, d) {
+    if (!marker) {
+      marker = L.marker([lat, lon]).addTo(map);
+    } else {
+      marker.setLatLng([lat, lon]);
+    }
+    if (!circle) {
+      circle = L.circle([lat, lon], { radius: (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
+    } else {
+      circle.setLatLng([lat, lon]);
+    }
+    map.setView([lat, lon], 15, { animate: true });
+    marker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
+  }
+
+  function clearMarker(){
+    if (marker) { map.removeLayer(marker); marker = null; }
+    if (circle) { map.removeLayer(circle); circle = null; }
+  }
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/[&<>"'`]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',"`":'&#96;'})[c]);
+  }
+
+  // modal functions
+  async function openModal(deviceId) {
+    modal.classList.add('show');
+    modalTitle.innerText = 'Device details — ' + deviceId;
+    modalMeta.innerText = 'Loading…';
+    modalSnapshots.innerText = 'Loading…';
+    try {
+      const res = await fetch('/admin/device/' + deviceId + '/json', { cache: "no-store" });
+      const j = await res.json();
+      const dev = j.device || {};
+      modalMeta.innerHTML = `
+        <div><strong>Name:</strong> ${escapeHtml(dev.car_name || dev.car_model || dev.id || '')}</div>
+        <div><strong>Owner:</strong> ${escapeHtml(dev.owner || '')}</div>
+        <div><strong>Plate:</strong> ${escapeHtml(dev.plate || '')}</div>
+        <div><strong>Created:</strong> ${escapeHtml(dev.created_at || '')}</div>
+        <div><strong>Connected:</strong> ${j.connected ? 'yes' : 'no'}</div>
+      `;
+      modalSnapshots.innerText = JSON.stringify(j.snapshots || [], null, 2);
+    } catch (err) {
+      modalMeta.innerText = 'Error loading details';
+      modalSnapshots.innerText = String(err);
+    }
+  }
+  function closeModal() {
+    modal.classList.remove('show');
+  }
+
+  // auto-refresh
+  refreshTimer = setInterval(fetchDevices, 5000);
+
+  // initial load
+  fetchDevices();
+
+</script>
+</body>
+</html>
+"""
 
 # Admin web pages / endpoints
 @app.route('/admin/login', methods=['GET', 'POST'])
@@ -1138,26 +1369,6 @@ def admin_device_revoke(device_id):
     return jsonify({"ok": True, "revoked": True})
 
 # -------------------------
-# New route: admin drivers list
-# -------------------------
-@app.route("/admin/drivers")
-def admin_drivers():
-    # Optionally require admin session:
-    # if not session.get('admin_logged'): return redirect(url_for('admin_login'))
-    try:
-        conn = sqlite3.connect("drivers.db")
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM drivers ORDER BY created_at DESC")
-        rows = c.fetchall()
-        drivers = [dict(row) for row in rows]
-        conn.close()
-    except Exception:
-        app.logger.exception("Failed to read drivers.db")
-        drivers = []
-    return render_template_string(DRIVERS_HTML, drivers=drivers)
-
-# -------------------------
 # Socket.IO events (preserved + auto-restore on register)
 # -------------------------
 @socketio.on('connect')
@@ -1225,3 +1436,5 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
+
