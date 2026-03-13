@@ -1107,7 +1107,7 @@ DASHBOARD_HTML = """
         data = JSON.parse(txt);
       } catch (e) {
         console.warn("JSON.parse failed, trying fallback:", e);
-        const m = txt.match(/\\{\\s*"?devices"?:[\\s\\S]*\\}/);
+        const m = txt.match(/\{\s*"?devices"?:[\s\S]*\}/);
         if (m) {
           data = JSON.parse(m[0]);
         } else {
@@ -1185,9 +1185,9 @@ DASHBOARD_HTML = """
       document.getElementById('detailTs').innerText = d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen';
       const spd = ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
       document.getElementById('detailSpeed').innerText = spd;
-      document.getElementById('detailLoc').innerText = (typeof d.last_snapshot.lat === 'number' && typeof d.last_snapshot.lon === 'number')
+      document.getElementById('detailLoc').innerText = (typeof d.last_snapshot.lat === 'number' and typeof d.last_snapshot.lon === 'number')
         ? (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6)) : '—';
-      document.getElementById('osmLink').href = (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon)
+      document.getElementById('osmLink').href = (d.last_snapshot and d.last_snapshot.lat and d.last_snapshot.lon)
         ? `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`
         : '#';
       document.getElementById('detailRaw').innerText = JSON.stringify(d.last_snapshot.raw || d.last_snapshot, null, 2);
@@ -1216,12 +1216,12 @@ DASHBOARD_HTML = """
       marker.setLatLng([lat, lon]);
     }
     if (!circle) {
-      circle = L.circle([lat, lon], { radius: (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
+      circle = L.circle([lat, lon], { radius: (d.last_snapshot and d.last_snapshot.raw and d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
     } else {
       circle.setLatLng([lat, lon]);
     }
     map.setView([lat, lon], 15, { animate: true });
-    marker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
+    marker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot and d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
   }
 
   function clearMarker(){
@@ -1488,6 +1488,3 @@ def ws_get_nearby(data):
 if __name__ == "__main__":
     init_db()
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
-
-
-
