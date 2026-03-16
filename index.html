@@ -3,138 +3,122 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Beacon Cloud — Unlimited Dashboard</title>
+  <title>Beacon Cloud — Dashboard</title>
 
-  <!-- If you want to use token-based auth from the UI, put it here:
+  <!-- If your backend uses token auth, paste it here:
        <meta name="admin-token" content="YOUR_ADMIN_API_TOKEN_HERE">
-       Leave empty to use browser session cookies (recommended if UI is served from same origin).
+       Leave empty to use cookie/session auth (recommended if served same-origin).
   -->
   <meta name="admin-token" content="">
 
-  <!-- Leaflet -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-sA+e2m3kX0t2q8EoF3lZ9bXqg0m5jvhi1q0c0z2H2Tk=" crossorigin=""/>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha256-oQm3Q2qXQf1gqg3Yp1jv4GfQbUtKQp7vG3u2sTgk9KY=" crossorigin=""></script>
+  <!-- Leaflet CSS/JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-  <!-- Simple styles -->
+  <!-- Optional: MarkerCluster for many devices (uncomment if you want clustering)
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster-src.js"></script>
+  -->
+
   <style>
-    :root{
+    :root {
       --sidebar-w: 360px;
       --accent: #0b84ff;
       --danger: #d9534f;
+      --muted: #6b7280;
+      --bg: #ffffff;
     }
-    html,body,#map { height:100%; margin:0; padding:0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
-    .app {
-      display: flex;
-      height: 100vh;
-      width: 100%;
-      overflow: hidden;
-    }
-    .sidebar{
-      width: var(--sidebar-w);
-      background: #fff;
-      border-right: 1px solid #eee;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      padding: 12px;
-      box-sizing: border-box;
-      overflow: auto;
-    }
+    html,body,#map { height:100%; margin:0; padding:0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: #f7fafc; color:#111;}
+    .app { display:flex; height:100vh; width:100%; overflow:hidden; }
+    .sidebar { width: var(--sidebar-w); background:var(--bg); border-right:1px solid #e6e9ee; box-sizing:border-box; padding:12px; display:flex; flex-direction:column; gap:10px; overflow:auto; }
     .mapwrap { flex:1; position:relative; }
     #map { position:absolute; inset:0; }
-    h1 { margin:0; font-size:18px; color:#111; }
-    .controls { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center; }
-    input[type="text"], input[type="number"], select { padding:6px 8px; border:1px solid #ddd; border-radius:6px; min-width:0; }
-    button { padding:6px 10px; border:0; background:var(--accent); color:white; border-radius:8px; cursor:pointer; }
+
+    h1 { margin:0; font-size:18px; font-weight:600; }
+    .muted { color:var(--muted); font-size:13px; }
+    .controls { display:flex; gap:8px; align-items:center; }
+    input[type="text"], input[type="number"], select, button { padding:8px 10px; border-radius:8px; border:1px solid #e6e9ee; font-size:13px; }
+    button { background:var(--accent); color:white; border:none; cursor:pointer; }
     button.ghost { background:transparent; color:var(--accent); border:1px solid #e6f2ff; }
-    .panel { background:#fafafa; padding:8px; border-radius:8px; border:1px solid #f0f0f0; }
-    .device-list { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
-    .device { padding:8px; border-radius:6px; background:white; display:flex; justify-content:space-between; align-items:center; border:1px solid #f1f1f1; cursor:pointer;}
-    .device .meta { font-size:12px; color:#666; }
-    .small { font-size:12px; color:#444; }
-    form.row { display:flex; gap:6px; align-items:center; margin-top:6px; }
-    .overspeeds { margin-top:8px; max-height:220px; overflow:auto; }
+    .panel { background:#fff; padding:10px; border-radius:10px; box-shadow:0 1px 2px rgba(16,24,40,0.03); border:1px solid #f0f3f6; }
+    .device-list { display:flex; flex-direction:column; gap:6px; margin-top:6px; }
+    .device { display:flex; justify-content:space-between; padding:8px; border-radius:8px; background:#fff; border:1px solid #f5f7fa; cursor:pointer; }
+    .device .meta { color:var(--muted); font-size:12px; }
+    .road-item { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px; border-radius:8px; background:#fff; border:1px solid #f5f7fa; }
+    .overspeeds { max-height:220px; overflow:auto; margin-top:8px; }
     table { width:100%; border-collapse:collapse; font-size:13px; }
-    th,td { text-align:left; padding:6px 8px; border-bottom:1px solid #f2f2f2; }
-    .muted { color:#666; font-size:12px; }
-    .road-item { display:flex; justify-content:space-between; align-items:center; gap:6px; padding:6px; border-radius:6px; background:#fff; border:1px solid #f1f1f1; }
-    footer { font-size:12px; color:#666; margin-top:8px; }
+    th,td { padding:6px 8px; border-bottom:1px solid #f2f4f7; text-align:left; }
+    footer { font-size:12px; color:var(--muted); margin-top:8px; }
+    .small { font-size:12px; color:var(--muted); }
+    .flex { display:flex; gap:8px; align-items:center; }
+    .grow { flex:1; }
+    .tag { padding:4px 8px; border-radius:999px; font-size:12px; background:#f3f5f8; color:#444; }
   </style>
 </head>
 <body>
-
 <div class="app">
   <aside class="sidebar">
     <div>
-      <h1>Beacon Cloud — Dashboard</h1>
-      <div class="muted">Registered cars, roads, overspeeds & map</div>
-    </div>
-
-    <div class="controls panel" style="align-items:center;">
-      <input id="searchBox" type="text" placeholder="Search cars (plate, name)..." style="flex:1;" />
-      <button id="btnRefresh" title="Refresh now">⟳</button>
-      <button id="btnCenterAll" class="ghost" title="Center map on all vehicles">Map</button>
+      <h1>Beacon Cloud Dashboard</h1>
+      <div class="muted">Vehicles, Roads, Overspeeds & Live Map</div>
     </div>
 
     <div class="panel">
-      <div style="display:flex; gap:6px; align-items:center;">
-        <label class="small">Show overspeeds ≥</label>
-        <input id="filterSpeed" type="number" min="0" step="1" placeholder="km/h" style="width:90px;" />
+      <div class="controls">
+        <input id="searchBox" type="text" placeholder="Search cars (plate, name, id)..." class="grow" />
+        <button id="btnRefresh" title="Refresh data">⟳</button>
+        <button id="btnFit" class="ghost" title="Fit map to devices">Map</button>
+      </div>
+      <div style="display:flex; gap:6px; margin-top:8px;">
+        <input id="filterSpeed" type="number" placeholder="overspeed ≥ km/h" style="width:120px;" />
         <select id="filterRoad" style="flex:1;">
           <option value="">All roads</option>
         </select>
-        <button id="btnFilter">Show</button>
+        <button id="btnFilter">Apply</button>
       </div>
-
-      <div style="margin-top:8px; display:flex; gap:6px;">
-        <input id="onlyExceedToggle" type="checkbox" />
-        <label class="small">Only show vehicles exceeding selected limit</label>
+      <div style="display:flex; gap:6px; margin-top:8px; align-items:center;">
+        <input id="onlyExceed" type="checkbox" />
+        <label class="small">Only show vehicles that exceeded</label>
       </div>
     </div>
 
     <div class="panel">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <strong>Registered cars</strong>
-        <span id="deviceCount" class="muted">0</span>
+        <strong>Registered cars</strong><span id="deviceCount" class="small">0</span>
       </div>
-      <div class="device-list" id="deviceList" aria-live="polite"></div>
+      <div id="deviceList" class="device-list" aria-live="polite"></div>
     </div>
 
     <div class="panel">
       <strong>Manage roads</strong>
-      <div class="muted">Name, center lat/lon, radius (m), speed limit (km/h)</div>
-      <form id="roadForm" class="row" onsubmit="return false;">
-        <input id="roadName" placeholder="Road name" required />
-        <input id="roadLat" placeholder="lat" required style="width:80px" />
-        <input id="roadLon" placeholder="lon" required style="width:80px" />
-        <input id="roadRadius" placeholder="radius m" value="50" style="width:80px" />
-        <input id="roadLimit" placeholder="limit km/h" value="50" style="width:80px" />
-      </form>
-      <div style="margin-top:6px; display:flex; gap:6px;">
-        <button id="btnAddRoad">Add road</button>
-        <button id="btnReloadRoads" class="ghost">Reload roads</button>
+      <div class="muted">Add road (center lat/lon, radius meters, limit km/h)</div>
+      <div style="display:flex; gap:6px; margin-top:8px;">
+        <input id="roadName" placeholder="name" />
+        <input id="roadLat" placeholder="lat" style="width:100px" />
+        <input id="roadLon" placeholder="lon" style="width:100px" />
       </div>
-
-      <div style="margin-top:8px;">
-        <div class="muted">Roads</div>
-        <div id="roadList" style="display:flex; flex-direction:column; gap:6px; margin-top:6px;"></div>
+      <div style="display:flex; gap:6px; margin-top:8px;">
+        <input id="roadRadius" placeholder="radius (m)" value="50" style="width:120px" />
+        <input id="roadLimit" placeholder="limit km/h" value="50" style="width:120px" />
+        <button id="btnAddRoad">Add</button>
+        <button id="btnReloadRoads" class="ghost">Reload</button>
       </div>
+      <div id="roadList" style="margin-top:8px; display:flex; flex-direction:column; gap:6px;"></div>
     </div>
 
     <div class="panel">
       <strong>Recent overspeeds</strong>
       <div class="overspeeds" id="overspeedContainer">
         <table id="overspeedTable">
-          <thead><tr><th>ts</th><th>device</th><th>road</th><th>km/h</th></tr></thead>
+          <thead><tr><th>time</th><th>device</th><th>road</th><th>km/h</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
     </div>
 
     <footer>
-      <div>Tip: place this `index.html` next to <code>app.py</code>. Serve at <code>/unlimited</code> or from same origin to allow cookie-based session auth.</div>
+      <div class="muted">Place this file next to <code>app.py</code>. If backend requires token auth, add it to the &lt;meta name="admin-token"&gt; above.</div>
     </footer>
   </aside>
 
@@ -144,22 +128,20 @@
 </div>
 
 <script>
-/* ----------------------
-   Config & utilities
-   ---------------------- */
+/* ====================
+   Config & Utilities
+   ==================== */
 const ADMIN_TOKEN = document.querySelector('meta[name="admin-token"]').content || '';
-const API_PREFIX = ''; // same origin; if API is at /api change accordingly
-const POLL_MS = 10000;
+const API_PREFIX = ''; // same origin; adjust if API is under /api or different path
+const POLL_INTERVAL = 10000; // ms
 
 function apiFetch(path, opts = {}) {
   const headers = opts.headers || {};
   if (ADMIN_TOKEN) headers['Authorization'] = 'Bearer ' + ADMIN_TOKEN;
   headers['Accept'] = 'application/json';
-  if (opts.body && !(opts.body instanceof FormData)) {
-    headers['Content-Type'] = 'application/json';
-  }
+  if (opts.body && !(opts.body instanceof FormData)) headers['Content-Type'] = 'application/json';
   return fetch(API_PREFIX + path, {
-    credentials: 'include', // allow session cookies when same origin
+    credentials: 'include',
     ...opts,
     headers
   }).then(async res => {
@@ -167,115 +149,120 @@ function apiFetch(path, opts = {}) {
       const txt = await res.text().catch(()=>'');
       throw new Error('HTTP ' + res.status + ' ' + txt);
     }
-    const ct = res.headers.get('content-type') || '';
+    const ct = res.headers.get('content-type')||'';
     if (ct.includes('application/json')) return res.json();
     return res.text();
   });
 }
 
-function kmhFromMps(mps){ return mps ? Math.round(mps*3.6*10)/10 : 0; }
-function fmtDate(iso){ try{ return new Date(iso).toLocaleString() }catch(e){ return iso } }
+function kmhFromMps(mps){ return mps==null ? null : Math.round(mps*3.6*10)/10; }
+function fmtDate(iso){ try { return new Date(iso).toLocaleString() } catch(e){ return iso; } }
 
-/* ----------------------
-   Map & layers
-   ---------------------- */
-const map = L.map('map', { preferCanvas:true }).setView([ -1.29, 36.82 ], 12); // default Nairobi center
-L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19, attribution: '&copy; OpenStreetMap'
-}).addTo(map);
+/* ====================
+   Map Setup
+   ==================== */
+const map = L.map('map', { preferCanvas: true }).setView([ -1.2921, 36.8219 ], 12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
 
-const deviceLayer = L.layerGroup().addTo(map);
-const roadLayer = L.layerGroup().addTo(map);
-const overspeedLayer = L.layerGroup().addTo(map);
+const layers = {
+  devices: L.layerGroup().addTo(map),
+  roads: L.layerGroup().addTo(map),
+  overs: L.layerGroup().addTo(map)
+};
 
+/* Optional: use MarkerCluster by uncommenting the script/link tags above
+   and replacing layers.devices with L.markerClusterGroup()
+*/
+
+/* ====================
+   State
+   ==================== */
 let devicesCache = [];
 let roadsCache = [];
 let oversCache = [];
+let deviceMarkers = new Map(); // device_id -> marker
+let pollHandle = null;
 
-/* marker helpers */
-function makeDeviceMarker(device){
-  const lat = device.lat || device.last_lat || 0;
-  const lon = device.lon || device.last_lon || 0;
-  const speed_kmh = device.speed_kmh ?? (device.speed_mps ? kmhFromMps(device.speed_mps) : null);
-  const lastSeen = device.last_seen || device.ts || device.last_seen_iso;
-  const title = device.name ? `${device.name} (${device.id})` : device.id;
-  const marker = L.circleMarker([lat,lon], {
+/* ====================
+   Rendering helpers
+   ==================== */
+function clearLayers() {
+  Object.values(layers).forEach(l => l.clearLayers());
+  deviceMarkers.clear();
+}
+
+function makeDeviceMarker(d) {
+  if (typeof d.lat !== 'number' || typeof d.lon !== 'number') return null;
+  const speed_kmh = d.speed_kmh ?? (d.speed_mps ? kmhFromMps(d.speed_mps) : null);
+  const color = speed_kmh == null ? '#0b84ff' : (speed_kmh >= 80 ? '#d9534f' : (speed_kmh >= 50 ? '#f0a636' : '#0b84ff'));
+  const marker = L.circleMarker([d.lat, d.lon], {
     radius: 7,
+    fillColor: color,
+    color: '#fff',
     weight: 1,
-    opacity: 1,
-    fillOpacity: 0.9,
-    fillColor: speed_kmh >= 80 ? '#d9534f' : (speed_kmh >= 50 ? '#f0a636' : '#0b84ff'),
-    color: '#fff'
+    fillOpacity: 0.9
   });
   const popup = `
-    <strong>${device.name || device.id}</strong><br/>
-    <div class="muted">${device.plate || ''}</div>
+    <strong>${d.name || d.id}</strong><br/>
+    <div class="small">${d.plate || ''}</div>
     <div class="small">Speed: ${speed_kmh ?? '—'} km/h</div>
-    <div class="small">Last: ${fmtDate(lastSeen || device.last_update || device.ts)}</div>
-    <div class="small">Lat: ${lat.toFixed(5)} Lon: ${lon.toFixed(5)}</div>
+    <div class="small">Last: ${fmtDate(d.last_seen)}</div>
+    <div class="small">Lat: ${d.lat.toFixed(6)} Lon: ${d.lon.toFixed(6)}</div>
   `;
   marker.bindPopup(popup);
   marker.on('click', ()=> {
-    // highlight device in list
-    const el = document.querySelector(`[data-device-id="${device.id}"]`);
+    const el = document.querySelector(`[data-device-id="${d.id}"]`);
     if (el) { el.scrollIntoView({behavior:'smooth', block:'center'}); el.style.background='#f6f9ff'; setTimeout(()=>el.style.background='',300); }
   });
   return marker;
 }
 
-/* ----------------------
-   Rendering functions
-   ---------------------- */
-function renderDevices(list){
+/* ====================
+   Render lists & tables
+   ==================== */
+function renderDevices(list) {
   devicesCache = list || [];
-  const listContainer = document.getElementById('deviceList');
-  listContainer.innerHTML = '';
+  const container = document.getElementById('deviceList');
+  container.innerHTML = '';
   document.getElementById('deviceCount').textContent = devicesCache.length;
-  deviceLayer.clearLayers();
-  for (const d of devicesCache){
-    const item = document.createElement('div');
-    item.className = 'device';
-    item.dataset.deviceId = d.id;
-    const speed = d.speed_kmh ?? (d.speed_mps ? kmhFromMps(d.speed_mps) : '—');
-    item.innerHTML = `
-      <div>
-        <div><strong>${d.name || d.id}</strong></div>
-        <div class="meta">${d.plate ? d.plate + ' • ' : ''}${d.model || ''}</div>
-      </div>
-      <div style="text-align:right">
-        <div class="small">${speed} km/h</div>
-        <div class="muted">${fmtDate(d.last_seen || d.ts || d.last_seen_iso || '')}</div>
-      </div>
-    `;
-    item.addEventListener('click', () => {
-      if (d.lat && d.lon) {
-        map.setView([d.lat, d.lon], 16);
-      }
-    });
-    listContainer.appendChild(item);
+  // update device markers
+  layers.devices.clearLayers();
+  deviceMarkers.clear();
+
+  for (const d of devicesCache) {
+    const row = document.createElement('div');
+    row.className = 'device';
+    row.dataset.deviceId = d.id;
+    row.innerHTML = `<div><strong>${d.name || d.id}</strong><div class="meta">${d.plate || ''}</div></div>
+                     <div style="text-align:right"><div class="small">${d.speed_kmh ?? (d.speed_mps ? kmhFromMps(d.speed_mps) : '—')} km/h</div><div class="small">${fmtDate(d.last_seen)}</div></div>`;
+    row.onclick = () => {
+      if (typeof d.lat === 'number' && typeof d.lon === 'number') map.setView([d.lat, d.lon], 15);
+    };
+    container.appendChild(row);
 
     // marker
-    if (typeof d.lat === 'number' && typeof d.lon === 'number') {
-      const mk = makeDeviceMarker(d);
-      mk.addTo(deviceLayer);
+    const mk = makeDeviceMarker(d);
+    if (mk) {
+      mk.addTo(layers.devices);
+      deviceMarkers.set(d.id, mk);
     }
   }
 }
 
-function renderRoads(roads, overs){
+function renderRoads(roads, overs) {
   roadsCache = roads || [];
   oversCache = overs || [];
-  // fill roads select
   const sel = document.getElementById('filterRoad');
   sel.innerHTML = '<option value="">All roads</option>';
-  const roadListEl = document.getElementById('roadList');
-  roadListEl.innerHTML = '';
-  roadLayer.clearLayers();
+  const roadList = document.getElementById('roadList');
+  roadList.innerHTML = '';
+  layers.roads.clearLayers();
+
   // count overs per road
   const counts = {};
   (overs || []).forEach(o => { counts[o.road_id] = (counts[o.road_id]||0) + 1; });
 
-  roads.forEach(r => {
+  for (const r of roadsCache) {
     const cnt = counts[r.id] || 0;
     const color = cnt > 0 ? '#d9534f' : '#0b84ff';
     const circle = L.circle([r.center_lat, r.center_lon], {
@@ -283,166 +270,233 @@ function renderRoads(roads, overs){
       color,
       weight: 2,
       fillOpacity: 0.05
-    }).addTo(roadLayer);
+    }).addTo(layers.roads);
     circle.bindPopup(`<strong>${r.name}</strong><br/>limit: ${r.speed_limit_kmh} km/h<br/>overspeeds: ${cnt}`);
     sel.appendChild(Object.assign(document.createElement('option'), { value: r.id, textContent: `${r.name} (${r.speed_limit_kmh} km/h)` }));
-    // list entry with quick center
     const row = document.createElement('div');
     row.className = 'road-item';
-    row.innerHTML = `<div><strong>${r.name}</strong><div class="muted">${r.center_lat.toFixed(4)}, ${r.center_lon.toFixed(4)}</div></div><div><div class="small">${r.speed_limit_kmh} km/h</div><div class="muted">${cnt} events</div></div>`;
-    row.addEventListener('click', ()=> map.setView([r.center_lat, r.center_lon], 15));
-    roadListEl.appendChild(row);
-  });
+    row.innerHTML = `<div><strong>${r.name}</strong><div class="small">${r.center_lat.toFixed(4)}, ${r.center_lon.toFixed(4)}</div></div><div class="small">${cnt} events</div>`;
+    row.onclick = () => map.setView([r.center_lat, r.center_lon], 15);
+    roadList.appendChild(row);
+  }
 }
 
-function renderOverspeeds(list){
+function renderOverspeeds(list) {
   oversCache = list || [];
   const tbody = document.querySelector('#overspeedTable tbody');
   tbody.innerHTML = '';
-  list.forEach(o => {
+  layers.overs.clearLayers();
+  for (const o of oversCache) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="small">${fmtDate(o.ts)}</td><td>${o.device_id}</td><td>${o.road_id || (o.road_name || '')}</td><td>${o.speed_kmh}</td>`;
+    tr.innerHTML = `<td class="small">${fmtDate(o.ts)}</td><td>${o.device_id}</td><td>${o.road_id || ''}</td><td>${o.speed_kmh || o.speed}</td>`;
     tbody.appendChild(tr);
-  });
-  // also draw markers for recent overspeeds on map
-  overspeedLayer.clearLayers();
-  list.slice(0,200).forEach(o => {
     if (typeof o.lat === 'number' && typeof o.lon === 'number') {
-      const m = L.circleMarker([o.lat,o.lon], { radius:6, color:'#d9534f', weight:1, fillOpacity:0.8 }).addTo(overspeedLayer);
-      m.bindPopup(`<strong>Overspeed</strong><br/>Device: ${o.device_id}<br/>${o.speed_kmh} km/h<br/>${fmtDate(o.ts)}`);
+      const mk = L.circleMarker([o.lat, o.lon], { radius:6, color:'#d9534f', weight:1, fillOpacity:0.9 }).addTo(layers.overs);
+      mk.bindPopup(`<strong>Overspeed</strong><br/>Device: ${o.device_id}<br/>${o.speed_kmh || o.speed} km/h<br/>${fmtDate(o.ts)}`);
     }
-  });
-}
-
-/* ----------------------
-   Data loading & polling
-   ---------------------- */
-async function loadAll(){
-  try {
-    const [devicesResp, roadsResp, oversResp] = await Promise.all([
-      apiFetch('/admin/devices').catch(e=>{console.warn('devices error',e); return []}),
-      apiFetch('/admin/roads').catch(e=>{console.warn('roads error',e); return []}),
-      apiFetch('/admin/overspeeds').catch(e=>{console.warn('overspeeds error',e); return {overspeeds:[]}})
-    ]);
-    // try to normalize responses:
-    const devices = Array.isArray(devicesResp) ? devicesResp : (devicesResp.devices || []);
-    const roads = Array.isArray(roadsResp) ? roadsResp : (roadsResp.roads || []);
-    const overs = (oversResp && oversResp.overspeeds) ? oversResp.overspeeds : (Array.isArray(oversResp) ? oversResp : []);
-    renderDevices(devices);
-    renderRoads(roads, overs);
-    renderOverspeeds(overs);
-  } catch (err) {
-    console.error('loadAll error', err);
   }
 }
 
-let pollHandle = null;
-function startPolling(){
-  if (pollHandle) clearInterval(pollHandle);
-  loadAll();
-  pollHandle = setInterval(loadAll, POLL_MS);
+/* ====================
+   Data loading
+   ==================== */
+async function loadAll() {
+  try {
+    const [devResp, roadResp, ovResp] = await Promise.all([
+      apiFetch('/admin/devices').catch(e => { console.warn('devices', e); return { devices: [] }; }),
+      apiFetch('/admin/roads').catch(e => { console.warn('roads', e); return { roads: [] }; }),
+      // overspeeds may require admin token; if not available, the endpoint will 401
+      apiFetch('/admin/overspeeds').catch(e => { console.warn('overs', e); return { overspeeds: [] }; })
+    ]);
+    // normalize responses
+    const devices = Array.isArray(devResp) ? devResp : (devResp.devices || devResp);
+    const roads = Array.isArray(roadResp) ? roadResp : (roadResp.roads || roadResp);
+    const overs = (ovResp && ovResp.overspeeds) ? ovResp.overspeeds : (Array.isArray(ovResp) ? ovResp : []);
+    // some backends return arrays directly; handle both forms
+    renderDevices(Array.isArray(devices) ? devices.map(normalizeDevice) : []);
+    renderRoads(Array.isArray(roads) ? roads.map(normalizeRoad) : [], overs.map(normalizeOvers));
+    renderOverspeeds(overs.map(normalizeOvers));
+  } catch (err) {
+    console.error('loadAll failed', err);
+  }
 }
+
+function normalizeDevice(d) {
+  // Accept a few possible field names
+  return {
+    id: d.id || d.device_id || d.uuid,
+    name: d.name || d.label || '',
+    plate: d.plate || d.registration || '',
+    model: d.model || '',
+    lat: d.lat || d.last_lat || d.latitude ? Number(d.lat || d.last_lat || d.latitude) : undefined,
+    lon: d.lon || d.last_lon || d.longitude ? Number(d.lon || d.last_lon || d.longitude) : undefined,
+    speed_mps: d.speed_mps || d.last_speed_mps || d.speed,
+    speed_kmh: d.speed_kmh || (d.speed_mps ? kmhFromMps(d.speed_mps) : (d.last_speed_mps ? kmhFromMps(d.last_speed_mps) : d.speed_kmh)),
+    last_seen: d.last_seen || d.ts || d.updated_at || d.last_seen
+  };
+}
+
+function normalizeRoad(r) {
+  return {
+    id: r.id,
+    name: r.name,
+    center_lat: r.center_lat || r.lat,
+    center_lon: r.center_lon || r.lon,
+    radius_m: r.radius_m || r.radius,
+    speed_limit_kmh: r.speed_limit_kmh || r.limit_kmh || r.limit
+  };
+}
+
+function normalizeOvers(o) {
+  return {
+    id: o.id,
+    device_id: o.device_id,
+    road_id: o.road_id,
+    ts: o.ts,
+    speed_kmh: o.speed_kmh || (o.speed_mps ? kmhFromMps(o.speed_mps) : (o.speed || null)),
+    lat: o.lat,
+    lon: o.lon
+  };
+}
+
+/* ====================
+   Polling & realtime
+   ==================== */
+function startPolling() { if (pollHandle) clearInterval(pollHandle); loadAll(); pollHandle = setInterval(loadAll, POLL_INTERVAL); }
 startPolling();
 
-/* ----------------------
-   UI wiring
-   ---------------------- */
-document.getElementById('btnRefresh').addEventListener('click', loadAll);
-document.getElementById('btnReloadRoads').addEventListener('click', async ()=>{
+/* Socket.IO realtime (if available) */
+(function initSocketIo(){
+  // attempt to load socket.io only if the server actually has it
+  // this will fail silently if socket.io isn't present on the server
   try {
-    const r = await apiFetch('/admin/roads');
-    renderRoads(Array.isArray(r) ? r : (r.roads||[]), oversCache);
+    // insert script tag for socket.io client
+    const s = document.createElement('script');
+    s.src = '/socket.io/socket.io.js';
+    s.onload = () => {
+      try {
+        const socket = io({ transports: ['websocket', 'polling'] });
+        socket.on('connect', () => console.info('socket connected'));
+        socket.on('snapshot', data => {
+          // update or add device quickly
+          const dev = normalizeDevice({ id: data.device_id, lat: data.lat, lon: data.lon, speed_mps: data.speed_mps, ts: data.ts });
+          // merge into devicesCache (update by id)
+          const idx = devicesCache.findIndex(x => String(x.id) === String(dev.id));
+          if (idx >= 0) devicesCache[idx] = { ...devicesCache[idx], ...dev };
+          else devicesCache.unshift(dev);
+          renderDevices(devicesCache);
+        });
+        socket.on('overspeed', data => {
+          // add overspeed marker
+          const ov = normalizeOvers(data);
+          oversCache.unshift(ov);
+          renderOverspeeds(oversCache.slice(0, 500));
+          // highlight affected road if exists
+          loadAll(); // quick refresh so road counts update. For heavy loads, optimize to update only counts.
+        });
+        socket.on('device_update', d => {
+          const device = normalizeDevice(d);
+          const idx = devicesCache.findIndex(x => String(x.id) === String(device.id));
+          if (idx >= 0) devicesCache[idx] = { ...devicesCache[idx], ...device };
+          else devicesCache.unshift(device);
+          renderDevices(devicesCache);
+        });
+      } catch (e) {
+        console.warn('socket init inner failed', e);
+      }
+    };
+    s.onerror = () => console.info('socket.io client not found on server');
+    document.head.appendChild(s);
+  } catch (e) {
+    console.warn('socket script injection failed', e);
+  }
+})();
+
+/* ====================
+   UI wiring
+   ==================== */
+document.getElementById('btnRefresh').addEventListener('click', loadAll);
+document.getElementById('btnReloadRoads').addEventListener('click', async () => {
+  try{
+    const roads = await apiFetch('/admin/roads');
+    const roadsArr = Array.isArray(roads) ? roads : (roads.roads || roads);
+    renderRoads(roadsArr.map(normalizeRoad), oversCache);
   } catch(e){ alert('Failed to reload roads: ' + e.message); }
 });
 
-document.getElementById('btnAddRoad').addEventListener('click', async ()=>{
+document.getElementById('btnAddRoad').addEventListener('click', async () => {
   const name = document.getElementById('roadName').value.trim();
   const lat = parseFloat(document.getElementById('roadLat').value);
   const lon = parseFloat(document.getElementById('roadLon').value);
-  const radius_m = parseFloat(document.getElementById('roadRadius').value);
-  const limit_kmh = parseFloat(document.getElementById('roadLimit').value);
+  const radius_m = parseFloat(document.getElementById('roadRadius').value || 50);
+  const limit_kmh = parseFloat(document.getElementById('roadLimit').value || 50);
   if (!name || Number.isNaN(lat) || Number.isNaN(lon) || Number.isNaN(limit_kmh)) {
-    alert('Please fill road name, lat, lon and speed limit correctly.');
-    return;
+    return alert('Please fill road name, lat, lon and speed limit correctly.');
   }
   try {
-    const body = { name, lat, lon, radius_m, limit_kmh };
-    // some servers expect center_lat/center_lon or different names; try to match what server expects:
     const payload = { name, center_lat: lat, center_lon: lon, radius_m, speed_limit_kmh: limit_kmh };
-    await apiFetch('/admin/roads', { method:'POST', body: JSON.stringify(payload) });
+    await apiFetch('/admin/roads', { method: 'POST', body: JSON.stringify(payload) });
     document.getElementById('roadName').value=''; document.getElementById('roadLat').value=''; document.getElementById('roadLon').value='';
     loadAll();
-  } catch(e){
-    alert('Failed to add road: ' + e.message);
+  } catch (e) {
+    alert('Failed to add road: ' + e.message + ' (requires admin token/session)');
   }
 });
 
-document.getElementById('btnFilter').addEventListener('click', async ()=>{
+document.getElementById('btnFilter').addEventListener('click', async () => {
   const speedThreshold = parseFloat(document.getElementById('filterSpeed').value || 0);
   const roadId = document.getElementById('filterRoad').value;
   try {
     const url = '/admin/overspeeds' + (roadId ? '?road_id=' + encodeURIComponent(roadId) : '');
     const resp = await apiFetch(url);
     const list = resp.overspeeds || resp;
-    const filtered = list.filter(o => (o.speed_kmh || 0) >= speedThreshold);
+    const filtered = (list || []).map(normalizeOvers).filter(o => (o.speed_kmh || 0) >= speedThreshold);
     renderOverspeeds(filtered);
-    // optionally hide non-exceeding devices from device layer if toggle set
-    const onlyExceed = document.getElementById('onlyExceedToggle').checked;
+    const onlyExceed = document.getElementById('onlyExceed').checked;
     if (onlyExceed) {
-      const ids = new Set(filtered.map(o=>String(o.device_id)));
-      // filter device markers and list:
+      const ids = new Set(filtered.map(o => String(o.device_id)));
       const filteredDevices = devicesCache.filter(d => ids.has(String(d.id)));
       renderDevices(filteredDevices);
     } else {
       renderDevices(devicesCache);
     }
-  } catch(e){
+  } catch(e) {
     alert('Failed to fetch/filter overspeeds: ' + e.message);
   }
 });
 
-document.getElementById('searchBox').addEventListener('input', (ev)=>{
+document.getElementById('searchBox').addEventListener('input', (ev) => {
   const q = ev.target.value.trim().toLowerCase();
-  if (!q) { renderDevices(devicesCache); return; }
+  if (!q) return renderDevices(devicesCache);
   const filtered = devicesCache.filter(d => {
     return (d.name && d.name.toLowerCase().includes(q)) ||
            (d.plate && d.plate.toLowerCase().includes(q)) ||
-           (d.id && String(d.id).toLowerCase().includes(q));
+           (String(d.id) && String(d.id).toLowerCase().includes(q));
   });
   renderDevices(filtered);
 });
 
-document.getElementById('btnCenterAll').addEventListener('click', ()=>{
+document.getElementById('btnFit').addEventListener('click', () => {
   const coords = devicesCache.filter(d=>d.lat && d.lon).map(d => [d.lat, d.lon]);
-  if (!coords.length) return alert('No device coordinates available to fit map.');
+  if (!coords.length) return alert('No device coordinates available.');
   const bounds = L.latLngBounds(coords);
   map.fitBounds(bounds.pad(0.2));
 });
 
-/* ----------------------
-   Optional: small startup tweaks
-   ---------------------- */
-(async function init(){
-  // try to center map on first device if present
+/* ====================
+   Initialization tweaks
+   ==================== */
+(async function init() {
   try {
-    const res = await apiFetch('/admin/devices').catch(()=>null);
-    const devices = Array.isArray(res) ? res : (res && res.devices ? res.devices : []);
+    const d = await apiFetch('/admin/devices').catch(()=>({ devices: [] }));
+    const devices = Array.isArray(d) ? d : (d.devices || []);
     if (devices.length) {
-      const first = devices.find(d => d.lat && d.lon) || devices[0];
-      if (first && first.lat && first.lon) map.setView([first.lat, first.lon], 13);
+      const first = devices.find(x => x.lat && x.lon) || devices[0];
+      if (first.lat && first.lon) map.setView([first.lat, first.lon], 12);
     }
-  } catch(e) {
-    console.warn('init center failed', e);
-  }
+  } catch (e) { console.warn('init center failed', e); }
 })();
 
-/* ----------------------
-   Notes & future improvements:
-   - If you want real-time updates, integrate socket.io: listen for snapshot events and call render updates.
-   - If your server field names differ (center_lat vs lat, speed_mps vs speed_kmh) adjust the JS normalization accordingly.
-   - For large numbers of roads/markers consider a spatial index or server-side filtering.
-   ---------------------- */
 </script>
-
 </body>
 </html>
