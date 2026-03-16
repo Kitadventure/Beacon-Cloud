@@ -677,25 +677,27 @@ def root():
         }
     })
 
-# -----------------------
-# Main startup
-# -----------------------
 if __name__ == "__main__":
-    # ensure DB exists before startup (needs app context)
-    with app.app_context():
-        db.create_all()
+    try:
+        with app.app_context():
+            init_db()
+    except Exception:
+        app.logger.exception("Database initialization failed.")
 
-    port = int(os.environ.get("PORT", "5000"))
-    host = os.environ.get("HOST", "0.0.0.0")
+    # start jam detector background thread
+    try:
+        t = threading.Thread(target=jam_detector_loop, daemon=True)
+        t.start()
+        app.logger.info("Jam detector thread started.")
+    except Exception:
+        app.logger.exception("Failed to start jam detector thread.")
 
     try:
-        if socketio:
-            logger.info("Starting with Socket.IO enabled")
-            socketio.run(app, host=host, port=port)
-        else:
-            logger.info("Starting without Socket.IO")
-            app.run(host=host, port=port, debug=DEBUG)
-    except Exception as e:
-        logger.error(f"Startup failed with Socket.IO, falling back to Flask: {e}")
-        app.run(host=host, port=port, debug=DEBUG)
-
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", 5000)),
+            debug=os.environ.get("FLASK_DEBUG", "0") == "1"
+        )
+    except Exception:
+        app.logger.exception("SocketIO server failed to start.")
