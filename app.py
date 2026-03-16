@@ -1,3 +1,17 @@
+# app.py
+# Full file: keeps your original app logic intact, and adds:
+#  - Road model (name, speed limit, center lat/lon, radius)
+#  - OverspeedEvent model (records events per road)
+#  - Floating minimizable UI widget in DASHBOARD_HTML (search/create/select road, view all)
+#  - Admin endpoints: create/list/delete/search roads
+#  - Automatic overspeed recording in heartbeat (per-road, deduped by snapshot)
+#  - Report endpoints: download full-app Excel/PDF, or per-road Excel/PDF
+#
+# IMPORTANT: This file is meant to replace your current app.py exactly.
+# All original code is preserved; new code is added where noted.
+#
+# Start of file -------------------------------------------------------------
+
 import os
 import uuid
 import threading
@@ -6,14 +20,31 @@ from datetime import datetime, timedelta
 import json
 import time
 from collections import defaultdict
+import io
 
 from flask import (
     Flask, request, jsonify, render_template_string, abort,
-    redirect, url_for, session, flash
+    redirect, url_for, session, flash, send_file, Response
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit, join_room
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# New imports for reports & excel
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+# reportlab optional for PDF generation
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 # -------------------------
 # Configuration (tunable)
@@ -93,6 +124,30 @@ class Snapshot(db.Model):
     heading_deg = db.Column(db.Float) # optional
     source = db.Column(db.String(32), default="app") # e.g., "app", "web"
     raw = db.Column(db.Text) # JSON dump of raw payload (optional)
+
+# -------------------------
+# New models: Road + OverspeedEvent
+# -------------------------
+class Road(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    name = db.Column(db.String(256), nullable=False, index=True)
+    speed_limit_kmh = db.Column(db.Float, nullable=False)  # stored in km/h for user-friendliness
+    # Simple circular area for road monitoring (center + radius)
+    center_lat = db.Column(db.Float, nullable=True)
+    center_lon = db.Column(db.Float, nullable=True)
+    radius_m = db.Column(db.Float, nullable=True, default=50.0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class OverspeedEvent(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    device_id = db.Column(db.String(36), db.ForeignKey('device.id'))
+    road_id = db.Column(db.String(36), db.ForeignKey('road.id'))
+    snapshot_id = db.Column(db.Integer, db.ForeignKey('snapshot.id'), nullable=True)
+    ts = db.Column(db.DateTime, default=datetime.utcnow)
+    speed_kmh = db.Column(db.Float)
+    lat = db.Column(db.Float)
+    lon = db.Column(db.Float)
+    raw = db.Column(db.Text)
 
 # -------------------------
 # Simple in-memory rate tracking (per-device)
@@ -612,6 +667,84 @@ def send_ws_to_device(device_id, event, payload):
     return True
 
 # -------------------------
+# Overspeed detection helpers (new)
+# -------------------------
+def check_overspeed_for_snapshot(snap):
+    """
+    Given a Snapshot instance (persisted), check against all roads and create OverspeedEvent entries
+    for any road whose circular area contains the snapshot and whose speed limit is exceeded.
+    Deduplication: avoid creating multiple events for the same snapshot_id + road_id.
+    """
+    try:
+        # convert snapshot speed to km/h for comparison
+        try:
+            speed_kmh = float(snap.speed_mps) * 3.6
+        except Exception:
+            speed_kmh = 0.0
+
+        # only proceed if roads exist
+        roads = Road.query.all()
+        if not roads:
+            return
+
+        for road in roads:
+            # if road has center/radius defined, use that; otherwise skip (user must define area)
+            if road.center_lat is None or road.center_lon is None or road.radius_m is None:
+                continue
+            d = haversine_m(snap.lat, snap.lon, road.center_lat, road.center_lon)
+            if d <= float(road.radius_m):
+                # snapshot is inside road area
+                if speed_kmh > float(road.speed_limit_kmh):
+                    # dedupe: check if an event for this snapshot & road exists
+                    exists = OverspeedEvent.query.filter_by(snapshot_id=snap.id, road_id=road.id).first()
+                    if exists:
+                        # already recorded
+                        continue
+                    ev = OverspeedEvent(
+                        device_id=snap.device_id,
+                        road_id=road.id,
+                        snapshot_id=snap.id,
+                        ts=snap.ts,
+                        speed_kmh=round(speed_kmh, 2),
+                        lat=snap.lat,
+                        lon=snap.lon,
+                        raw=(snap.raw)
+                    )
+                    db.session.add(ev)
+                    try:
+                        db.session.commit()
+                    except Exception:
+                        db.session.rollback()
+                    # push to in-memory alerts list (optional)
+                    try:
+                        push_alert({
+                            "type": "overspeed",
+                            "road_id": road.id,
+                            "road_name": road.name,
+                            "device_id": snap.device_id,
+                            "speed_kmh": round(speed_kmh, 2),
+                            "lat": snap.lat,
+                            "lon": snap.lon,
+                            "ts": snap.ts.isoformat()
+                        })
+                    except Exception:
+                        pass
+                    # send websocket to device for feedback (best-effort)
+                    try:
+                        send_ws_to_device(snap.device_id, "overspeed_alert", {
+                            "road_id": road.id,
+                            "road_name": road.name,
+                            "speed_kmh": round(speed_kmh, 2),
+                            "ts": snap.ts.isoformat(),
+                            "lat": snap.lat,
+                            "lon": snap.lon
+                        })
+                    except Exception:
+                        pass
+    except Exception:
+        app.logger.exception("check_overspeed_for_snapshot error")
+
+# -------------------------
 # Routes: API (onboard, heartbeat, nearby, admin)
 # -------------------------
 @app.route("/health")
@@ -797,8 +930,17 @@ def heartbeat():
     except Exception as e:
         app.logger.exception("compute_nearby error: %s", e)
 
+    # NEW: after persisting snapshot, check for overspeed (per-road)
+    try:
+        check_overspeed_for_snapshot(snap)
+    except Exception:
+        app.logger.exception("overspeed check error")
+
     return jsonify({"ok": True, "saved_at": snap.ts.isoformat()})
 
+# -------------------------
+# Nearby & compute_for_device functions (unchanged)
+# -------------------------
 @app.route("/nearby", methods=["GET"])
 def nearby():
     token_device = None
@@ -997,13 +1139,11 @@ ADMIN_LOGIN_HTML = """
 """
 
 # -------------------------
-# Friendly Dashboard HTML (unchanged)
+# Friendly Dashboard HTML (modified to include floating widget for Road & Reports)
 # -------------------------
-# (kept exactly as in your original paste to preserve UI)
-DASHBOARD_HTML = """..."""  # (omitted here for brevity in source listing; kept below in the actual file)
-
-# To keep code readable here, we insert the original long DASHBOARD_HTML content back:
-# (In your actual file, the full HTML string should be placed here unchanged from your previous paste.)
+# We keep the bulk of your original DASHBOARD_HTML content intact (map, devices list, modal).
+# Added a floating widget (minimizable) in the bottom-right for Road search / create / select,
+# plus buttons to download reports (all / per-road) as Excel or PDF.
 DASHBOARD_HTML = """
 <!doctype html>
 <html>
@@ -1047,6 +1187,33 @@ DASHBOARD_HTML = """
     pre#detailRaw { background:#fbfdff; padding:12px; border-radius:6px; max-height:120px; overflow:auto; white-space:pre-wrap; word-wrap:break-word; }
     .meta-row { margin-top:8px; font-size:13px; color:#374151; }
 
+    /* Floating roads widget */
+    #roadsWidget {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      width: 360px;
+      max-width: calc(100% - 32px);
+      z-index: 1300;
+      transition: transform 0.18s ease, opacity 0.18s ease;
+    }
+    #roadsWidget .widget-card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 12px 36px rgba(2,6,23,0.24);
+      overflow: hidden;
+    }
+    #roadsWidget .widget-header { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    #roadsWidget .widget-body { margin-top:10px; max-height:340px; overflow:auto; }
+    #roadsWidget.minimized .widget-body { display:none; }
+    #roadsWidget .road-item { padding:8px; border-radius:8px; border:1px solid #eef2f7; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; }
+    #roadsWidget .tiny { font-size:12px; color:var(--muted); }
+    #roadsWidget input, #roadsWidget select { width:100%; padding:8px; margin-top:6px; border-radius:8px; border:1px solid #e6eef8; box-sizing:border-box; }
+    #roadsWidget .flex-row { display:flex; gap:8px; }
+
+    /* small responsiveness */
+    @media (max-width:700px){ .left{ display:none; } #roadsWidget{ width:95%; right:8px; bottom:8px;} }
   </style>
 </head>
 <body>
@@ -1125,6 +1292,55 @@ DASHBOARD_HTML = """
         <hr/>
         <div><strong>Recent snapshots</strong></div>
         <pre id="modalSnapshots" style="white-space:pre-wrap; word-break:break-word; background:#fbfdff; padding:12px; border-radius:8px; max-height:60%; overflow:auto;">Loading…</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating Roads & Reports widget -->
+  <div id="roadsWidget" class="">
+    <div class="widget-card">
+      <div class="widget-header">
+        <div>
+          <strong>Roads & Reports</strong><br/>
+          <span class="tiny">Search, create, monitor, export</span>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="toggleWidget" class="btn small">−</button>
+        </div>
+      </div>
+
+      <div class="widget-body">
+        <div style="margin-top:8px;">
+          <input id="searchRoadInput" placeholder="Search roads by name..." />
+        </div>
+        <div id="roadsList" style="margin-top:8px;"></div>
+
+        <hr/>
+        <div><strong>Create new road area</strong></div>
+        <div style="margin-top:8px;">
+          <input id="newRoadName" placeholder="Road name (e.g. 'Mombasa Rd')" />
+          <div class="flex-row" style="margin-top:8px;">
+            <input id="newRoadSpeed" placeholder="Speed limit (km/h)" />
+            <input id="newRoadRadius" placeholder="Radius (m)" />
+          </div>
+          <div style="margin-top:8px;">
+            <input id="newRoadLat" placeholder="Center lat (optional)" />
+            <input id="newRoadLon" placeholder="Center lon (optional)" />
+          </div>
+          <div style="margin-top:8px; display:flex; gap:8px;">
+            <button id="btnCreateRoad" class="btn small">Create Road</button>
+            <button id="btnRefreshRoads" class="btn ghost small">Refresh Roads</button>
+          </div>
+        </div>
+
+        <hr/>
+        <div style="display:flex; gap:8px; margin-top:6px;">
+          <button id="btnExportAllXLSX" class="btn small">Export All (.xlsx)</button>
+          <button id="btnExportAllPDF" class="btn small">Export All (.pdf)</button>
+        </div>
+        <div style="margin-top:6px;">
+          <span class="tiny">Select a road then use the per-road export buttons next to it.</span>
+        </div>
       </div>
     </div>
   </div>
@@ -1337,6 +1553,139 @@ DASHBOARD_HTML = """
   // initial load
   fetchDevices();
 
+  // -----------------------------
+  // Roads widget logic (frontend)
+  // -----------------------------
+  const toggleWidget = document.getElementById('toggleWidget');
+  const roadsWidget = document.getElementById('roadsWidget');
+  const roadsList = document.getElementById('roadsList');
+  const searchRoadInput = document.getElementById('searchRoadInput');
+  const btnCreateRoad = document.getElementById('btnCreateRoad');
+  const btnRefreshRoads = document.getElementById('btnRefreshRoads');
+  const btnExportAllXLSX = document.getElementById('btnExportAllXLSX');
+  const btnExportAllPDF = document.getElementById('btnExportAllPDF');
+
+  let roadsCache = [];
+  let selectedRoadId = null;
+
+  toggleWidget.addEventListener('click', () => {
+    if (roadsWidget.classList.contains('minimized')) {
+      roadsWidget.classList.remove('minimized');
+      toggleWidget.innerText = '−';
+    } else {
+      roadsWidget.classList.add('minimized');
+      toggleWidget.innerText = '+';
+    }
+  });
+
+  async function fetchRoads(){
+    try {
+      const res = await fetch('/admin/roads', { cache: "no-store" });
+      const j = await res.json();
+      roadsCache = j.roads || [];
+      renderRoads();
+    } catch (e) {
+      console.error("fetchRoads error", e);
+      roadsCache = [];
+      renderRoads();
+    }
+  }
+
+  function renderRoads(){
+    const filter = (searchRoadInput.value || '').toLowerCase().trim();
+    roadsList.innerHTML = '';
+    const list = roadsCache.filter(r => !filter || (r.name && r.name.toLowerCase().includes(filter)));
+    for (const r of list) {
+      const div = document.createElement('div');
+      div.className = 'road-item';
+      div.innerHTML = `
+        <div>
+          <div style="font-weight:600">${escapeHtml(r.name)}</div>
+          <div class="tiny">${escapeHtml((r.speed_limit_kmh||'') + ' km/h')} — radius ${escapeHtml((r.radius_m||'') + ' m')}</div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-end;">
+          <div style="display:flex; gap:6px;">
+            <button class="btn small btn-monitor" data-id="${r.id}">Monitor</button>
+            <button class="btn ghost small btn-export" data-id="${r.id}">Export</button>
+          </div>
+          <div style="display:flex; gap:6px; margin-top:6px;">
+            <button class="btn ghost small btn-delete" data-id="${r.id}">Delete</button>
+          </div>
+        </div>
+      `;
+      roadsList.appendChild(div);
+    }
+
+    // hook buttons
+    document.querySelectorAll('.btn-monitor').forEach(b => {
+      b.onclick = async (ev) => {
+        const id = b.dataset.id;
+        selectedRoadId = id;
+        alert('Monitoring road selected. Overspeed will be recorded automatically for devices in that road area.');
+      };
+    });
+    document.querySelectorAll('.btn-export').forEach(b => {
+      b.onclick = async (ev) => {
+        const id = b.dataset.id;
+        // open per-road excel in new tab
+        window.open('/report/road/' + id + '.xlsx', '_blank');
+      };
+    });
+    document.querySelectorAll('.btn-delete').forEach(b => {
+      b.onclick = async (ev) => {
+        const id = b.dataset.id;
+        if (!confirm('Delete road? This will remove it from monitoring history but not delete past overspeed events.')) return;
+        try {
+          const res = await fetch('/admin/road/' + id, { method: 'DELETE' });
+          if (!res.ok) { alert('Delete failed'); return; }
+          fetchRoads();
+        } catch (e) { alert('Delete error'); }
+      };
+    });
+  }
+
+  searchRoadInput.addEventListener('input', () => renderRoads());
+  btnRefreshRoads.addEventListener('click', fetchRoads);
+
+  btnCreateRoad.addEventListener('click', async () => {
+    const name = (document.getElementById('newRoadName').value || '').trim();
+    const speed = parseFloat((document.getElementById('newRoadSpeed').value || '').trim());
+    const radius = parseFloat((document.getElementById('newRoadRadius').value || '').trim()) || 50;
+    const lat = parseFloat((document.getElementById('newRoadLat').value || '').trim());
+    const lon = parseFloat((document.getElementById('newRoadLon').value || '').trim());
+    if (!name || isNaN(speed)) { alert('Name and speed limit required'); return; }
+    const body = { name: name, speed_limit_kmh: speed, radius_m: radius };
+    if (!isNaN(lat) && !isNaN(lon)) {
+      body.center_lat = lat; body.center_lon = lon;
+    }
+    try {
+      const res = await fetch('/admin/roads', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if (!res.ok) {
+        const txt = await res.text();
+        alert('Create road failed: ' + txt);
+        return;
+      }
+      document.getElementById('newRoadName').value = '';
+      document.getElementById('newRoadSpeed').value = '';
+      document.getElementById('newRoadRadius').value = '';
+      document.getElementById('newRoadLat').value = '';
+      document.getElementById('newRoadLon').value = '';
+      await fetchRoads();
+    } catch (e) {
+      alert('Create error: ' + e);
+    }
+  });
+
+  btnExportAllXLSX.addEventListener('click', () => {
+    window.open('/report/all.xlsx', '_blank');
+  });
+  btnExportAllPDF.addEventListener('click', () => {
+    window.open('/report/all.pdf', '_blank');
+  });
+
+  // initial load for roads
+  fetchRoads();
+
 </script>
 </body>
 </html>
@@ -1491,7 +1840,342 @@ def admin_device_revoke(device_id):
     return jsonify({"ok": True, "revoked": True})
 
 # -------------------------
-# New admin endpoints for alerts & jams (requires admin session or ADMIN_API_TOKEN)
+# New admin endpoints for roads & overspeeds (requires admin session or ADMIN_API_TOKEN)
+# -------------------------
+@app.route('/admin/roads', methods=['GET', 'POST'])
+def admin_roads():
+    # GET: list roads
+    if request.method == 'GET':
+        # public to admin session or API token
+        require_admin_api()
+        roads = Road.query.order_by(Road.created_at.desc()).all()
+        out = []
+        for r in roads:
+            out.append({
+                "id": r.id,
+                "name": r.name,
+                "speed_limit_kmh": float(r.speed_limit_kmh),
+                "center_lat": float(r.center_lat) if r.center_lat is not None else None,
+                "center_lon": float(r.center_lon) if r.center_lon is not None else None,
+                "radius_m": float(r.radius_m) if r.radius_m is not None else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None
+            })
+        return jsonify({"roads": out})
+
+    # POST: create a road
+    require_admin_api()
+    body = request.get_json(force=True, silent=True) or {}
+    name = body.get("name")
+    speed_limit_kmh = body.get("speed_limit_kmh")
+    center_lat = body.get("center_lat")
+    center_lon = body.get("center_lon")
+    radius_m = body.get("radius_m", 50.0)
+    if not name or speed_limit_kmh is None:
+        return jsonify({"error": "name and speed_limit_kmh required"}), 400
+    try:
+        r = Road(name=name, speed_limit_kmh=float(speed_limit_kmh))
+        if center_lat is not None and center_lon is not None:
+            r.center_lat = float(center_lat)
+            r.center_lon = float(center_lon)
+        r.radius_m = float(radius_m)
+        db.session.add(r)
+        db.session.commit()
+        return jsonify({"ok": True, "road": {
+            "id": r.id, "name": r.name, "speed_limit_kmh": r.speed_limit_kmh,
+            "center_lat": r.center_lat, "center_lon": r.center_lon, "radius_m": r.radius_m
+        }})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/road/<road_id>', methods=['GET', 'DELETE'])
+def admin_road_detail(road_id):
+    require_admin_api()
+    r = Road.query.get_or_404(road_id)
+    if request.method == 'GET':
+        return jsonify({
+            "id": r.id, "name": r.name, "speed_limit_kmh": float(r.speed_limit_kmh),
+            "center_lat": float(r.center_lat) if r.center_lat is not None else None,
+            "center_lon": float(r.center_lon) if r.center_lon is not None else None,
+            "radius_m": float(r.radius_m) if r.radius_m is not None else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None
+        })
+    # DELETE
+    try:
+        db.session.delete(r)
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/overspeeds', methods=['GET'])
+def admin_list_overspeeds():
+    require_admin_api()
+    limit = int(request.args.get("limit", 1000))
+    query = OverspeedEvent.query.order_by(OverspeedEvent.ts.desc()).limit(limit).all()
+    out = []
+    for e in query:
+        out.append({
+            "id": e.id,
+            "device_id": e.device_id,
+            "road_id": e.road_id,
+            "snapshot_id": e.snapshot_id,
+            "ts": e.ts.isoformat() if e.ts else None,
+            "speed_kmh": float(e.speed_kmh) if e.speed_kmh is not None else None,
+            "lat": e.lat, "lon": e.lon,
+            "raw": (json.loads(e.raw) if e.raw else None) if isinstance(e.raw, str) else e.raw
+        })
+    return jsonify({"overspeeds": out})
+
+# -------------------------
+# Report generation utils (Excel & PDF)
+# -------------------------
+def generate_all_excel_bytes():
+    """
+    Build an Excel workbook with sheets:
+     - devices
+     - snapshots (recent)
+     - roads
+     - overspeeds
+    Return bytes (xlsx).
+    Requires pandas to be available.
+    """
+    if pd is None:
+        raise RuntimeError("pandas is required for Excel report generation")
+
+    # devices
+    devs = Device.query.all()
+    dev_rows = []
+    for d in devs:
+        dev_rows.append({
+            "id": d.id, "owner": d.owner, "car_name": d.car_name, "car_model": d.car_model,
+            "plate": d.plate, "created_at": d.created_at.isoformat() if d.created_at else None, "revoked": bool(d.revoked)
+        })
+    df_devs = pd.DataFrame(dev_rows)
+
+    # snapshots (last N or recent window)
+    snaps_q = Snapshot.query.order_by(Snapshot.ts.desc()).limit(2000).all()
+    snaps_rows = []
+    for s in snaps_q:
+        parsed = None
+        if s.raw:
+            try:
+                parsed = json.loads(s.raw)
+            except Exception:
+                parsed = s.raw
+        snaps_rows.append({
+            "id": s.id, "device_id": s.device_id, "ts": s.ts.isoformat() if s.ts else None,
+            "lat": s.lat, "lon": s.lon, "speed_mps": s.speed_mps, "speed_kmh": round((s.speed_mps or 0.0)*3.6,2),
+            "bearing_deg": s.bearing_deg, "source": s.source, "raw": json.dumps(parsed) if parsed is not None else None
+        })
+    df_snaps = pd.DataFrame(snaps_rows)
+
+    # roads
+    roads = Road.query.order_by(Road.created_at.desc()).all()
+    roads_rows = []
+    for r in roads:
+        roads_rows.append({
+            "id": r.id, "name": r.name, "speed_limit_kmh": r.speed_limit_kmh,
+            "center_lat": r.center_lat, "center_lon": r.center_lon, "radius_m": r.radius_m,
+            "created_at": r.created_at.isoformat() if r.created_at else None
+        })
+    df_roads = pd.DataFrame(roads_rows)
+
+    # overspeeds
+    overs = OverspeedEvent.query.order_by(OverspeedEvent.ts.desc()).limit(2000).all()
+    overs_rows = []
+    for o in overs:
+        parsed = None
+        if o.raw:
+            try:
+                parsed = json.loads(o.raw)
+            except Exception:
+                parsed = o.raw
+        overs_rows.append({
+            "id": o.id, "device_id": o.device_id, "road_id": o.road_id,
+            "snapshot_id": o.snapshot_id, "ts": o.ts.isoformat() if o.ts else None,
+            "speed_kmh": o.speed_kmh, "lat": o.lat, "lon": o.lon, "raw": json.dumps(parsed) if parsed is not None else None
+        })
+    df_overs = pd.DataFrame(overs_rows)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_devs.to_excel(writer, sheet_name='devices', index=False)
+        df_snaps.to_excel(writer, sheet_name='snapshots', index=False)
+        df_roads.to_excel(writer, sheet_name='roads', index=False)
+        df_overs.to_excel(writer, sheet_name='overspeeds', index=False)
+        writer.save()
+    output.seek(0)
+    return output.getvalue()
+
+def generate_road_excel_bytes(road_id):
+    if pd is None:
+        raise RuntimeError("pandas is required for Excel report generation")
+    r = Road.query.get_or_404(road_id)
+    # basic road info sheet + overspeeds sheet
+    overs = OverspeedEvent.query.filter_by(road_id=road_id).order_by(OverspeedEvent.ts.desc()).all()
+    overs_rows = []
+    for o in overs:
+        parsed = None
+        if o.raw:
+            try:
+                parsed = json.loads(o.raw)
+            except Exception:
+                parsed = o.raw
+        overs_rows.append({
+            "id": o.id, "device_id": o.device_id, "snapshot_id": o.snapshot_id,
+            "ts": o.ts.isoformat() if o.ts else None,
+            "speed_kmh": o.speed_kmh, "lat": o.lat, "lon": o.lon, "raw": json.dumps(parsed) if parsed is not None else None
+        })
+    df_overs = pd.DataFrame(overs_rows)
+    df_info = pd.DataFrame([{
+        "id": r.id, "name": r.name, "speed_limit_kmh": r.speed_limit_kmh,
+        "center_lat": r.center_lat, "center_lon": r.center_lon, "radius_m": r.radius_m, "created_at": r.created_at.isoformat() if r.created_at else None
+    }])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_info.to_excel(writer, sheet_name='road_info', index=False)
+        df_overs.to_excel(writer, sheet_name='overspeeds', index=False)
+        writer.save()
+    output.seek(0)
+    return output.getvalue()
+
+def generate_all_pdf_bytes():
+    """
+    Attempt to create a simple PDF summary using reportlab.
+    If reportlab not available, raise an error to let caller return a helpful message.
+    """
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab library is required for PDF generation")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4))
+    styles = getSampleStyleSheet()
+    elems = []
+
+    elems.append(Paragraph("Beacon — Full App Report", styles['Heading1']))
+    elems.append(Spacer(1, 12))
+
+    # devices table (brief)
+    devs = Device.query.all()
+    dev_table_data = [["id", "owner", "car_name", "plate", "created_at", "revoked"]]
+    for d in devs:
+        dev_table_data.append([d.id, d.owner or "", d.car_name or "", d.plate or "", d.created_at.isoformat() if d.created_at else "", str(bool(d.revoked))])
+    t = Table(dev_table_data, repeatRows=1)
+    t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.lightblue),('GRID',(0,0),(-1,-1),0.25,colors.grey)]))
+    elems.append(Paragraph("Devices", styles['Heading2']))
+    elems.append(t)
+    elems.append(Spacer(1,12))
+
+    # roads
+    roads = Road.query.all()
+    road_table = [["id","name","speed_limit_kmh","center_lat","center_lon","radius_m"]]
+    for r in roads:
+        road_table.append([r.id, r.name, str(r.speed_limit_kmh), str(r.center_lat or ""), str(r.center_lon or ""), str(r.radius_m or "")])
+    elems.append(Paragraph("Roads", styles['Heading2']))
+    tr = Table(road_table, repeatRows=1)
+    tr.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.lightblue),('GRID',(0,0),(-1,-1),0.25,colors.grey)]))
+    elems.append(tr)
+    elems.append(Spacer(1,12))
+
+    # overspeeds (recent N)
+    overs = OverspeedEvent.query.order_by(OverspeedEvent.ts.desc()).limit(500).all()
+    overs_table = [["ts","device_id","road_id","speed_kmh","lat","lon"]]
+    for o in overs:
+        overs_table.append([o.ts.isoformat() if o.ts else "", o.device_id, o.road_id, str(o.speed_kmh), str(o.lat), str(o.lon)])
+    elems.append(Paragraph("Recent Overspeed Events (most recent 500)", styles['Heading2']))
+    to = Table(overs_table, repeatRows=1)
+    to.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.lightblue),('GRID',(0,0),(-1,-1),0.25,colors.grey)]))
+    elems.append(to)
+
+    doc.build(elems)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def generate_road_pdf_bytes(road_id):
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab library is required for PDF generation")
+    r = Road.query.get_or_404(road_id)
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4))
+    styles = getSampleStyleSheet()
+    elems = []
+
+    elems.append(Paragraph(f"Road Report — {r.name}", styles['Heading1']))
+    elems.append(Paragraph(f"Speed limit: {r.speed_limit_kmh} km/h — Radius: {r.radius_m} m", styles['Normal']))
+    elems.append(Spacer(1,12))
+
+    overs = OverspeedEvent.query.filter_by(road_id=road_id).order_by(OverspeedEvent.ts.desc()).limit(1000).all()
+    tdata = [["ts","device_id","speed_kmh","lat","lon"]]
+    for o in overs:
+        tdata.append([o.ts.isoformat() if o.ts else "", o.device_id, str(o.speed_kmh), str(o.lat), str(o.lon)])
+    t = Table(tdata, repeatRows=1)
+    t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.lightblue),('GRID',(0,0),(-1,-1),0.25,colors.grey)]))
+    elems.append(t)
+
+    doc.build(elems)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# -------------------------
+# Report endpoints
+# -------------------------
+@app.route('/report/all.xlsx')
+def report_all_xlsx():
+    try:
+        require_admin_api()
+    except Exception:
+        # allow admin UI access via session cookie, else require admin token
+        return abort(401, "Admin access required")
+    try:
+        data = generate_all_excel_bytes()
+        return send_file(io.BytesIO(data), download_name="beacon_full_report.xlsx", as_attachment=True, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/report/road/<road_id>.xlsx')
+def report_road_xlsx(road_id):
+    try:
+        require_admin_api()
+    except Exception:
+        return abort(401, "Admin access required")
+    try:
+        data = generate_road_excel_bytes(road_id)
+        road = Road.query.get(road_id)
+        name_safe = (road.name[:30].replace(" ", "_") if road else road_id)
+        return send_file(io.BytesIO(data), download_name=f"road_{name_safe}_report.xlsx", as_attachment=True, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/report/all.pdf')
+def report_all_pdf():
+    try:
+        require_admin_api()
+    except Exception:
+        return abort(401, "Admin access required")
+    try:
+        data = generate_all_pdf_bytes()
+        return send_file(io.BytesIO(data), download_name="beacon_full_report.pdf", as_attachment=True, mimetype="application/pdf")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/report/road/<road_id>.pdf')
+def report_road_pdf(road_id):
+    try:
+        require_admin_api()
+    except Exception:
+        return abort(401, "Admin access required")
+    try:
+        data = generate_road_pdf_bytes(road_id)
+        road = Road.query.get(road_id)
+        name_safe = (road.name[:30].replace(" ", "_") if road else road_id)
+        return send_file(io.BytesIO(data), download_name=f"road_{name_safe}_report.pdf", as_attachment=True, mimetype="application/pdf")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# -------------------------
+# Admin endpoints for alerts & jams (requires admin session or ADMIN_API_TOKEN)
 # -------------------------
 @app.route('/admin/alerts', methods=['GET'])
 def admin_list_alerts():
@@ -1678,3 +2362,4 @@ if __name__ == "__main__":
         app.logger.exception("Failed to start jam detector thread.")
 
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+# End of file
