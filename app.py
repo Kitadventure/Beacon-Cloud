@@ -681,14 +681,21 @@ def root():
 # Main startup
 # -----------------------
 if __name__ == "__main__":
-    # ensure DB exists before startup
-    db.create_all()
+    # ensure DB exists before startup (needs app context)
+    with app.app_context():
+        db.create_all()
+
     port = int(os.environ.get("PORT", "5000"))
     host = os.environ.get("HOST", "0.0.0.0")
-    if socketio:
-        logger.info("Starting with Socket.IO enabled")
-        # prefer eventlet or gevent in production; socketio.run will auto-detect installed server
-        socketio.run(app, host=host, port=port)
-    else:
-        logger.info("Starting without Socket.IO")
+
+    try:
+        if socketio:
+            logger.info("Starting with Socket.IO enabled")
+            socketio.run(app, host=host, port=port)
+        else:
+            logger.info("Starting without Socket.IO")
+            app.run(host=host, port=port, debug=DEBUG)
+    except Exception as e:
+        logger.error(f"Startup failed with Socket.IO, falling back to Flask: {e}")
         app.run(host=host, port=port, debug=DEBUG)
+
