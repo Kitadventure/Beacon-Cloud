@@ -1,49 +1,71 @@
 #!/usr/bin/env python3
 """
-app.py - Beacon Cloud minimal full server
+Full-featured backend for Beacon Cloud (app.py)
 
-Place this file next to index.html and Procfile. Requirements:
-  pip install flask flask_sqlalchemy flask_socketio eventlet
+Features:
+ - Devices, Snapshots
+ - Roads (center + radius geometry)
+ - Overspeed detection with dedupe
+ - Admin endpoints (CRUD + search + traffic overview)
+ - Telemetry ingestion endpoint (/api/heartbeat)
+ - Optional Socket.IO realtime events (if flask-socketio installed)
+ - Token or session-based admin authentication
+ - Pagination, validation, and CLI helpers
 
-Environment variables:
-  DATABASE_URL     - SQLAlchemy DB URL (default: sqlite:///beacon.db)
-  ADMIN_API_TOKEN  - token for API auth (optional but recommended)
-  FLASK_SECRET     - flask secret key (used for session auth)
-  PORT             - port to bind when running directly
+Configuration (env vars):
+ - DATABASE_URL (default: sqlite:///beacon.db)
+ - ADMIN_API_TOKEN (optional; if set allows Bearer auth)
+ - FLASK_SECRET (default: change-me)
+ - OVERSPEED_DEDUPE_SECS (default: 30)
+ - DEFAULT_CENTER_LAT / DEFAULT_CENTER_LON (map centering defaults)
+ - CORS_ORIGINS (optional, comma-separated)
+ - DEBUG (0/1)
 
-Notes:
-  - This is intentionally simple to be dropped into an existing project.
-  - If you're integrating into a larger app, adapt model names/field names to match yours.
+Usage:
+  python app.py
+  # or with socketio/eventlet support (if installed) the app will auto-detect
 """
+from __future__ import annotations
 import os
 import math
 import uuid
+import logging
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
 
 from flask import (
-    Flask, request, jsonify, session, redirect, url_for,
-    send_from_directory, abort
+    Flask, request, jsonify, abort, session, redirect, url_for,
+    send_from_directory
 )
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func, or_
 
-# Optional Socket.IO - used if installed; otherwise fallback to no real-time
+# optional real-time
 try:
-    from flask_socketio import SocketIO, emit
+    from flask_socketio import SocketIO
     SOCKETIO_AVAILABLE = True
 except Exception:
     SOCKETIO_AVAILABLE = False
 
 # -----------------------
-# Config & initialization
+# Basic config & logging
 # -----------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///beacon.db")
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN", "") or ""
 FLASK_SECRET = os.environ.get("FLASK_SECRET", "change-me-in-prod")
-DEDUPE_SECONDS = int(os.environ.get("OVERSPEED_DEDUPE_SECS", "30"))
+OVERSPEED_DEDUPE_SECS = int(os.environ.get("OVERSPEED_DEDUPE_SECS", "30"))
+DEBUG = bool(int(os.environ.get("DEBUG", "0")))
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")  # comma-separated
+DEFAULT_CENTER_LAT = float(os.environ.get("DEFAULT_CENTER_LAT", "-1.2921"))
+DEFAULT_CENTER_LON = float(os.environ.get("DEFAULT_CENTER_LON", "36.8219"))
 
-app = Flask(__name__, static_folder=None)  # we'll serve index.html manually
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("beacon")
+
+app = Flask(__name__, static_folder=None)
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.secret_key = FLASK_SECRET
 
 db = SQLAlchemy(app)
@@ -53,24 +75,33 @@ socketio = SocketIO(app, cors_allowed_origins="*") if SOCKETIO_AVAILABLE else No
 # -----------------------
 # Utilities
 # -----------------------
-def now_utc():
+def now_utc() -> datetime:
     return datetime.utcnow()
 
-def haversine_m(lat1, lon1, lat2, lon2):
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
-    Haversine distance in meters between two (lat, lon) points.
+    Haversine distance in meters.
     """
-    R = 6371000.0  # Earth radius meters
+    R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2.0)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2.0)**2
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
 
-def kmh_from_mps(mps):
-    return (mps or 0.0) * 3.6
+def mps_to_kmh(mps: Optional[float]) -> Optional[float]:
+    return None if mps is None else round(mps * 3.6, 2)
+
+def safe_float(v, default=None):
+    try:
+        return None if v is None else float(v)
+    except Exception:
+        return default
+
+def uuid_str():
+    return uuid.uuid4().hex
 
 # -----------------------
 # Models
@@ -78,19 +109,19 @@ def kmh_from_mps(mps):
 class Device(db.Model):
     __tablename__ = "device"
     id = db.Column(db.String(64), primary_key=True)
-    name = db.Column(db.String(128))
-    plate = db.Column(db.String(64))
-    model = db.Column(db.String(64))
+    name = db.Column(db.String(128), nullable=True)
+    plate = db.Column(db.String(64), nullable=True, index=True)
+    model = db.Column(db.String(64), nullable=True)
+    meta = db.Column(db.JSON, nullable=True)
+
     created_at = db.Column(db.DateTime, default=now_utc)
+    last_lat = db.Column(db.Float, nullable=True)
+    last_lon = db.Column(db.Float, nullable=True)
+    last_speed_mps = db.Column(db.Float, nullable=True)
+    last_seen = db.Column(db.DateTime, nullable=True)
 
-    # Latest known location/snapshot summary
-    last_lat = db.Column(db.Float)
-    last_lon = db.Column(db.Float)
-    last_speed_mps = db.Column(db.Float)
-    last_seen = db.Column(db.DateTime)
-
-    def to_dict(self):
-        return {
+    def to_dict(self, include_meta: bool = False) -> Dict[str, Any]:
+        out = {
             "id": self.id,
             "name": self.name,
             "plate": self.plate,
@@ -99,19 +130,24 @@ class Device(db.Model):
             "lat": self.last_lat,
             "lon": self.last_lon,
             "speed_mps": self.last_speed_mps,
-            "speed_kmh": round(kmh_from_mps(self.last_speed_mps), 2) if self.last_speed_mps is not None else None,
+            "speed_kmh": mps_to_kmh(self.last_speed_mps),
             "last_seen": self.last_seen.isoformat() if self.last_seen else None
         }
+        if include_meta:
+            out["meta"] = self.meta
+        return out
 
 class Snapshot(db.Model):
     __tablename__ = "snapshot"
     id = db.Column(db.Integer, primary_key=True)
-    device_id = db.Column(db.String(64), db.ForeignKey('device.id'), index=True)
+    device_id = db.Column(db.String(64), db.ForeignKey("device.id"), index=True)
     ts = db.Column(db.DateTime, default=now_utc, index=True)
     lat = db.Column(db.Float)
     lon = db.Column(db.Float)
-    speed_mps = db.Column(db.Float)
-    raw = db.Column(db.Text)
+    speed_mps = db.Column(db.Float, nullable=True)
+    heading = db.Column(db.Float, nullable=True)
+    battery = db.Column(db.Float, nullable=True)
+    raw = db.Column(db.JSON, nullable=True)
 
     def to_dict(self):
         return {
@@ -121,18 +157,26 @@ class Snapshot(db.Model):
             "lat": self.lat,
             "lon": self.lon,
             "speed_mps": self.speed_mps,
-            "speed_kmh": round(kmh_from_mps(self.speed_mps), 2) if self.speed_mps is not None else None,
+            "speed_kmh": mps_to_kmh(self.speed_mps),
+            "heading": self.heading,
+            "battery": self.battery,
             "raw": self.raw
         }
 
 class Road(db.Model):
+    """
+    Simple geometry support: center_lat/center_lon + radius_m
+    For more precise geometry, replace with PostGIS geometry and spatial queries.
+    """
     __tablename__ = "road"
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(128), nullable=False)
     center_lat = db.Column(db.Float, nullable=False)
     center_lon = db.Column(db.Float, nullable=False)
-    radius_m = db.Column(db.Float, default=50.0)
+    radius_m = db.Column(db.Float, nullable=False, default=50.0)
+    # speed limit expressed in km/h
     speed_limit_kmh = db.Column(db.Float, nullable=False)
+    meta = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, default=now_utc)
 
     def to_dict(self):
@@ -143,18 +187,20 @@ class Road(db.Model):
             "center_lon": self.center_lon,
             "radius_m": self.radius_m,
             "speed_limit_kmh": self.speed_limit_kmh,
+            "meta": self.meta,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
 
 class Overspeed(db.Model):
     __tablename__ = "overspeed"
     id = db.Column(db.Integer, primary_key=True)
-    device_id = db.Column(db.String(64), db.ForeignKey('device.id'), index=True)
-    road_id = db.Column(db.Integer, db.ForeignKey('road.id'), index=True, nullable=True)
+    device_id = db.Column(db.String(64), db.ForeignKey("device.id"), index=True)
+    road_id = db.Column(db.Integer, db.ForeignKey("road.id"), index=True, nullable=True)
     ts = db.Column(db.DateTime, default=now_utc, index=True)
-    speed_mps = db.Column(db.Float)
-    lat = db.Column(db.Float)
-    lon = db.Column(db.Float)
+    speed_mps = db.Column(db.Float, nullable=True)
+    lat = db.Column(db.Float, nullable=True)
+    lon = db.Column(db.Float, nullable=True)
+    snapshot_id = db.Column(db.Integer, db.ForeignKey("snapshot.id"), nullable=True)
 
     def to_dict(self):
         return {
@@ -163,46 +209,67 @@ class Overspeed(db.Model):
             "road_id": self.road_id,
             "ts": self.ts.isoformat() if self.ts else None,
             "speed_mps": self.speed_mps,
-            "speed_kmh": round(kmh_from_mps(self.speed_mps), 2) if self.speed_mps is not None else None,
+            "speed_kmh": mps_to_kmh(self.speed_mps),
             "lat": self.lat,
-            "lon": self.lon
+            "lon": self.lon,
+            "snapshot_id": self.snapshot_id
         }
+
+# -----------------------
+# DB helpers & CLI
+# -----------------------
+@app.cli.command("initdb")
+def initdb_command():
+    """Initialize the database tables."""
+    db.create_all()
+    logger.info("Database tables created.")
+
+@app.cli.command("dropdb")
+def dropdb_command():
+    """Drop all tables (dangerous!)."""
+    db.drop_all()
+    logger.warning("Dropped all database tables.")
+
+@app.cli.command("create-admin-token")
+def create_admin_token_cmd():
+    """Create an admin token to print out (not stored server-side by default)."""
+    tok = uuid_str()
+    print("Generated token (copy to ADMIN_API_TOKEN env):", tok)
 
 # -----------------------
 # Auth helpers
 # -----------------------
 def require_admin_api():
     """
-    Check admin access by either:
-     - session['is_admin'] == True
-     - Authorization: Bearer <ADMIN_API_TOKEN>
-     - X-API-Token header
+    Allow access when:
+      - session['is_admin'] == True (after /admin/login)
+      - Authorization: Bearer <ADMIN_API_TOKEN>
+      - X-API-Token: <ADMIN_API_TOKEN>
     """
-    # session
-    if session.get('is_admin'):
+    if session.get("is_admin"):
         return True
-    # header token
-    auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer '):
-        token = auth.split(' ', 1)[1].strip()
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth.split(" ", 1)[1].strip()
         if ADMIN_API_TOKEN and token and token == ADMIN_API_TOKEN:
             return True
-    # x-api-token
-    xt = request.headers.get('X-API-Token', '')
+    xt = request.headers.get("X-API-Token", "")
     if ADMIN_API_TOKEN and xt and xt == ADMIN_API_TOKEN:
         return True
-    abort(401, description="missing admin token or login")
+    abort(401, description="admin auth required")
 
-# Simple admin login page (very small, for convenience)
-@app.route('/admin/login', methods=['GET', 'POST'])
+@app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    if request.method == 'POST':
-        token = request.form.get('token') or request.form.get('password') or ''
+    """
+    Very small admin login for convenience (only sets session if ADMIN_API_TOKEN matches).
+    Not intended as a hardened auth system.
+    """
+    if request.method == "POST":
+        token = request.form.get("token") or request.form.get("password") or ""
         if ADMIN_API_TOKEN and token == ADMIN_API_TOKEN:
-            session['is_admin'] = True
-            return redirect(url_for('admin_dashboard'))
+            session["is_admin"] = True
+            return redirect(url_for("admin_ping"))
         return "invalid token", 401
-    # simple form
     return """
     <html><body>
       <h3>Admin login</h3>
@@ -213,143 +280,313 @@ def admin_login():
     </body></html>
     """
 
-@app.route('/admin/logout')
+@app.route("/admin/logout")
 def admin_logout():
-    session.pop('is_admin', None)
-    return redirect('/')
+    session.pop("is_admin", None)
+    return redirect("/")
 
 # -----------------------
-# Endpoints - Admin APIs
+# Utility endpoints
 # -----------------------
-@app.route('/admin/devices', methods=['GET'])
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "ts": now_utc().isoformat()})
+
+@app.route("/admin/ping")
+def admin_ping():
+    require_admin_api()
+    return jsonify({"ok": True, "ts": now_utc().isoformat()})
+
+# -----------------------
+# Device endpoints (CRUD + search)
+# -----------------------
+@app.route("/admin/devices", methods=["GET", "POST"])
 def admin_devices():
-    # Public info endpoint: allow read without admin? we'll allow public reading
-    # If you want to restrict, call require_admin_api()
-    devices = Device.query.all()
-    return jsonify([d.to_dict() for d in devices])
+    """
+    GET: list devices (public)
+      query params: page, per_page
+    POST: create a device (admin)
+    """
+    if request.method == "GET":
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 100))
+        q = Device.query.order_by(Device.created_at.desc())
+        devices = q.paginate(page=page, per_page=per_page, error_out=False)
+        return jsonify({
+            "total": devices.total,
+            "page": page,
+            "per_page": per_page,
+            "devices": [d.to_dict() for d in devices.items]
+        })
+    # POST - create device
+    require_admin_api()
+    data = request.get_json(force=True, silent=True) or {}
+    dev_id = data.get("id") or uuid_str()
+    if Device.query.get(dev_id):
+        return jsonify({"error": "device already exists", "id": dev_id}), 400
+    d = Device(id=str(dev_id), name=data.get("name"), plate=data.get("plate"), model=data.get("model"), meta=data.get("meta"))
+    db.session.add(d)
+    db.session.commit()
+    return jsonify({"ok": True, "device": d.to_dict()}), 201
 
-@app.route('/admin/device/<device_id>/json', methods=['GET'])
-def admin_device_json(device_id):
+@app.route("/admin/device/<device_id>", methods=["GET", "PUT", "DELETE"])
+def admin_device(device_id):
     d = Device.query.get(device_id)
     if not d:
         return jsonify({"error": "not found"}), 404
-    # include recent snapshots (last 50)
-    snaps = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).limit(50).all()
-    return jsonify({"device": d.to_dict(), "snapshots": [s.to_dict() for s in snaps]})
-
-@app.route('/admin/roads', methods=['GET', 'POST'])
-def admin_roads():
-    if request.method == 'GET':
-        # public read allowed
-        roads = Road.query.order_by(Road.id.asc()).all()
-        return jsonify([r.to_dict() for r in roads])
-    # create road - require admin
-    require_admin_api()
-    data = request.get_json(force=True)
-    if not data:
-        return jsonify({"error": "json body required"}), 400
-    # accept several possible field names for compat
-    name = data.get('name') or data.get('road_name')
-    lat = data.get('center_lat') or data.get('lat')
-    lon = data.get('center_lon') or data.get('lon')
-    radius_m = data.get('radius_m') or data.get('radius') or 50.0
-    limit_kmh = data.get('speed_limit_kmh') or data.get('limit_kmh') or data.get('limit') or None
-    if not (name and lat is not None and lon is not None and limit_kmh is not None):
-        return jsonify({"error": "missing fields: name, lat, lon, speed_limit_kmh required"}), 400
-    try:
-        r = Road(
-            name=str(name),
-            center_lat=float(lat),
-            center_lon=float(lon),
-            radius_m=float(radius_m),
-            speed_limit_kmh=float(limit_kmh)
-        )
-        db.session.add(r)
+    if request.method == "GET":
+        # include last 100 snapshots optionally
+        include_snaps = bool(request.args.get("snapshots", "").lower() in ("1", "true", "yes"))
+        out = d.to_dict(include_meta=True)
+        if include_snaps:
+            snaps = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).limit(100).all()
+            out["snapshots"] = [s.to_dict() for s in snaps]
+        return jsonify(out)
+    if request.method == "PUT":
+        require_admin_api()
+        data = request.get_json(force=True, silent=True) or {}
+        d.name = data.get("name", d.name)
+        d.plate = data.get("plate", d.plate)
+        d.model = data.get("model", d.model)
+        if "meta" in data:
+            d.meta = data.get("meta")
         db.session.commit()
-        return jsonify({"ok": True, "id": r.id, "road": r.to_dict()})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": True, "device": d.to_dict()})
+    if request.method == "DELETE":
+        require_admin_api()
+        # optionally cascade snapshots and overspeeds
+        Snapshot.query.filter_by(device_id=device_id).delete()
+        Overspeed.query.filter_by(device_id=device_id).delete()
+        db.session.delete(d)
+        db.session.commit()
+        return jsonify({"ok": True})
 
-@app.route('/admin/overspeeds', methods=['GET'])
-def admin_overspeeds():
-    # require admin to read overspeeds (optional - make public if you prefer)
+@app.route("/admin/search")
+def admin_search():
+    """
+    Search devices by id, name or plate.
+    q parameter required.
+    """
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "q parameter required"}), 400
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    qlike = f"%{q}%"
+    devices = Device.query.filter(or_(Device.id.ilike(qlike), Device.name.ilike(qlike), Device.plate.ilike(qlike))).paginate(page=page, per_page=per_page, error_out=False)
+    return jsonify({
+        "total": devices.total,
+        "page": page,
+        "per_page": per_page,
+        "devices": [d.to_dict() for d in devices.items]
+    })
+
+# -----------------------
+# Road endpoints (CRUD)
+# -----------------------
+@app.route("/admin/roads", methods=["GET", "POST"])
+def admin_roads():
+    if request.method == "GET":
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 100))
+        roads = Road.query.order_by(Road.id.asc()).paginate(page=page, per_page=per_page, error_out=False)
+        return jsonify({
+            "total": roads.total,
+            "page": page,
+            "per_page": per_page,
+            "roads": [r.to_dict() for r in roads.items]
+        })
+    # POST -> create
     require_admin_api()
-    road_id = request.args.get('road_id', type=int)
+    data = request.get_json(force=True, silent=True) or {}
+    name = data.get("name")
+    center_lat = safe_float(data.get("center_lat") or data.get("lat"))
+    center_lon = safe_float(data.get("center_lon") or data.get("lon"))
+    radius_m = safe_float(data.get("radius_m") or data.get("radius") or 50.0, 50.0)
+    limit_kmh = safe_float(data.get("speed_limit_kmh") or data.get("limit_kmh") or data.get("limit"))
+    if not (name and center_lat is not None and center_lon is not None and limit_kmh is not None):
+        return jsonify({"error": "missing name/center_lat/center_lon/speed_limit_kmh"}), 400
+    r = Road(name=name, center_lat=center_lat, center_lon=center_lon, radius_m=radius_m, speed_limit_kmh=limit_kmh, meta=data.get("meta"))
+    db.session.add(r)
+    db.session.commit()
+    return jsonify({"ok": True, "road": r.to_dict()}), 201
+
+@app.route("/admin/roads/<int:road_id>", methods=["GET", "PUT", "DELETE"])
+def admin_road(road_id):
+    r = Road.query.get(road_id)
+    if not r:
+        return jsonify({"error": "not found"}), 404
+    if request.method == "GET":
+        return jsonify(r.to_dict())
+    require_admin_api()
+    if request.method == "PUT":
+        data = request.get_json(force=True, silent=True) or {}
+        r.name = data.get("name", r.name)
+        r.center_lat = safe_float(data.get("center_lat"), r.center_lat)
+        r.center_lon = safe_float(data.get("center_lon"), r.center_lon)
+        r.radius_m = safe_float(data.get("radius_m"), r.radius_m)
+        r.speed_limit_kmh = safe_float(data.get("speed_limit_kmh"), r.speed_limit_kmh)
+        if "meta" in data:
+            r.meta = data.get("meta")
+        db.session.commit()
+        return jsonify({"ok": True, "road": r.to_dict()})
+    if request.method == "DELETE":
+        # deleting road does not delete overspeeds (but could)
+        db.session.delete(r)
+        db.session.commit()
+        return jsonify({"ok": True})
+
+# -----------------------
+# Overspeed endpoints
+# -----------------------
+@app.route("/admin/overspeeds", methods=["GET"])
+def admin_overspeeds():
+    """
+    Query overspeeds. Admin-only.
+    Query params:
+      - road_id
+      - device_id
+      - min_speed (km/h)
+      - since_secs (int)
+      - page, per_page
+    """
+    require_admin_api()
     q = Overspeed.query
+    road_id = request.args.get("road_id", type=int)
+    device_id = request.args.get("device_id")
+    min_speed = safe_float(request.args.get("min_speed"))
+    since_secs = request.args.get("since_secs", type=int)
     if road_id:
-        q = q.filter_by(road_id=road_id)
-    # optional time window
-    since_secs = request.args.get('since_secs', type=int)
+        q = q.filter(Overspeed.road_id == road_id)
+    if device_id:
+        q = q.filter(Overspeed.device_id == device_id)
+    if min_speed is not None:
+        # convert km/h to mps for filter
+        mpst = float(min_speed) / 3.6
+        q = q.filter(Overspeed.speed_mps >= mpst)
     if since_secs:
         cutoff = now_utc() - timedelta(seconds=since_secs)
         q = q.filter(Overspeed.ts >= cutoff)
-    rows = q.order_by(Overspeed.ts.desc()).limit(1000).all()
-    return jsonify({"overspeeds": [r.to_dict() for r in rows]})
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 200))
+    rows = q.order_by(Overspeed.ts.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    return jsonify({
+        "total": rows.total,
+        "page": page,
+        "per_page": per_page,
+        "overspeeds": [r.to_dict() for r in rows.items]
+    })
 
 # -----------------------
-# Heartbeat / Telemetry ingestion
+# Traffic overview
 # -----------------------
-@app.route('/api/heartbeat', methods=['POST'])
+@app.route("/admin/traffic", methods=["GET"])
+def admin_traffic():
+    """
+    Return aggregated traffic per road or global:
+     - if road_id provided -> detailed stats for that road
+     - else -> list roads with vehicle_count, avg_speed, overspeed_count
+    Query params: road_id, since_secs (default 3600)
+    """
+    require_admin_api()
+    road_id = request.args.get("road_id", type=int)
+    since_secs = request.args.get("since_secs", type=int) or 3600
+    cutoff = now_utc() - timedelta(seconds=since_secs)
+
+    if road_id:
+        road = Road.query.get(road_id)
+        if not road:
+            return jsonify({"error": "road not found"}), 404
+        # get snapshots within time window inside the road radius
+        snaps = Snapshot.query.filter(Snapshot.ts >= cutoff).all()
+        snaps_in = [s for s in snaps if (s.lat is not None and s.lon is not None and haversine_m(s.lat, s.lon, road.center_lat, road.center_lon) <= road.radius_m)]
+        device_ids = set(s.device_id for s in snaps_in)
+        avg_speed = None
+        speeds = [s.speed_mps for s in snaps_in if s.speed_mps is not None]
+        if speeds:
+            avg_speed = sum(speeds) / len(speeds)
+        overs = Overspeed.query.filter(Overspeed.road_id == road_id, Overspeed.ts >= cutoff).count()
+        return jsonify({
+            "road": road.to_dict(),
+            "vehicle_count": len(device_ids),
+            "avg_speed_mps": avg_speed,
+            "avg_speed_kmh": mps_to_kmh(avg_speed),
+            "overspeed_count": overs,
+            "sample_snapshots": [s.to_dict() for s in snaps_in[:200]]
+        })
+    # global per-road aggregation
+    roads = Road.query.all()
+    result = []
+    # perform in-python aggregation (simple but fine for moderate road counts)
+    for r in roads:
+        snaps = Snapshot.query.filter(Snapshot.ts >= cutoff).all()
+        snaps_in = [s for s in snaps if (s.lat is not None and s.lon is not None and haversine_m(s.lat, s.lon, r.center_lat, r.center_lon) <= r.radius_m)]
+        device_ids = set(s.device_id for s in snaps_in)
+        speeds = [s.speed_mps for s in snaps_in if s.speed_mps is not None]
+        avg_speed = (sum(speeds) / len(speeds)) if speeds else None
+        overs = Overspeed.query.filter(Overspeed.road_id == r.id, Overspeed.ts >= cutoff).count()
+        result.append({
+            "road": r.to_dict(),
+            "vehicle_count": len(device_ids),
+            "avg_speed_kmh": mps_to_kmh(avg_speed),
+            "overspeed_count": overs
+        })
+    return jsonify({"since_secs": since_secs, "roads": result})
+
+# -----------------------
+# Telemetry ingestion endpoint
+# -----------------------
+@app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
     """
-    Receive JSON:
+    Expected JSON payload (flexible):
     {
-      "device_id": "uuid-or-plate",
-      "lat":  -1.2921,
-      "lon": 36.8219,
-      "speed_mps": 12.3,        # optional
-      "ts": "2025-03-14T12:...Z",  # optional ISO8601
-      "raw": {...}             # optional raw payload
+      "device_id": "abc",
+      "lat": -1.29,
+      "lon": 36.82,
+      "speed_mps": 10.5,
+      "heading": 180,
+      "battery": 78,
+      "ts": "2025-03-14T12:00:00Z",
+      "raw": {...}    # optional
     }
     """
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({"error": "json required"}), 400
 
-    device_id = str(data.get('device_id') or data.get('id') or data.get('device') or uuid.uuid4().hex)
-    lat = data.get('lat') or data.get('latitude') or data.get('lat_deg')
-    lon = data.get('lon') or data.get('longitude') or data.get('lon_deg')
-    speed_mps = data.get('speed_mps') or data.get('speed') or None
-    ts_raw = data.get('ts') or data.get('timestamp') or None
-    raw = data.get('raw') or data
+    device_id = str(data.get("device_id") or data.get("id") or data.get("device") or uuid_str())
+    lat = safe_float(data.get("lat") or data.get("latitude") or data.get("lat_deg"))
+    lon = safe_float(data.get("lon") or data.get("longitude") or data.get("lon_deg"))
+    speed_mps = safe_float(data.get("speed_mps") or data.get("speed") or None)
+    heading = safe_float(data.get("heading") or data.get("hdg") or None)
+    battery = safe_float(data.get("battery") or None)
+    ts_raw = data.get("ts") or data.get("timestamp")
+    raw = data.get("raw") or data
 
-    # coerce
-    try:
-        lat = None if lat is None else float(lat)
-        lon = None if lon is None else float(lon)
-    except Exception:
-        return jsonify({"error": "lat/lon must be numeric"}), 400
-
-    try:
-        speed_mps = None if speed_mps is None else float(speed_mps)
-    except Exception:
-        speed_mps = None
-
-    # parse timestamp if present
+    # parse timestamp robustly
     ts = None
     if ts_raw:
         try:
-            # try isoformat parsing
-            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone(tz=None).replace(tzinfo=None)
+            # handle 'Z'
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).replace(tzinfo=None)
         except Exception:
             try:
-                # fallback, assume epoch seconds
                 ts = datetime.utcfromtimestamp(float(ts_raw))
             except Exception:
                 ts = now_utc()
     else:
         ts = now_utc()
 
-    # find or create device
+    # upsert device
     device = Device.query.get(device_id)
     if not device:
-        device = Device(id=device_id, name=data.get('name') or None, plate=data.get('plate') or None)
+        device = Device(id=device_id, name=data.get("name"), plate=data.get("plate"), model=data.get("model"), meta=data.get("meta"))
         db.session.add(device)
         db.session.commit()
 
     # create snapshot
-    snap = Snapshot(device_id=device_id, ts=ts, lat=lat, lon=lon, speed_mps=speed_mps, raw=str(raw))
+    snap = Snapshot(device_id=device_id, ts=ts, lat=lat, lon=lon, speed_mps=speed_mps, heading=heading, battery=battery, raw=raw)
     db.session.add(snap)
     # update device quick fields
     if lat is not None and lon is not None:
@@ -362,88 +599,96 @@ def api_heartbeat():
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "db commit failed: " + str(e)}), 500
+        logger.exception("DB commit failed during heartbeat")
+        return jsonify({"error": "db commit failed", "detail": str(e)}), 500
 
-    # emit snapshot to websockets if available
+    # emit realtime
+    snapshot_payload = {
+        "device_id": device_id, "ts": ts.isoformat(), "lat": lat, "lon": lon,
+        "speed_mps": speed_mps, "speed_kmh": mps_to_kmh(speed_mps),
+        "heading": heading, "battery": battery
+    }
     try:
-        payload = {"device_id": device_id, "ts": ts.isoformat(), "lat": lat, "lon": lon, "speed_mps": speed_mps, "speed_kmh": kmh_from_mps(speed_mps)}
-        if SOCKETIO_AVAILABLE:
-            socketio.emit('snapshot', payload, broadcast=True)
+        if socketio:
+            socketio.emit("snapshot", snapshot_payload, broadcast=True)
+        else:
+            logger.debug("socketio unavailable; snapshot event not emitted")
     except Exception:
-        app.logger.exception("socket emit failed for snapshot")
+        logger.exception("socket emit snapshot failed")
 
-    # check overspeed against registered roads
+    # overspeed check against registered roads
     try:
-        roads = Road.query.all()
-        for r in roads:
-            if lat is None or lon is None:
-                continue
-            dist_m = haversine_m(lat, lon, r.center_lat, r.center_lon)
-            if dist_m <= (r.radius_m or 50.0):
-                # if speed known and exceeds limit -> log overspeed
-                if speed_mps is not None and kmh_from_mps(speed_mps) > float(r.speed_limit_kmh):
-                    # dedupe: ensure we don't insert repeated overspeeds for same device+road within DEDUPE_SECONDS
-                    cutoff = now_utc() - timedelta(seconds=DEDUPE_SECONDS)
-                    last = Overspeed.query.filter_by(device_id=device_id, road_id=r.id).order_by(Overspeed.ts.desc()).first()
-                    if not last or (last.ts < cutoff):
-                        ov = Overspeed(device_id=device_id, road_id=r.id, ts=ts, speed_mps=speed_mps, lat=lat, lon=lon)
-                        db.session.add(ov)
-                        db.session.commit()
-                        if SOCKETIO_AVAILABLE:
-                            socketio.emit('overspeed', ov.to_dict(), broadcast=True)
+        if lat is not None and lon is not None and speed_mps is not None:
+            roads = Road.query.all()
+            speed_kmh = mps_to_kmh(speed_mps) or 0.0
+            for r in roads:
+                d = haversine_m(lat, lon, r.center_lat, r.center_lon)
+                if d <= (r.radius_m or 50.0):
+                    if speed_kmh > r.speed_limit_kmh:
+                        # dedupe within OVERSPEED_DEDUPE_SECS for same device+road
+                        cutoff = now_utc() - timedelta(seconds=OVERSPEED_DEDUPE_SECS)
+                        last = Overspeed.query.filter_by(device_id=device_id, road_id=r.id).order_by(Overspeed.ts.desc()).first()
+                        if not last or last.ts < cutoff:
+                            ov = Overspeed(device_id=device_id, road_id=r.id, ts=ts, speed_mps=speed_mps, lat=lat, lon=lon, snapshot_id=snap.id)
+                            db.session.add(ov)
+                            db.session.commit()
+                            logger.info("Overspeed recorded: device=%s road=%s speed_kmh=%.1f", device_id, r.id, speed_kmh)
+                            if socketio:
+                                socketio.emit("overspeed", ov.to_dict(), broadcast=True)
     except Exception:
-        app.logger.exception("overspeed check failed")
+        logger.exception("overspeed detection failed")
+
+    # notify device update if realtime available
+    try:
+        if socketio:
+            socketio.emit("device_update", device.to_dict(include_meta=True), broadcast=True)
+    except Exception:
+        logger.exception("socket emit device_update failed")
 
     return jsonify({"ok": True, "device_id": device_id, "ts": ts.isoformat()})
 
 # -----------------------
-# Serve index.html at /unlimited
+# Optional: serve static UI (if you want later)
 # -----------------------
-@app.route('/unlimited')
-def unlimited_ui():
-    """
-    Serve index.html from the same directory as app.py
-    """
+@app.route("/unlimited")
+def unlimited_placeholder():
+    # No UI included by default. When index.html is added to the project root you can enable serving it here.
     base = os.path.dirname(os.path.abspath(__file__))
     index_path = os.path.join(base, "index.html")
-    if not os.path.exists(index_path):
-        return "<h3>index.html not found. Place index.html next to app.py</h3>", 404
-    return send_from_directory(base, "index.html")
+    if os.path.exists(index_path):
+        return send_from_directory(base, "index.html")
+    return jsonify({"ok": True, "message": "No UI installed. Place index.html next to app.py to serve the dashboard at /unlimited."})
 
-# Root friendly message
-@app.route('/')
+# -----------------------
+# Root & helpful links
+# -----------------------
+@app.route("/")
 def root():
-    return """
-    <h2>Beacon Cloud</h2>
-    <div><a href="/unlimited">Open dashboard</a></div>
-    <div><a href="/admin/devices">/admin/devices (json)</a></div>
-    <div><a href="/admin/roads">/admin/roads (json)</a></div>
-    """
+    return jsonify({
+        "service": "Beacon Cloud Backend",
+        "endpoints": {
+            "health": "/health",
+            "devices": "/admin/devices",
+            "roads": "/admin/roads",
+            "overspeeds": "/admin/overspeeds",
+            "heartbeat": "/api/heartbeat",
+            "search": "/admin/search",
+            "traffic": "/admin/traffic"
+        }
+    })
 
 # -----------------------
-# CLI helpers
+# Main startup
 # -----------------------
-@app.cli.command('initdb')
-def initdb_command():
-    """Initialize the database (flask initdb)."""
+if __name__ == "__main__":
+    # ensure DB exists before startup
     db.create_all()
-    print("Initialized the database.")
-
-# allow simple startup to create DB if missing
-@app.before_first_request
-def ensure_db():
-    db.create_all()
-
-# -----------------------
-# Main
-# -----------------------
-if __name__ == '__main__':
-    # if using socketio and eventlet is installed, using socketio.run makes it realtime-friendly
-    port = int(os.environ.get("PORT", 5000))
-    if SOCKETIO_AVAILABLE:
-        # prefer eventlet/uwsgi in production. Using eventlet for dev/realtime
-        print("Starting with Socket.IO support")
-        socketio.run(app, host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", "5000"))
+    host = os.environ.get("HOST", "0.0.0.0")
+    if socketio:
+        logger.info("Starting with Socket.IO enabled")
+        # prefer eventlet or gevent in production; socketio.run will auto-detect installed server
+        socketio.run(app, host=host, port=port)
     else:
-        print("Starting without Socket.IO (flask only)")
-        app.run(host='0.0.0.0', port=port, debug=True)
+        logger.info("Starting without Socket.IO")
+        app.run(host=host, port=port, debug=DEBUG)
