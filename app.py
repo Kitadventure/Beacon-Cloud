@@ -1362,6 +1362,28 @@ DASHBOARD_HTML = """
 </script>
 
 <script>
+  // helper: show-all toggle (works even if UI button isn't present)
+  let showAllDevices = true;
+  const mcToggleAll = document.getElementById('mc-toggleAll');
+  function updateToggleAllUI() {
+    if (!mcToggleAll) return;
+    mcToggleAll.innerText = showAllDevices ? 'All' : 'Single';
+    mcToggleAll.title = showAllDevices ? 'Showing all devices (click to focus selected)' : 'Showing only selected device (click to show all)';
+  }
+  if (mcToggleAll) {
+    mcToggleAll.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showAllDevices = !showAllDevices;
+      updateToggleAllUI();
+      renderTrafficView();
+      if (!showAllDevices) {
+        if (map && map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+        if (map && map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
+      }
+    });
+  }
+  updateToggleAllUI();
+
   const DateTime = luxon.DateTime;
   const devicesListEl = document.getElementById('devicesList');
   const devicesCountEl = document.getElementById('devicesCount');
@@ -1416,7 +1438,7 @@ DASHBOARD_HTML = """
     if (toggleHeat.checked) {
       heatLayer.addTo(map);
     } else {
-      map.removeLayer(heatLayer);
+      if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
     }
   });
 
@@ -1510,24 +1532,74 @@ DASHBOARD_HTML = """
     roadStatus.innerText = `Drawing finished (${currentRoadPoints.length} points). Save the road with a name and max speed.`;
   }
 
+  // ---------- robust normalization for coords ----------
+  // Returns { lat, lon, swapped, valid } or null if invalid
+  function normalizeCoords(snap) {
+    if (!snap) return null;
+    const rawLat = snap.lat;
+    const rawLon = snap.lon;
+    if (rawLat === null || rawLat === undefined || rawLon === null || rawLon === undefined) return null;
+    const lat0 = Number(rawLat);
+    const lon0 = Number(rawLon);
+    if (Number.isNaN(lat0) || Number.isNaN(lon0)) return null;
+
+    let lat = lat0, lon = lon0, swapped = false;
+
+    // If lat outside [-90,90] but lon looks like a latitude, swap.
+    if ((lat < -90 || lat > 90) && lon >= -90 && lon <= 90) {
+      swapped = true;
+      [lat, lon] = [lon, lat];
+      console.warn('normalizeCoords: swapped because lat out of bounds', {rawLat, rawLon, lat, lon});
+    }
+
+    // If lon outside [-180,180] but lat looks like a longitude, swap.
+    if (!swapped && (lon < -180 || lon > 180) && lat >= -180 && lat <= 180) {
+      swapped = true;
+      [lat, lon] = [lon, lat];
+      console.warn('normalizeCoords: swapped because lon out of bounds', {rawLat, rawLon, lat, lon});
+    }
+
+    // Final validity check
+    if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+      return { lat, lon, swapped, valid: true };
+    }
+    // fallback: invalid coordinates
+    console.warn('normalizeCoords: coords invalid after checks', {rawLat, rawLon, computedLat: lat, computedLon: lon});
+    return null;
+  }
+
   // initial marker / heat population
   function renderTrafficView() {
     // heat points: [lat, lon, intensity]
     const heatPoints = [];
     markersLayer.clearLayers();
+
+    if (!showAllDevices) {
+      // hide heat & markers entirely when focusing single device
+      try { if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer); } catch(e){}
+      try { if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer); } catch(e){}
+      return;
+    }
+
     for (const d of devicesCache) {
       const snap = d.last_snapshot;
-      if (!snap || typeof snap.lat !== 'number' || typeof snap.lon !== 'number') continue;
+      const norm = normalizeCoords(snap);
+      if (!norm || !norm.valid) continue;
+      const lat = norm.lat, lon = norm.lon;
       const spd = (snap.speed_mps || 0) * 3.6;
       const intensity = Math.min(1.0, spd / 120.0);
-      heatPoints.push([snap.lat, snap.lon, intensity]);
+      heatPoints.push([lat, lon, intensity]);
       // speed color
       const color = spd > 80 ? '#ff3333' : (spd > 40 ? '#ffb43d' : '#4ade80');
-      const c = L.circleMarker([snap.lat, snap.lon], { radius: 6, color: color, weight: 1, fillOpacity: 0.9 })
+      const c = L.circleMarker([lat, lon], { radius: 6, color: color, weight: 1, fillOpacity: 0.9 })
         .bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${spd.toFixed(1)} km/h<br/>${snap.ts || ''}`)
         .addTo(markersLayer);
       c.on('click', () => selectDevice(d.id));
     }
+
+    if (!map.hasLayer(markersLayer)) markersLayer.addTo(map);
+
+    // heat layer handling
     heatLayer.setLatLngs(heatPoints);
     if (toggleHeat.checked) {
       if (!map.hasLayer(heatLayer)) heatLayer.addTo(map);
@@ -1545,7 +1617,7 @@ DASHBOARD_HTML = """
       try {
         data = JSON.parse(txt);
       } catch (e) {
-        const m = txt.match(/\\{\\s*"?devices"?:[\\s\\S]*\\}/);
+        const m = txt.match(/\{\s*"?devices"?:[\s\S]*\}/);
         if (m) data = JSON.parse(m[0]);
       }
       devicesCache = data.devices || [];
@@ -1592,6 +1664,7 @@ DASHBOARD_HTML = """
     }
   }
 
+  // ---- selectDevice: uses normalizeCoords and focuses the single device ----
   function selectDevice(id) {
     selectedId = id;
     document.querySelectorAll('#devicesList li').forEach(li => {
@@ -1600,10 +1673,23 @@ DASHBOARD_HTML = """
     const d = devicesCache.find(x => x.id === id);
     if (!d) return;
     showDetail(d);
-    if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
-      placeMarker(d.last_snapshot.lat, d.last_snapshot.lon, d);
+
+    // switch to single-device focus
+    showAllDevices = false;
+    updateToggleAllUI();
+
+    // hide general layers for clarity
+    try { if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer); } catch(e){}
+    try { if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer); } catch(e){}
+
+    const norm = normalizeCoords(d.last_snapshot);
+    if (norm && norm.valid) {
+      placeMarker(norm.lat, norm.lon, d);
     } else {
       clearMarker();
+      // Helpful user notification + console details
+      console.warn('selectDevice: no valid coords for device', id, d.last_snapshot);
+      alert('Selected device has no valid coordinates available. Check device heartbeat or console for details.');
     }
   }
 
@@ -1617,10 +1703,11 @@ DASHBOARD_HTML = """
       document.getElementById('detailTs').innerText = d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : 'seen';
       const spd = ((d.last_snapshot.speed_mps || 0) * 3.6).toFixed(1) + ' km/h';
       document.getElementById('detailSpeed').innerText = spd;
-      document.getElementById('detailLoc').innerText = (typeof d.last_snapshot.lat === 'number' && typeof d.last_snapshot.lon === 'number')
-        ? (d.last_snapshot.lat.toFixed(6) + ', ' + d.last_snapshot.lon.toFixed(6)) : '—';
-      document.getElementById('osmLink').href = (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon)
-        ? `https://www.openstreetmap.org/?mlat=${d.last_snapshot.lat}&mlon=${d.last_snapshot.lon}#map=18/${d.last_snapshot.lat}/${d.last_snapshot.lon}`
+      const norm = normalizeCoords(d.last_snapshot);
+      document.getElementById('detailLoc').innerText = (norm && norm.valid)
+        ? (norm.lat.toFixed(6) + ', ' + norm.lon.toFixed(6)) : '—';
+      document.getElementById('osmLink').href = (norm && norm.valid)
+        ? `https://www.openstreetmap.org/?mlat=${norm.lat}&mlon=${norm.lon}#map=18/${norm.lat}/${norm.lon}`
         : '#';
       document.getElementById('detailRaw').innerText = JSON.stringify(d.last_snapshot.raw || d.last_snapshot, null, 2);
       document.getElementById('btnRevoke').onclick = async () => {
@@ -1643,24 +1730,53 @@ DASHBOARD_HTML = """
 
   let singleMarker = null;
   let singleCircle = null;
+
+  // ---- placeMarker: coerces + robustly draws marker and accuracy circle ----
   function placeMarker(lat, lon, d) {
-    if (!singleMarker) {
-      singleMarker = L.marker([lat, lon]).addTo(map);
-    } else {
-      singleMarker.setLatLng([lat, lon]);
+    try {
+      const latN = Number(lat);
+      const lonN = Number(lon);
+      if (Number.isNaN(latN) || Number.isNaN(lonN)) {
+        console.warn('placeMarker: invalid numeric coords', lat, lon);
+        return;
+      }
+
+      // create or move single marker
+      if (!singleMarker) {
+        singleMarker = L.marker([latN, lonN], { riseOnHover: true }).addTo(map);
+      } else {
+        singleMarker.setLatLng([latN, lonN]);
+      }
+
+      // accuracy circle (if provided)
+      const accuracyRaw = d && d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy;
+      const accuracyRadius = (accuracyRaw !== undefined && accuracyRaw !== null) ? Number(accuracyRaw) : 20;
+      if (!singleCircle) {
+        singleCircle = L.circle([latN, lonN], { radius: (Number.isFinite(accuracyRadius) ? accuracyRadius : 20), interactive:false }).addTo(map);
+      } else {
+        singleCircle.setLatLng([latN, lonN]);
+        if (Number.isFinite(accuracyRadius)) singleCircle.setRadius(accuracyRadius);
+      }
+
+      // set view (don't force zoom down if already zoomed-in)
+      const currentZoom = map.getZoom();
+      const targetZoom = currentZoom >= 15 ? currentZoom : 15;
+      map.setView([latN, lonN], targetZoom, { animate: true });
+
+      // ensure marker on top
+      if (singleMarker && typeof singleMarker.bringToFront === 'function') singleMarker.bringToFront();
+      if (singleCircle && typeof singleCircle.bringToFront === 'function') singleCircle.bringToFront();
+
+      singleMarker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
+    } catch (e) {
+      console.error('placeMarker error', e);
     }
-    if (!singleCircle) {
-      singleCircle = L.circle([lat, lon], { radius: (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
-    } else {
-      singleCircle.setLatLng([lat, lon]);
-    }
-    map.setView([lat, lon], 15, { animate: true });
-    singleMarker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
   }
 
+  // ---- clearMarker: remove focused marker/circle ----
   function clearMarker(){
-    if (singleMarker) { map.removeLayer(singleMarker); singleMarker = null; }
-    if (singleCircle) { map.removeLayer(singleCircle); singleCircle = null; }
+    if (singleMarker) { try { map.removeLayer(singleMarker); } catch(e){} singleMarker = null; }
+    if (singleCircle) { try { map.removeLayer(singleCircle); } catch(e){} singleCircle = null; }
   }
 
   function escapeHtml(s) {
@@ -1694,23 +1810,30 @@ DASHBOARD_HTML = """
     modal.style.display = 'none';
   }
 
-  // search: first try to match device name/id, otherwise try Nominatim place search
+  // ---- handleSearch: unified behavior when matching devices ----
   async function handleSearch() {
     const q = searchInput.value && searchInput.value.trim();
     if (!q) return;
     // local device search
     const match = devicesCache.find(d => (d.car_name && d.car_name.toLowerCase() === q.toLowerCase()) || (d.id && d.id === q));
-    if (match && match.last_snapshot && match.last_snapshot.lat && match.last_snapshot.lon) {
-      map.setView([match.last_snapshot.lat, match.last_snapshot.lon], 15);
-      selectDevice(match.id);
-      return;
+    if (match) {
+      const norm = normalizeCoords(match.last_snapshot);
+      if (norm && norm.valid) {
+        selectDevice(match.id);
+        return;
+      } else {
+        alert('Device matched but it has no valid coordinates. See console for details.');
+        console.warn('handleSearch: matched device has no valid coords', match.id, match.last_snapshot);
+        return;
+      }
     }
-    // attempt Nominatim geocode
+    // Nominatim geocode fallback
     try {
       const res = await fetch('https://nominatim.openstreetmap.org/search?format=json&q=' + encodeURIComponent(q));
       const results = await res.json();
       if (results && results.length > 0) {
         const r = results[0];
+        showAllDevices = true; updateToggleAllUI();
         map.setView([parseFloat(r.lat), parseFloat(r.lon)], 15);
         return;
       } else {
