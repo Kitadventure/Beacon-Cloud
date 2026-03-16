@@ -1178,12 +1178,13 @@ DASHBOARD_HTML = """
     <div id="mapWrap" class="card">
       <div id="map" style="position:relative"></div>
 
-      <!-- map floating controls (REPLACED with draggable + minimize/maximize) -->
+            <!-- map floating controls (REPLACED with draggable + minimize/maximize + show-all toggle) -->
       <div class="map-controls" id="mapControls" aria-label="Map controls">
         <div class="map-controls-header" id="mapControlsHeader" title="Drag me — double-click to minimize">
           <div class="map-controls-title">Beacon controls</div>
           <div class="map-controls-actions">
             <button id="mc-min" title="Minimize">▁</button>
+            <button id="mc-toggleAll" title="Show all devices">All</button>
             <button id="mc-max" title="Maximize">▢</button>
           </div>
         </div>
@@ -1277,7 +1278,7 @@ DASHBOARD_HTML = """
     header.addEventListener('touchstart', onDragStart, {passive:false});
 
     function onDragStart(e){
-      if (e.target && (e.target.id === 'mc-min' || e.target.id === 'mc-max')) return;
+      if (e.target && (e.target.id === 'mc-min' || e.target.id === 'mc-max' || e.target.id === 'mc-toggleAll')) return;
       e.preventDefault();
       dragging = true;
       header.style.cursor = 'grabbing';
@@ -1361,6 +1362,32 @@ DASHBOARD_HTML = """
 </script>
 
 <script>
+  // show-all toggle flag + UI helper
+  let showAllDevices = true;
+  const mcToggleAll = document.getElementById('mc-toggleAll');
+  function updateToggleAllUI() {
+    if (!mcToggleAll) return;
+    mcToggleAll.innerText = showAllDevices ? 'All' : 'Single';
+    mcToggleAll.title = showAllDevices ? 'Showing all devices (click to focus selected)' : 'Showing only selected device (click to show all)';
+  }
+  if (mcToggleAll) {
+    mcToggleAll.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showAllDevices = !showAllDevices;
+      updateToggleAllUI();
+      renderTrafficView();
+      if (showAllDevices) {
+        // keep single marker but re-add markers/heat
+        // renderTrafficView will add markers/heat back
+      } else {
+        // hide general layers when focusing single
+        if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+        if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
+      }
+    });
+  }
+  updateToggleAllUI();
+
   const DateTime = luxon.DateTime;
   const devicesListEl = document.getElementById('devicesList');
   const devicesCountEl = document.getElementById('devicesCount');
@@ -1415,7 +1442,7 @@ DASHBOARD_HTML = """
     if (toggleHeat.checked) {
       heatLayer.addTo(map);
     } else {
-      map.removeLayer(heatLayer);
+      if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
     }
   });
 
@@ -1514,6 +1541,14 @@ DASHBOARD_HTML = """
     // heat points: [lat, lon, intensity]
     const heatPoints = [];
     markersLayer.clearLayers();
+
+    if (!showAllDevices) {
+      // hide heat & markers entirely when focusing single device
+      if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
+      if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+      return;
+    }
+
     for (const d of devicesCache) {
       const snap = d.last_snapshot;
       if (!snap || typeof snap.lat !== 'number' || typeof snap.lon !== 'number') continue;
@@ -1527,6 +1562,10 @@ DASHBOARD_HTML = """
         .addTo(markersLayer);
       c.on('click', () => selectDevice(d.id));
     }
+
+    if (!map.hasLayer(markersLayer)) markersLayer.addTo(map);
+
+    // heat layer handling
     heatLayer.setLatLngs(heatPoints);
     if (toggleHeat.checked) {
       if (!map.hasLayer(heatLayer)) heatLayer.addTo(map);
@@ -1599,6 +1638,15 @@ DASHBOARD_HTML = """
     const d = devicesCache.find(x => x.id === id);
     if (!d) return;
     showDetail(d);
+
+    // focus single device by default when selecting
+    showAllDevices = false;
+    updateToggleAllUI();
+
+    // hide general markers/heat to emphasize selected device
+    if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+    if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
+
     if (d.last_snapshot && d.last_snapshot.lat && d.last_snapshot.lon) {
       placeMarker(d.last_snapshot.lat, d.last_snapshot.lon, d);
     } else {
@@ -1643,23 +1691,34 @@ DASHBOARD_HTML = """
   let singleMarker = null;
   let singleCircle = null;
   function placeMarker(lat, lon, d) {
-    if (!singleMarker) {
-      singleMarker = L.marker([lat, lon]).addTo(map);
-    } else {
-      singleMarker.setLatLng([lat, lon]);
+    try {
+      if (!singleMarker) {
+        singleMarker = L.marker([lat, lon]).addTo(map);
+      } else {
+        singleMarker.setLatLng([lat, lon]);
+      }
+      if (!singleCircle) {
+        const accuracyRadius = (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20;
+        singleCircle = L.circle([lat, lon], { radius: accuracyRadius }).addTo(map);
+      } else {
+        singleCircle.setLatLng([lat, lon]);
+      }
+      // center the map on the device
+      map.setView([lat, lon], 15, { animate: true });
+
+      // ensure single marker and circle are above other layers
+      if (singleMarker && typeof singleMarker.bringToFront === 'function') singleMarker.bringToFront();
+      if (singleCircle && typeof singleCircle.bringToFront === 'function') singleCircle.bringToFront();
+
+      singleMarker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
+    } catch (e) {
+      console.error('placeMarker error', e);
     }
-    if (!singleCircle) {
-      singleCircle = L.circle([lat, lon], { radius: (d.last_snapshot && d.last_snapshot.raw && d.last_snapshot.raw.accuracy) ? d.last_snapshot.raw.accuracy : 20 }).addTo(map);
-    } else {
-      singleCircle.setLatLng([lat, lon]);
-    }
-    map.setView([lat, lon], 15, { animate: true });
-    singleMarker.bindPopup(`<strong>${escapeHtml(d.car_name || d.id)}</strong><br/>${d.last_snapshot && d.last_snapshot.ts ? new Date(d.last_snapshot.ts).toLocaleString() : ''}`).openPopup();
   }
 
   function clearMarker(){
-    if (singleMarker) { map.removeLayer(singleMarker); singleMarker = null; }
-    if (singleCircle) { map.removeLayer(singleCircle); singleCircle = null; }
+    if (singleMarker) { try { map.removeLayer(singleMarker); } catch(e){} singleMarker = null; }
+    if (singleCircle) { try { map.removeLayer(singleCircle); } catch(e){} singleCircle = null; }
   }
 
   function escapeHtml(s) {
@@ -1700,7 +1759,7 @@ DASHBOARD_HTML = """
     // local device search
     const match = devicesCache.find(d => (d.car_name && d.car_name.toLowerCase() === q.toLowerCase()) || (d.id && d.id === q));
     if (match && match.last_snapshot && match.last_snapshot.lat && match.last_snapshot.lon) {
-      map.setView([match.last_snapshot.lat, match.last_snapshot.lon], 15);
+      // selecting device will focus it (selectDevice hides general markers)
       selectDevice(match.id);
       return;
     }
@@ -1710,6 +1769,9 @@ DASHBOARD_HTML = """
       const results = await res.json();
       if (results && results.length > 0) {
         const r = results[0];
+        // when searching a place (not a device) keep showAllDevices = true
+        showAllDevices = true;
+        updateToggleAllUI();
         map.setView([parseFloat(r.lat), parseFloat(r.lon)], 15);
         return;
       } else {
