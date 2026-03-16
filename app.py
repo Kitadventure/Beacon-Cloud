@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import threading
@@ -1023,41 +1024,6 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
 
     return payload
 
-# -------------------------
-# Admin/UI templates and routes
-# -------------------------
-ADMIN_LOGIN_HTML = """
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Admin login</title></head>
-<body style="font-family: sans-serif; margin: 20px;">
-  <h2>Beacon Admin Login</h2>
-  {% with messages = get_flashed_messages() %}
-    {% if messages %}
-      <div style="color: red;">{{ messages[0] }}</div>
-    {% endif %}
-  {% endwith %}
-  <form method="post" action="{{ url_for('admin_login') }}">
-    <label>Username: <input name="username" required></label><br/><br/>
-    <label>Password: <input name="password" type="password" required></label><br/><br/>
-    <button type="submit">Login</button>
-  </form>
-  <p style="margin-top: 1em;">
-    If no admin exists, set environment variables <code>ADMIN_USER</code> and <code>ADMIN_PASS</code>
-    before first run to create one automatically.
-  </p>
-</body>
-</html>
-"""
-
-# -------------------------
-# Friendly Dashboard HTML (unchanged)
-# -------------------------
-# (kept exactly as in your original paste to preserve UI)
-DASHBOARD_HTML = """..."""  # (omitted here for brevity in source listing; kept below in the actual file)
-
-# To keep code readable here, we insert the original long DASHBOARD_HTML content back:
-# (In your actual file, the full HTML string should be placed here unchanged from your previous paste.)
 DASHBOARD_HTML = """
 <!doctype html>
 <html>
@@ -1091,14 +1057,51 @@ DASHBOARD_HTML = """
     footer { font-size:12px; color:var(--muted); padding:8px 16px; text-align:right; }
     #statusBar { font-size:13px; color:#08306B; margin-top:8px; }
 
-    /* small control panel on map */
+    /* map control panel styles (enhanced for dragging + minimize/maximize) */
     .map-controls {
       position: absolute;
       left: 12px;
       top: 70px;
       z-index: 1100;
       width: 320px;
+      touch-action: none;
+      user-select: none;
     }
+    .map-controls-header {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:8px;
+      padding:8px;
+      background: linear-gradient(90deg,#ffffff, #fbfdff);
+      border-radius:10px;
+      box-shadow:0 6px 20px rgba(2,6,23,0.06);
+      cursor:grab;
+      margin-bottom:8px;
+    }
+    .map-controls-header:active { cursor:grabbing; }
+    .map-controls-title { font-weight:700; font-size:13px; color:var(--accent); }
+    .map-controls-actions { display:flex; gap:6px; align-items:center; }
+    .map-controls-actions button {
+      border: none;
+      background: #f1f5f9;
+      padding:6px 8px;
+      border-radius:6px;
+      cursor: pointer;
+      font-size:12px;
+    }
+    .map-controls.minimized { width:140px; }
+    .map-controls.minimized .map-panel { display:none; }
+    .map-controls.minimized .map-controls-header { border-radius:10px; }
+    .map-controls.maximized {
+      left: 12px !important;
+      right: 12px;
+      top: 70px !important;
+      width: auto !important;
+      max-width: calc(100% - 24px);
+    }
+    .map-controls.maximized .map-panel { margin-bottom:10px; }
+
     .map-panel { background:white; border-radius:10px; padding:8px; box-shadow:0 8px 32px rgba(2,6,23,0.2); margin-bottom:8px; }
     .control-row { display:flex; gap:8px; align-items:center; }
     .control-row input[type="text"], .control-row input[type="number"] { flex:1; padding:6px 8px; border-radius:6px; border:1px solid #e6eef8; }
@@ -1106,6 +1109,12 @@ DASHBOARD_HTML = """
     .legend { display:flex; gap:8px; align-items:center; margin-top:6px; font-size:12px; color:#374151; }
     .legend .dot { width:12px; height:12px; border-radius:6px; display:inline-block; margin-right:6px; }
 
+    /* small responsive tweak */
+    @media (max-width:900px) {
+      .left { width: 280px; }
+      .map-controls { left: 8px; top: 80px; width: 280px; }
+      .map-controls.minimized { width:120px; }
+    }
   </style>
 </head>
 <body>
@@ -1169,8 +1178,16 @@ DASHBOARD_HTML = """
     <div id="mapWrap" class="card">
       <div id="map" style="position:relative"></div>
 
-      <!-- map floating controls -->
-      <div class="map-controls" id="mapControls">
+      <!-- map floating controls (REPLACED with draggable + minimize/maximize) -->
+      <div class="map-controls" id="mapControls" aria-label="Map controls">
+        <div class="map-controls-header" id="mapControlsHeader" title="Drag me — double-click to minimize">
+          <div class="map-controls-title">Beacon controls</div>
+          <div class="map-controls-actions">
+            <button id="mc-min" title="Minimize">▁</button>
+            <button id="mc-max" title="Maximize">▢</button>
+          </div>
+        </div>
+
         <div class="map-panel">
           <div style="font-weight:600; margin-bottom:6px;">Search</div>
           <div class="control-row">
@@ -1212,6 +1229,7 @@ DASHBOARD_HTML = """
           <div class="muted-small" id="roadStatus"></div>
         </div>
       </div>
+      <!-- end map floating controls -->
 
     </div>
   </div>
@@ -1236,6 +1254,112 @@ DASHBOARD_HTML = """
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
+<script>
+  /* Draggable / minimize / maximize behavior for map-controls.
+     Self-contained and resilient: doesn't assume map exists yet.
+  */
+  (function(){
+    const mapControls = document.getElementById('mapControls');
+    if (!mapControls) return;
+    const header = document.getElementById('mapControlsHeader');
+    const btnMin = document.getElementById('mc-min');
+    const btnMax = document.getElementById('mc-max');
+    let dragging = false;
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+    function px(v){ return (typeof v === 'number') ? v + 'px' : v; }
+    function getStyleNum(el, prop){
+      const v = window.getComputedStyle(el)[prop];
+      return v ? parseFloat(v.replace('px','')) : 0;
+    }
+
+    header.addEventListener('mousedown', onDragStart);
+    header.addEventListener('touchstart', onDragStart, {passive:false});
+
+    function onDragStart(e){
+      if (e.target && (e.target.id === 'mc-min' || e.target.id === 'mc-max')) return;
+      e.preventDefault();
+      dragging = true;
+      header.style.cursor = 'grabbing';
+      startX = e.touches ? e.touches[0].clientX : e.clientX;
+      startY = e.touches ? e.touches[0].clientY : e.clientY;
+      startLeft = getStyleNum(mapControls, 'left');
+      startTop = getStyleNum(mapControls, 'top');
+      document.addEventListener('mousemove', onDragging);
+      document.addEventListener('mouseup', onDragEnd);
+      document.addEventListener('touchmove', onDragging, {passive:false});
+      document.addEventListener('touchend', onDragEnd);
+    }
+    function onDragging(e){
+      if (!dragging) return;
+      e.preventDefault();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      const dx = clientX - startX;
+      const dy = clientY - startY;
+      mapControls.style.left = px(startLeft + dx);
+      mapControls.style.top  = px(startTop + dy);
+      if (mapControls.classList.contains('maximized')) mapControls.classList.remove('maximized');
+    }
+    function onDragEnd(){
+      dragging = false;
+      header.style.cursor = 'grab';
+      document.removeEventListener('mousemove', onDragging);
+      document.removeEventListener('mouseup', onDragEnd);
+      document.removeEventListener('touchmove', onDragging);
+      document.removeEventListener('touchend', onDragEnd);
+      // keep panel inside viewport after drag
+      const rect = mapControls.getBoundingClientRect();
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let left = rect.left, top = rect.top;
+      if (rect.right > vw) left = Math.max(8, vw - rect.width - 8);
+      if (rect.left < 8) left = 8;
+      if (rect.bottom > vh) top = Math.max(8, vh - rect.height - 8);
+      if (rect.top < 8) top = 8;
+      mapControls.style.left = px(left);
+      mapControls.style.top = px(top);
+      setTimeout(()=>{ if (window.map && typeof window.map.invalidateSize === 'function') window.map.invalidateSize(); }, 200);
+    }
+
+    header.addEventListener('dblclick', () => toggleMinimize());
+    btnMin.addEventListener('click', (ev) => { ev.stopPropagation(); toggleMinimize(); });
+    btnMax.addEventListener('click', (ev) => { ev.stopPropagation(); toggleMaximize(); });
+
+    function toggleMinimize(){
+      mapControls.classList.toggle('minimized');
+      if (mapControls.classList.contains('maximized')) mapControls.classList.remove('maximized');
+      setTimeout(()=>{ if (window.map && typeof window.map.invalidateSize === 'function') window.map.invalidateSize(); }, 300);
+    }
+    function toggleMaximize(){
+      const isMax = mapControls.classList.toggle('maximized');
+      if (isMax) {
+        mapControls.style.left = '12px';
+        mapControls.style.top  = '70px';
+        mapControls.style.width = 'auto';
+        mapControls.classList.remove('minimized');
+      } else {
+        mapControls.style.width = '320px';
+      }
+      setTimeout(()=>{ if (window.map && typeof window.map.invalidateSize === 'function') window.map.invalidateSize(); }, 300);
+    }
+
+    // Prevent clicks inside panel from propagating to the map (so draw mode isn't accidentally triggered)
+    mapControls.addEventListener('mousedown', (e)=> e.stopPropagation());
+    mapControls.addEventListener('touchstart', (e)=> e.stopPropagation());
+
+    // reposition if window resized (keeps panel visible)
+    window.addEventListener('resize', () => {
+      const rect = mapControls.getBoundingClientRect();
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let changed = false;
+      if (rect.right > vw) { mapControls.style.left = px(Math.max(8, vw - rect.width - 8)); changed = true; }
+      if (rect.bottom > vh) { mapControls.style.top = px(Math.max(8, vh - rect.height - 8)); changed = true; }
+      if (changed) setTimeout(()=>{ if (window.map && window.map.invalidateSize) window.map.invalidateSize(); }, 200);
+    });
+
+  })();
+</script>
+
 <script>
   const DateTime = luxon.DateTime;
   const devicesListEl = document.getElementById('devicesList');
@@ -1606,7 +1730,6 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
-
 
 # Admin web pages / endpoints
 @app.route('/admin/login', methods=['GET', 'POST'])
