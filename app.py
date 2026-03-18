@@ -2405,9 +2405,6 @@ POLICE_DASH_HTML = """
 
 @app.route('/police')
 def police_dashboard():
-    key = request.args.get("key")
-    if key != "KenyaPolice":
-        return abort(401)
     return render_template_string(POLICE_DASH_HTML)
 # -------------------------
 # End of police/watch block
