@@ -1,3 +1,4 @@
+
 # app.py
 # Full file: keeps your original app logic intact, and adds:
 #  - Road model (name, speed limit, center lat/lon, radius)
@@ -2173,6 +2174,245 @@ def report_road_pdf(road_id):
         return send_file(io.BytesIO(data), download_name=f"road_{name_safe}_report.pdf", as_attachment=True, mimetype="application/pdf")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# -------------------------
+# Police / Watch features (drop-in)
+# -------------------------
+# Plate sightings model (camera / manual plate ingestion)
+class PlateSighting(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    plate = db.Column(db.String(64), nullable=False, index=True)
+    lat = db.Column(db.Float, nullable=True)
+    lon = db.Column(db.Float, nullable=True)
+    ts = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    source = db.Column(db.String(64), default="camera")  # e.g., camera, manual
+    raw = db.Column(db.Text, nullable=True)
+
+# Admin: watchlist management (plates)
+@app.route('/admin/watchlist', methods=['GET', 'POST'])
+def admin_watchlist():
+    require_admin_api()
+    if request.method == 'GET':
+        q = Watchlist.query.order_by(Watchlist.created_at.desc()).all()
+        out = [{"id": w.id, "plate": w.plate, "label": w.label, "created_at": w.created_at.isoformat()} for w in q]
+        return jsonify({"watchlist": out})
+    body = request.get_json(force=True, silent=True) or {}
+    plate = (body.get("plate") or "").strip()
+    label = body.get("label")
+    if not plate:
+        return jsonify({"error": "plate required"}), 400
+    try:
+        w = Watchlist(plate=plate.upper(), label=label)
+        db.session.add(w)
+        db.session.commit()
+        return jsonify({"ok": True, "watch": {"id": w.id, "plate": w.plate, "label": w.label}})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/watchlist/<watch_id>', methods=['DELETE'])
+def admin_watchlist_delete(watch_id):
+    require_admin_api()
+    w = Watchlist.query.get_or_404(watch_id)
+    try:
+        db.session.delete(w)
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+# Police/watch API: query recent overspeed events (with device owner/vehicle meta)
+@app.route('/watch/overspeeds', methods=['GET'])
+def watch_overspeeds():
+    require_admin_api()
+    since = request.args.get("since")  # ISO timestamp (optional)
+    road_id = request.args.get("road_id")
+    plate = request.args.get("plate")
+    limit = int(request.args.get("limit", 200))
+
+    q = OverspeedEvent.query
+    if since:
+        try:
+            dt = datetime.fromisoformat(since)
+            q = q.filter(OverspeedEvent.ts >= dt)
+        except Exception:
+            pass
+    if road_id:
+        q = q.filter(OverspeedEvent.road_id == road_id)
+    if plate:
+        # find any device ids with that plate (case-insensitive)
+        devs = Device.query.filter(db.func.upper(Device.plate) == plate.strip().upper()).all()
+        dev_ids = [d.id for d in devs] if devs else []
+        if dev_ids:
+            q = q.filter(OverspeedEvent.device_id.in_(dev_ids))
+        else:
+            return jsonify({"overspeeds": []})
+
+    q = q.order_by(OverspeedEvent.ts.desc()).limit(limit).all()
+    out = []
+    for e in q:
+        dev_meta = {}
+        try:
+            d = Device.query.get(e.device_id)
+            if d:
+                dev_meta = {"owner": d.owner, "car_name": d.car_name, "car_model": d.car_model, "plate": d.plate}
+        except Exception:
+            dev_meta = {}
+        out.append({
+            "id": e.id,
+            "device_id": e.device_id,
+            "road_id": e.road_id,
+            "ts": e.ts.isoformat() if e.ts else None,
+            "speed_kmh": float(e.speed_kmh) if e.speed_kmh is not None else None,
+            "lat": e.lat,
+            "lon": e.lon,
+            "device": dev_meta,
+            "raw": (json.loads(e.raw) if e.raw and isinstance(e.raw, str) else e.raw)
+        })
+    return jsonify({"overspeeds": out})
+
+# Plate ingestion endpoint (cameras, manual entries)
+# Example body: { "plate": "KAA123A", "lat": -1.29, "lon": 36.82, "source": "camera-lpr-1", "raw": {...} }
+@app.route('/ingest/plate', methods=['POST'])
+def ingest_plate():
+    # allow camera systems (no device token). Protect by admin token if desired:
+    # require_admin_api()  <-- comment/uncomment depending on desired security
+    body = request.get_json(force=True, silent=True) or {}
+    plate = (body.get("plate") or "").strip().upper()
+    if not plate:
+        return jsonify({"error": "plate required"}), 400
+    lat = body.get("lat")
+    lon = body.get("lon")
+    src = body.get("source") or "camera"
+    raw = body.get("raw")
+    s = PlateSighting(plate=plate, lat=(float(lat) if lat is not None else None),
+                      lon=(float(lon) if lon is not None else None),
+                      source=src, raw=(json.dumps(raw) if raw is not None else None))
+    try:
+        db.session.add(s)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({"error": "db_error"}), 500
+
+    # check watchlist
+    try:
+        entry = Watchlist.query.filter(db.func.upper(Watchlist.plate) == plate).first()
+        if entry:
+            a = {
+                "type": "watch_hit",
+                "watch_id": entry.id,
+                "watch_plate": entry.plate,
+                "watch_label": entry.label,
+                "plate": plate,
+                "lat": s.lat,
+                "lon": s.lon,
+                "ts": s.ts.isoformat(),
+                "source": s.source,
+                "sighting_id": s.id
+            }
+            try:
+                push_alert(a)
+            except Exception:
+                pass
+            # emit to police room (real-time)
+            try:
+                socketio.emit('watch_hit', a, room='police')
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # emit the plate sighting to police UIs as well
+    try:
+        socketio.emit('plate_sighting', {"id": s.id, "plate": plate, "lat": s.lat, "lon": s.lon, "ts": s.ts.isoformat(), "source": s.source}, room='police')
+    except Exception:
+        pass
+
+    return jsonify({"ok": True, "sighting_id": s.id})
+
+# -------------------------
+# WebSocket helpers for police clients
+# -------------------------
+@socketio.on('police_auth')
+def police_auth(data):
+    """Police UI should send: { 'token': 'ADMIN_TOKEN' } to join police room."""
+    try:
+        token = None
+        if isinstance(data, dict):
+            token = data.get('token') or ''
+        # also allow session-based admin if they have cookie-based session
+        if session.get('admin_logged'):
+            join_room('police')
+            emit('police_auth_ok', {"ok": True})
+            return
+        # check bearer/admin token
+        if token and ADMIN_API_TOKEN and token == ADMIN_API_TOKEN:
+            join_room('police')
+            emit('police_auth_ok', {"ok": True})
+            return
+    except Exception:
+        pass
+    emit('police_auth_failed', {"ok": False})
+
+@socketio.on('police_leave')
+def police_leave(_data):
+    try:
+        leave_room('police')
+    except Exception:
+        pass
+
+# -------------------------
+# Minimal police dashboard (protected)
+# -------------------------
+POLICE_DASH_HTML = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Police Dashboard</title>
+<style>body{font-family: Arial, Helvetica, sans-serif; margin:0; padding:0;} #list{padding:12px;}</style>
+</head>
+<body>
+  <h2 style="margin:12px 12px;">Police — Watch / Live Hits</h2>
+  <div style="margin:12px;"><button id="btnAuth">Connect (admin token)</button></div>
+  <div id="list"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const s = io();
+  const list = document.getElementById('list');
+  document.getElementById('btnAuth').onclick = async () => {
+    const token = prompt('Admin API token (or blank to use cookie session):');
+    s.emit('police_auth', { token: token });
+  };
+  s.on('police_auth_ok', () => { list.innerHTML = '<div style="color:green;padding:8px;">Connected — listening for watch hits</div>'; });
+  s.on('police_auth_failed', () => { alert('Auth failed'); });
+  s.on('watch_hit', (d) => {
+    const el = document.createElement('div');
+    el.style.border = '1px solid #ccc'; el.style.padding='8px'; el.style.margin='8px';
+    el.innerHTML = '<b>WATCH HIT</b> plate: '+(d.watch_plate||d.plate)+' <br/> label: '+(d.watch_label||'')+' <br/> at: '+(d.ts||'')+' <br/> loc: '+(d.lat||'')+','+(d.lon||'');
+    list.prepend(el);
+  });
+  s.on('plate_sighting', (d) => {
+    const el = document.createElement('div');
+    el.style.border = '1px dashed #999'; el.style.padding='6px'; el.style.margin='8px';
+    el.innerHTML = '<b>Plate sighting</b> '+d.plate+' @ '+(d.ts||'');
+    list.prepend(el);
+  });
+</script>
+</body>
+</html>
+"""
+
+@app.route('/police')
+def police_dashboard():
+    try:
+        require_admin_api()
+    except Exception:
+        return abort(401, "Admin access required")
+    return render_template_string(POLICE_DASH_HTML)
+# -------------------------
+# End of police/watch block
+# -------------------------
 
 # -------------------------
 # Admin endpoints for alerts & jams (requires admin session or ADMIN_API_TOKEN)
