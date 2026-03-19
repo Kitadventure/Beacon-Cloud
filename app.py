@@ -27,7 +27,7 @@ from flask import (
     redirect, url_for, session, flash, send_file, Response
 )
 from flask_sqlalchemy import SQLAlchemy
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # New imports for reports & excel
@@ -148,6 +148,26 @@ class OverspeedEvent(db.Model):
     lat = db.Column(db.Float)
     lon = db.Column(db.Float)
     raw = db.Column(db.Text)
+
+
+# -------------------------
+# Additional auth / traffic models
+# -------------------------
+class PoliceUser(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(128), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class TrafficZone(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    name = db.Column(db.String(256), nullable=False, index=True)
+    scope = db.Column(db.String(64), nullable=False, default="custom")
+    center_lat = db.Column(db.Float, nullable=True)
+    center_lon = db.Column(db.Float, nullable=True)
+    radius_m = db.Column(db.Float, nullable=True)
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # -------------------------
 # Simple in-memory rate tracking (per-device)
@@ -546,6 +566,156 @@ def cleanup_old_snapshots():
     Snapshot.query.filter(Snapshot.ts < cutoff).delete()
     db.session.commit()
 
+
+@app.route('/')
+def index():
+    role = _current_role()
+    if role == 'admin':
+        return redirect(url_for('dashboard'))
+    if role == 'police':
+        return redirect(url_for('police_dashboard'))
+    return redirect(url_for('admin_login'))
+
+
+# -------------------------
+# Web auth helpers
+# -------------------------
+def _bootstrap_open():
+    return Admin.query.count() == 0
+
+def _current_role():
+    return session.get('auth_role') or ('admin' if session.get('admin_logged') else None)
+
+def _set_auth_session(username, role):
+    session.clear()
+    session['user_id'] = username
+    session['username'] = username
+    session['auth_role'] = role
+    session['admin_logged'] = (role == 'admin')
+    session['admin_user'] = username if role == 'admin' else None
+    session['police_logged'] = (role == 'police')
+
+def _pick_login_user(username):
+    admin = Admin.query.filter_by(username=username).first()
+    if admin:
+        return admin, 'admin'
+    police = PoliceUser.query.filter_by(username=username).first()
+    if police:
+        return police, 'police'
+    return None, None
+
+def _create_account(username, password, role='admin'):
+    username = (username or '').strip()
+    password = password or ''
+    if not username or not password:
+        return None, "Username and password are required"
+    if Admin.query.filter_by(username=username).first() or PoliceUser.query.filter_by(username=username).first():
+        return None, "Username already exists"
+    pw_hash = generate_password_hash(password)
+    if role == 'police':
+        obj = PoliceUser(username=username, password_hash=pw_hash)
+    else:
+        obj = Admin(username=username, password_hash=pw_hash)
+    db.session.add(obj)
+    db.session.commit()
+    return obj, None
+
+def _vehicle_type_label(device):
+    raw = " ".join([str(device.car_name or ""), str(device.car_model or ""), str(device.extra or "")]).lower()
+    if any(k in raw for k in ('truck', 'lorry', 'hgv')):
+        return 'truck'
+    if any(k in raw for k in ('bus', 'coach', 'matatu')):
+        return 'bus'
+    if any(k in raw for k in ('motor', 'bike', 'boda')):
+        return 'motorcycle'
+    if any(k in raw for k in ('van', 'minibus')):
+        return 'van'
+    if any(k in raw for k in ('pickup', 'p-up')):
+        return 'pickup'
+    if any(k in raw for k in ('taxi', 'cab')):
+        return 'taxi'
+    return 'car'
+
+def _zone_matches(zone, lat, lon):
+    if not zone:
+        return True
+    if zone.scope == 'national':
+        return True
+    if zone.center_lat is None or zone.center_lon is None or zone.radius_m is None:
+        return False
+    return haversine_m(lat, lon, zone.center_lat, zone.center_lon) <= float(zone.radius_m)
+
+def _traffic_snapshot(zone=None):
+    cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
+    snaps = Snapshot.query.filter(Snapshot.ts >= cutoff).order_by(Snapshot.ts.desc()).all()
+    latest = {}
+    for s in snaps:
+        if s.device_id not in latest:
+            latest[s.device_id] = s
+
+    vehicles = []
+    counts = defaultdict(int)
+    for dev_id, snap in latest.items():
+        if zone and not _zone_matches(zone, snap.lat, snap.lon):
+            continue
+        d = Device.query.get(dev_id)
+        if not d:
+            continue
+        vehicle_type = _vehicle_type_label(d)
+        counts[vehicle_type] += 1
+        vehicles.append({
+            "device_id": d.id,
+            "owner": d.owner,
+            "car_name": d.car_name,
+            "car_model": d.car_model,
+            "plate": d.plate,
+            "vehicle_type": vehicle_type,
+            "last_snapshot": {
+                "ts": snap.ts.isoformat() if snap.ts else None,
+                "lat": snap.lat,
+                "lon": snap.lon,
+                "speed_mps": round(snap.speed_mps or 0.0, 3),
+                "bearing_deg": round(snap.bearing_deg or 0.0, 1),
+            }
+        })
+    vehicles.sort(key=lambda x: x.get("last_snapshot", {}).get("ts") or "", reverse=True)
+    return vehicles, counts
+
+def _safe_login_redirect(role, next_path=None):
+    if next_path and isinstance(next_path, str) and next_path.startswith('/'):
+        if role == 'admin' and (next_path.startswith('/dashboard') or next_path.startswith('/friendly') or next_path.startswith('/admin/') or next_path.startswith('/report/') or next_path.startswith('/traffic')):
+            return redirect(next_path)
+        if role in {'admin', 'police'} and (next_path.startswith('/police') or next_path.startswith('/all-vehicles')):
+            return redirect(next_path)
+    return redirect(url_for('dashboard' if role == 'admin' else 'police_dashboard'))
+
+@app.before_request
+def _guard_web_pages():
+    path = request.path or '/'
+
+    public_paths = {
+        '/', '/health', '/login', '/register',
+        '/admin/login', '/admin/register',
+        '/logout', '/admin/logout',
+    }
+    public_prefixes = ('/static/', '/socket.io/', '/onboard', '/reconnect', '/heartbeat', '/nearby', '/ingest/')
+    if path in public_paths or path.startswith(public_prefixes):
+        return None
+
+    if _bootstrap_open():
+        if path.startswith(('/dashboard', '/friendly', '/police', '/admin', '/report', '/watch', '/all-vehicles', '/traffic')):
+            return redirect(url_for('admin_register'))
+        return None
+
+    role = _current_role()
+    if path.startswith(('/dashboard', '/friendly', '/admin', '/report', '/watch', '/traffic')):
+        if role != 'admin':
+            return redirect(url_for('admin_login', next=path))
+    elif path.startswith(('/police', '/all-vehicles')):
+        if role not in {'admin', 'police'}:
+            return redirect(url_for('admin_login', next=path))
+    return None
+
 # -------------------------
 # Authentication helpers
 # -------------------------
@@ -638,7 +808,7 @@ def require_admin_api():
     API-level admin check: allow if logged in via session OR provide ADMIN_API_TOKEN in Bearer header.
     Use this for JSON admin endpoints. UI routes rely on session.
     """
-    if session.get('admin_logged'):
+    if session.get('admin_logged') or session.get('auth_role') == 'admin':
         return True
     auth = request.headers.get("Authorization", "")
     if auth and auth.lower().startswith("bearer "):
@@ -1117,92 +1287,48 @@ def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
 ADMIN_LOGIN_HTML = """
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <title>Beacon Admin</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root { --bg:#f6f8fb; --card:#fff; --text:#0f172a; --muted:#64748b; --accent:#0b84ff; --line:#e2e8f0; }
-    body { margin:0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 40px; }
-    .hero { background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding: 24px; border-radius: 18px; box-shadow: 0 12px 34px rgba(2,6,23,.15); }
-    .hero h1 { margin:0 0 6px; font-size: 28px; }
-    .hero p { margin: 6px 0 0; opacity:.95; line-height: 1.5; }
-    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 18px; }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px; box-shadow: 0 10px 24px rgba(2,6,23,.05); }
-    .card h2 { margin:0 0 12px; font-size: 18px; }
-    label { display:block; font-weight:600; margin: 12px 0 6px; }
-    input { width:100%; box-sizing:border-box; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); font-size: 15px; }
-    button, .btnlink { display:inline-block; padding: 12px 16px; border:0; border-radius: 12px; background: var(--accent); color:white; cursor:pointer; text-decoration:none; font-weight:700; margin-top: 14px; }
-    .muted { color:var(--muted); font-size: 14px; line-height: 1.55; }
-    .notice { margin-top: 14px; padding: 12px 14px; border-radius: 12px; background:#eff6ff; border:1px solid #dbeafe; color:#1e3a8a; }
-    .full { grid-column: 1 / -1; }
-    .topline { display:flex; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
-    .pill { display:inline-flex; align-items:center; gap:8px; padding: 9px 12px; border-radius: 999px; background: rgba(255,255,255,.15); color:white; text-decoration:none; font-weight:700; }
-    ul { padding-left: 18px; margin: 8px 0 0; }
-    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
-  </style>
+<head><meta charset="utf-8"><title>Beacon Login</title><meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+.card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05);}
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
+button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+.muted{color:#64748b;font-size:14px;line-height:1.5;}
+.flash{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px;border-radius:10px;margin-top:12px;}
+.top{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="hero">
-      <h1>Beacon Admin</h1>
-      <p>First-time setup creates the first administrator. After that, only login is shown here, and existing admins can add more admins from the admin management page.</p>
-      <div class="topline">
-        <a class="pill" href="{{ url_for('dashboard') }}">Open dashboard</a>
-        <a class="pill" href="{{ url_for('all_vehicles') }}">All vehicles</a>
-        {% if allow_register %}
-          <a class="pill" href="{{ url_for('admin_register') }}">Register first admin</a>
-        {% endif %}
-      </div>
-    </div>
-
+  <div class="card">
+    <h2>Beacon Login</h2>
     {% with messages = get_flashed_messages() %}
       {% if messages %}
-        <div class="notice">{{ messages[0] }}</div>
+        <div class="flash">{{ messages[0] }}</div>
       {% endif %}
     {% endwith %}
-
-    <div class="grid">
-      <div class="card">
-        <h2>Login</h2>
-        <form method="post" action="{{ url_for('admin_login') }}">
-          <label>Username</label>
-          <input name="username" autocomplete="username" required>
-          <label>Password</label>
-          <input name="password" type="password" autocomplete="current-password" required>
-          <button type="submit">Login</button>
-        </form>
-        <p class="muted">Use this after the first admin has been created.</p>
-      </div>
-
-      <div class="card">
-        <h2>Registration</h2>
-        {% if allow_register %}
-          <p class="muted">Create the first admin account now. Once this exists, the registration path is closed for normal users.</p>
-          <a class="btnlink" href="{{ url_for('admin_register') }}">Create first admin</a>
-        {% else %}
-          <p class="muted">Registration is closed. Existing admins can add new admin accounts from the admin management page.</p>
-        {% endif %}
-        <div class="notice" style="margin-top:16px;">
-          If you already have access, go straight to login. If this is a fresh install, create the first admin first.
-        </div>
-      </div>
-
-      <div class="card full">
-        <h2>What changes here</h2>
-        <ul class="muted">
-          <li>The first user becomes the first admin.</li>
-          <li>Once an admin exists, public registration is no longer shown.</li>
-          <li>More admins can be added only by an existing admin.</li>
-          <li>Vehicle lookup is available from the new All Vehicles page.</li>
-        </ul>
-      </div>
+    <form method="post" action="{{ url_for('admin_login') }}">
+      <label>Username</label>
+      <input name="username" required>
+      <label>Password</label>
+      <input name="password" type="password" required>
+      <button type="submit">Login</button>
+    </form>
+    <div class="top">
+      {% if allow_register %}
+        <a href="{{ url_for('admin_register') }}">Register first admin</a>
+      {% endif %}
+      <span class="muted">Admins open the dashboard. Police users open the police dashboard.</span>
     </div>
+    {% if allow_register %}
+      <p class="muted">This is the very first setup. Once the first admin exists, registration disappears.</p>
+    {% else %}
+      <p class="muted">Registration is closed. An existing admin can add more admins or police users.</p>
+    {% endif %}
   </div>
 </body>
 </html>
 """
+
 # -------------------------
 # Friendly Dashboard HTML (modified to include floating widget for Road & Reports)
 # -------------------------
@@ -1284,7 +1410,12 @@ DASHBOARD_HTML = """
 <body>
   <header>
     <h1>Beacon — Live Dashboard</h1>
-    <div style="margin-left:auto; display:flex; align-items:center; gap:14px; font-size:13px; opacity:0.95;"><a href="/all-vehicles" style="color:white; font-weight:700; text-decoration:none;">All Vehicles</a><span>Auto-refresh every 5s — open this page on desktop or phone</span></div>
+    <div style="margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <a href="{{ url_for('all_vehicles') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">All Vehicles</a>
+      <a href="{{ url_for('admin_admins') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Users</a>
+      <a href="{{ url_for('admin_traffic') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Traffic</a>
+      <span style="font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</span>
+    </div>
   </header>
 
   <div class="wrap">
@@ -1757,9 +1888,11 @@ DASHBOARD_HTML = """
 """
 
 # Admin web pages / endpoints
+
+@app.route('/login', methods=['GET', 'POST'])
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
-    allow_register = (Admin.query.count() == 0)
+    allow_register = _bootstrap_open()
     if request.method == 'GET':
         return render_template_string(ADMIN_LOGIN_HTML, allow_register=allow_register)
 
@@ -1769,33 +1902,105 @@ def admin_login():
         flash("Missing username or password")
         return render_template_string(ADMIN_LOGIN_HTML, allow_register=allow_register), 400
 
-    admin = Admin.query.filter_by(username=username).first()
-    if not admin or not check_password_hash(admin.password_hash, password):
+    user, role = _pick_login_user(username)
+    if not user or not check_password_hash(user.password_hash, password):
         flash("Invalid credentials")
         return render_template_string(ADMIN_LOGIN_HTML, allow_register=allow_register), 401
 
-    session['admin_logged'] = True
-    session['admin_user'] = admin.username
-    return redirect(url_for('dashboard'))
+    _set_auth_session(user.username, role)
+    return _safe_login_redirect(role, request.args.get('next') or request.form.get('next'))
 
+@app.route('/logout')
 @app.route('/admin/logout')
 def admin_logout():
     session.pop('admin_logged', None)
     session.pop('admin_user', None)
+    session.pop('police_logged', None)
+    session.pop('auth_role', None)
+    session.pop('username', None)
+    session.pop('user_id', None)
+    return redirect(url_for('admin_login'))
+
+@app.route('/register', methods=['GET', 'POST'])
+@app.route('/admin/register', methods=['GET', 'POST'])
+def admin_register():
+    if not _bootstrap_open():
+        flash("Registration is closed. An existing admin must add more users.")
+        return redirect(url_for('admin_login'))
+
+    if request.method == 'GET':
+        return render_template_string("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Register first admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+    .card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05);}
+    label{display:block;margin-top:12px;font-weight:700;}
+    input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;}
+    button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+    .muted{color:#64748b;font-size:14px;line-height:1.5;}
+    .error{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px;border-radius:10px;margin-top:12px;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Register first admin</h1>
+    <p class="muted">This only appears while the database has no admin account. After this, the register button disappears and only login stays public.</p>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="error">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+    <form method="post">
+      <label>Username</label>
+      <input name="username" required>
+      <label>Password</label>
+      <input name="password" type="password" required>
+      <label>Confirm password</label>
+      <input name="password2" type="password" required>
+      <button type="submit">Create first admin</button>
+    </form>
+  </div>
+</body>
+</html>
+""")
+    username = (request.form.get('username') or '').strip()
+    password = request.form.get('password') or ''
+    password2 = request.form.get('password2') or ''
+    if not username or not password:
+        flash("Username and password are required")
+        return render_template_string(ADMIN_LOGIN_HTML, allow_register=True), 400
+    if password != password2:
+        flash("Passwords do not match")
+        return render_template_string(ADMIN_LOGIN_HTML, allow_register=True), 400
+    user, err = _create_account(username, password, role='admin')
+    if err:
+        flash(err)
+        return render_template_string(ADMIN_LOGIN_HTML, allow_register=True), 400
+    flash("First admin created. Please log in.")
     return redirect(url_for('admin_login'))
 
 @app.route('/dashboard')
 def dashboard():
-    # friendly dashboard for non-technical users
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
     return render_template_string(DASHBOARD_HTML)
 
 # keep /friendly for compatibility
 @app.route('/friendly')
 def friendly():
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
     return render_template_string(DASHBOARD_HTML)
 
 @app.route('/admin/devices')
 def admin_devices():
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
     devices = Device.query.all()
     out = []
     prune_active_devices()
@@ -2471,8 +2676,522 @@ POLICE_DASH_HTML = """
 </html>
 """
 
+
+@app.route('/admin/users', methods=['GET', 'POST'])
+@app.route('/admin/admins', methods=['GET', 'POST'])
+def admin_admins():
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
+
+    if request.method == 'POST':
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+        password2 = request.form.get('password2') or ''
+        role = (request.form.get('role') or 'admin').strip().lower()
+        if role not in {'admin', 'police'}:
+            role = 'admin'
+        if not username or not password:
+            flash("Username and password are required")
+            return redirect(url_for('admin_admins'))
+        if password != password2:
+            flash("Passwords do not match")
+            return redirect(url_for('admin_admins'))
+        user, err = _create_account(username, password, role=role)
+        if err:
+            flash(err)
+            return redirect(url_for('admin_admins'))
+        flash(f"New {role} account added")
+        return redirect(url_for('admin_admins'))
+
+    admins = Admin.query.order_by(Admin.created_at.asc()).all()
+    police_users = PoliceUser.query.order_by(PoliceUser.created_at.asc()).all()
+    return render_template_string("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>User Management</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+    .wrap{max-width:980px;margin:0 auto;}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
+    table{width:100%;border-collapse:collapse;}
+    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;}
+    input,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
+    button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+    .muted{color:#64748b;font-size:14px;}
+    .flash{background:#eff6ff;border:1px solid #dbeafe;color:#1e3a8a;padding:12px;border-radius:10px;margin-bottom:14px;}
+    .top{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+    .full{grid-column:1/-1;}
+    @media (max-width: 900px){ .grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>Users & Access</h1>
+      <div>
+        <a href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('all_vehicles') }}">All Vehicles</a>
+        <a href="{{ url_for('admin_traffic') }}">Traffic Search</a>
+        <a href="{{ url_for('admin_logout') }}">Logout</a>
+      </div>
+    </div>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+    <div class="card">
+      <h2>Add admin or police</h2>
+      <form method="post" class="grid">
+        <div class="full">
+          <label>Role</label>
+          <select name="role">
+            <option value="admin">Admin</option>
+            <option value="police">Police</option>
+          </select>
+        </div>
+        <div>
+          <label>Username</label>
+          <input name="username" required>
+        </div>
+        <div>
+          <label>Password</label>
+          <input name="password" type="password" required>
+        </div>
+        <div class="full">
+          <label>Confirm password</label>
+          <input name="password2" type="password" required>
+        </div>
+        <div class="full">
+          <button type="submit">Create account</button>
+        </div>
+      </form>
+      <p class="muted">Registration stays closed to the public after the first admin. Only this page can add more accounts.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h2>Admins</h2>
+        <table>
+          <thead><tr><th>Username</th><th>Created</th></tr></thead>
+          <tbody>
+          {% for a in admins %}
+            <tr><td>{{ a.username }}</td><td>{{ a.created_at.isoformat() if a.created_at else '' }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Police</h2>
+        <table>
+          <thead><tr><th>Username</th><th>Created</th></tr></thead>
+          <tbody>
+          {% for p in police_users %}
+            <tr><td>{{ p.username }}</td><td>{{ p.created_at.isoformat() if p.created_at else '' }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+""", admins=admins, police_users=police_users)
+
+
+@app.route('/all-vehicles')
+def all_vehicles():
+    if _current_role() not in {'admin', 'police'}:
+        return redirect(url_for('admin_login'))
+    return render_template_string("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>All Vehicles</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    :root{--bg:#f6f8fb;--card:#fff;--line:#e2e8f0;--muted:#64748b;--accent:#0b84ff;}
+    body{margin:0;font-family:Arial,sans-serif;background:var(--bg);}
+    header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:linear-gradient(90deg,#0b84ff,#00c6ff);color:#fff;}
+    header a{color:#fff;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;}
+    .wrap{display:grid;grid-template-columns:380px 1fr;gap:14px;padding:14px;height:calc(100vh - 76px);box-sizing:border-box;}
+    .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 8px 22px rgba(0,0,0,.05);overflow:auto;}
+    .searchbar{display:flex;gap:8px;flex-wrap:wrap;}
+    .searchbar input,.searchbar select,.searchbar button{padding:11px 12px;border-radius:12px;border:1px solid var(--line);font-size:14px;}
+    .searchbar input,.searchbar select{flex:1;}
+    .searchbar button{background:var(--accent);color:#fff;border:none;cursor:pointer;font-weight:700;flex:0 0 auto;}
+    #vehicleList{overflow:auto;flex:1;padding:10px 0;}
+    .vehicle{border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:10px;cursor:pointer;}
+    .vehicle.selected{border-color:#93c5fd;background:#eff6ff;}
+    .row{display:flex;justify-content:space-between;gap:10px;}
+    .big{font-weight:700;font-size:15px;}
+    .muted{color:var(--muted);font-size:13px;line-height:1.5;}
+    #map{height:100%;width:100%;}
+    .detail{padding:14px;border-top:1px solid var(--line);}
+    .badge{display:inline-block;margin-top:6px;padding:4px 9px;border-radius:999px;background:#e0f2fe;color:#075985;font-size:12px;font-weight:700;}
+    .stats{display:grid;grid-template-columns: repeat(3, 1fr);gap:8px;margin-top:10px;}
+    .stat{border:1px solid var(--line);border-radius:12px;padding:10px;}
+    .stat .k{color:var(--muted);font-size:12px;}
+    .stat .v{font-weight:700;margin-top:3px;}
+    @media (max-width: 920px) { .wrap{grid-template-columns:1fr;height:auto;} #map{height:58vh;} }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>All Vehicles</h1>
+    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+    <a href="{{ url_for('admin_traffic') }}">Traffic Search</a>
+    <a href="{{ url_for('admin_admins') }}">Users</a>
+    <a href="{{ url_for('admin_logout') }}">Logout</a>
+    <span style="margin-left:auto;opacity:.95;">Search by plate or owner, then click a vehicle to jump to its position.</span>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="searchbar">
+        <input id="q" placeholder="Search by plate or owner..." />
+        <select id="field">
+          <option value="all">All</option>
+          <option value="plate">Plate</option>
+          <option value="owner">Owner</option>
+        </select>
+        <button id="btnSearch">Search</button>
+      </div>
+      <div class="muted" id="count" style="margin-top:8px;">Loading vehicles…</div>
+      <div id="vehicleList"></div>
+      <div class="detail" id="detailBox">
+        <div class="big" id="detailName">Select a vehicle</div>
+        <div class="muted" id="detailMeta">Its last beacon and location will appear here.</div>
+        <div class="stats">
+          <div class="stat"><div class="k">Plate</div><div class="v" id="detailPlate">—</div></div>
+          <div class="stat"><div class="k">Owner</div><div class="v" id="detailOwner">—</div></div>
+          <div class="stat"><div class="k">Speed</div><div class="v" id="detailSpeed">—</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card"><div id="map"></div></div>
+  </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const map = L.map('map', { center:[0,0], zoom:2, preferCanvas:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19 }).addTo(map);
+  let vehicles = [];
+  let selected = null;
+  let marker = null;
+  let circle = null;
+
+  const qEl = document.getElementById('q');
+  const fieldEl = document.getElementById('field');
+  const listEl = document.getElementById('vehicleList');
+  const countEl = document.getElementById('count');
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return String(s).replace(/[&<>"'`]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'})[c]);
+  }
+
+  async function loadVehicles() {
+    const q = qEl.value.trim();
+    const field = fieldEl.value;
+    const res = await fetch(`/admin/vehicles?q=${encodeURIComponent(q)}&field=${encodeURIComponent(field)}`, { cache: 'no-store' });
+    if (!res.ok) {
+      countEl.innerText = 'Login required';
+      return;
+    }
+    const data = await res.json();
+    vehicles = data.vehicles || [];
+    countEl.innerText = `${vehicles.length} vehicle(s) shown`;
+    renderVehicles();
+    if (vehicles.length && !selected) selectVehicle(vehicles[0].id);
+    if (selected && !vehicles.some(v => v.id === selected)) selected = null;
+  }
+
+  function renderVehicles() {
+    listEl.innerHTML = '';
+    for (const v of vehicles) {
+      const div = document.createElement('div');
+      div.className = 'vehicle' + (v.id === selected ? ' selected' : '');
+      const last = v.last_snapshot || {};
+      const when = last.ts ? new Date(last.ts).toLocaleString() : 'no beacon yet';
+      const spd = (last.speed_mps != null) ? ((last.speed_mps * 3.6).toFixed(1) + ' km/h') : '—';
+      div.innerHTML = `
+        <div class="row">
+          <div>
+            <div class="big">${escapeHtml(v.car_name || v.car_model || v.id)}</div>
+            <div class="muted">${escapeHtml(v.owner || '')}</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="muted">${escapeHtml(v.plate || '—')}</div>
+            <div class="badge">${escapeHtml(v.connected ? 'live' : 'offline')}</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-top:8px;">Beacon: ${escapeHtml(when)} · ${escapeHtml(spd)}</div>
+      `;
+      div.addEventListener('click', () => selectVehicle(v.id));
+      listEl.appendChild(div);
+    }
+  }
+
+  function selectVehicle(id) {
+    selected = id;
+    renderVehicles();
+    const v = vehicles.find(x => x.id === id);
+    if (!v) return;
+    const last = v.last_snapshot || {};
+    document.getElementById('detailName').innerText = v.car_name || v.car_model || v.id;
+    document.getElementById('detailMeta').innerText = last.ts ? new Date(last.ts).toLocaleString() : 'No beacon yet';
+    document.getElementById('detailPlate').innerText = v.plate || '—';
+    document.getElementById('detailOwner').innerText = v.owner || '—';
+    document.getElementById('detailSpeed').innerText = last.speed_mps != null ? ((last.speed_mps * 3.6).toFixed(1) + ' km/h') : '—';
+
+    if (typeof last.lat === 'number' && typeof last.lon === 'number') {
+      if (!marker) marker = L.marker([last.lat, last.lon]).addTo(map);
+      else marker.setLatLng([last.lat, last.lon]);
+      if (!circle) circle = L.circle([last.lat, last.lon], { radius: 25 }).addTo(map);
+      else circle.setLatLng([last.lat, last.lon]);
+      marker.bindPopup(`<strong>${escapeHtml(v.car_name || v.id)}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
+      map.setView([last.lat, last.lon], 15, { animate:true });
+    }
+  }
+
+  document.getElementById('btnSearch').addEventListener('click', loadVehicles);
+  qEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') loadVehicles(); });
+  qEl.addEventListener('input', () => {
+    clearTimeout(window._vehTimer);
+    window._vehTimer = setTimeout(loadVehicles, 200);
+  });
+  fieldEl.addEventListener('change', loadVehicles);
+
+  loadVehicles();
+</script>
+</body>
+</html>
+""")
+
+
+@app.route('/admin/traffic', methods=['GET', 'POST'])
+def admin_traffic():
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
+
+    if request.method == 'POST':
+        name = (request.form.get('name') or '').strip()
+        scope = (request.form.get('scope') or 'custom').strip().lower()
+        notes = (request.form.get('notes') or '').strip()
+        zone_id = (request.form.get('zone_id') or '').strip()
+        zone = TrafficZone.query.filter_by(id=zone_id).first() if zone_id else TrafficZone()
+
+        if name:
+            zone.name = name
+        zone.scope = scope if scope in {'county', 'constituency', 'region', 'road', 'national', 'custom'} else 'custom'
+        zone.notes = notes or None
+
+        for key in ('center_lat', 'center_lon', 'radius_m'):
+            val = (request.form.get(key) or '').strip()
+            if val:
+                try:
+                    setattr(zone, key, float(val))
+                except Exception:
+                    pass
+
+        if not zone.name:
+            zone.name = zone.scope.title() if zone.scope else 'Traffic Zone'
+
+        db.session.add(zone)
+        db.session.commit()
+        flash('Traffic zone saved')
+        return redirect(url_for('admin_traffic', zone_id=zone.id))
+
+    zone_id = (request.args.get('zone_id') or '').strip()
+    zone = TrafficZone.query.filter_by(id=zone_id).first() if zone_id else None
+    if not zone and (request.args.get('scope') or '').lower() == 'national':
+        zone = TrafficZone(name='National Traffic', scope='national')
+
+    vehicles, counts = _traffic_snapshot(zone)
+    zones = TrafficZone.query.order_by(TrafficZone.created_at.desc()).all()
+    return render_template_string("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Traffic Search</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+    .wrap{max-width:1200px;margin:0 auto;}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+    .full{grid-column:1/-1;}
+    input,select,textarea{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
+    button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+    table{width:100%;border-collapse:collapse;}
+    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;}
+    .muted{color:#64748b;font-size:14px;line-height:1.5;}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
+        <div>
+          <h1 style="margin:0;">Traffic Search</h1>
+          <div class="muted">Search traffic by county, constituency, region, road, or national view. Counts use the latest beacon from each vehicle.</div>
+        </div>
+        <div>
+          <a href="{{ url_for('dashboard') }}">Dashboard</a>
+          <a href="{{ url_for('all_vehicles') }}">All Vehicles</a>
+          <a href="{{ url_for('admin_admins') }}">Users</a>
+          <a href="{{ url_for('admin_logout') }}">Logout</a>
+        </div>
+      </div>
+    </div>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}<div class="card" style="border-color:#bfdbfe;background:#eff6ff;">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+
+    <div class="grid">
+      <div class="card">
+        <h2 style="margin-top:0;">Search zone</h2>
+        <form method="get">
+          <label>Saved zone</label>
+          <select name="zone_id">
+            <option value="">-- pick a saved zone --</option>
+            {% for z in zones %}
+              <option value="{{ z.id }}" {% if zone and z.id == zone.id %}selected{% endif %}>{{ z.name }} ({{ z.scope }})</option>
+            {% endfor %}
+          </select>
+          <label>National view</label>
+          <select name="scope">
+            <option value="">-- keep selected zone --</option>
+            <option value="national">National</option>
+          </select>
+          <button type="submit">Search traffic</button>
+        </form>
+
+        <form method="post" style="margin-top:18px;">
+          <h3>Add / update zone</h3>
+          <input type="hidden" name="zone_id" value="{{ zone.id if zone else '' }}">
+          <label>Zone name</label>
+          <input name="name" placeholder="Nairobi County / Thika Road / Rift Valley" value="{{ zone.name if zone else '' }}">
+          <label>Scope</label>
+          <select name="scope">
+            {% set scopes = ['county','constituency','region','road','national','custom'] %}
+            {% for s in scopes %}
+              <option value="{{ s }}" {% if zone and zone.scope == s %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+          </select>
+          <label>Center latitude</label>
+          <input name="center_lat" value="{{ zone.center_lat if zone and zone.center_lat is not none else '' }}">
+          <label>Center longitude</label>
+          <input name="center_lon" value="{{ zone.center_lon if zone and zone.center_lon is not none else '' }}">
+          <label>Radius metres</label>
+          <input name="radius_m" value="{{ zone.radius_m if zone and zone.radius_m is not none else '' }}">
+          <label>Notes</label>
+          <textarea name="notes" rows="3">{{ zone.notes if zone and zone.notes else '' }}</textarea>
+          <button type="submit">Save zone</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top:0;">Summary</h2>
+        <div>
+          <span class="pill">Total {{ vehicles|length }}</span>
+          <span class="pill">Cars {{ counts.get('car', 0) }}</span>
+          <span class="pill">Trucks {{ counts.get('truck', 0) }}</span>
+          <span class="pill">Buses {{ counts.get('bus', 0) }}</span>
+          <span class="pill">Vans {{ counts.get('van', 0) }}</span>
+          <span class="pill">Motorcycles {{ counts.get('motorcycle', 0) }}</span>
+          <span class="pill">Pickups {{ counts.get('pickup', 0) }}</span>
+          <span class="pill">Taxis {{ counts.get('taxi', 0) }}</span>
+        </div>
+        <p class="muted" style="margin-top:12px;">This count uses each vehicle’s latest beacon, so it does not conflict with the single-vehicle beacon view.</p>
+      </div>
+
+      <div class="card full">
+        <h2 style="margin-top:0;">Vehicles in this traffic area</h2>
+        <table>
+          <thead><tr><th>Plate</th><th>Owner</th><th>Type</th><th>Speed</th><th>Last position</th></tr></thead>
+          <tbody>
+            {% for v in vehicles %}
+              <tr>
+                <td>{{ v.plate or '—' }}</td>
+                <td>{{ v.owner or '—' }}</td>
+                <td>{{ v.vehicle_type }}</td>
+                <td>{{ '%.1f km/h'|format(v.last_snapshot.speed_mps * 3.6) if v.last_snapshot.speed_mps is not none else '—' }}</td>
+                <td>{{ v.last_snapshot.lat }}, {{ v.last_snapshot.lon }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+""", zone=zone, zones=zones, vehicles=vehicles, counts=counts)
+
+
+@app.route('/admin/vehicles')
+def admin_vehicles():
+    if _current_role() not in {'admin', 'police'}:
+        return jsonify({"error": "Login required"}), 401
+
+    q = (request.args.get("q") or "").strip().lower()
+    field = (request.args.get("field") or "all").strip().lower()
+    devices = Device.query.all()
+    out = []
+
+    for d in devices:
+        hay_plate = (d.plate or "").lower()
+        hay_owner = (d.owner or "").lower()
+        hay_name = ((d.car_name or "") + " " + (d.car_model or "")).lower()
+
+        match = True
+        if q:
+            if field == "plate":
+                match = q in hay_plate
+            elif field == "owner":
+                match = q in hay_owner
+            else:
+                match = (q in hay_plate) or (q in hay_owner) or (q in hay_name)
+
+        if not match:
+            continue
+
+        snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
+        last = None
+        if snap:
+            last = {
+                "ts": snap.ts.isoformat() if snap.ts else None,
+                "lat": snap.lat,
+                "lon": snap.lon,
+                "speed_mps": round(snap.speed_mps or 0.0, 3),
+                "bearing_deg": round(snap.bearing_deg or 0.0, 1),
+            }
+
+        out.append({
+            "id": d.id,
+            "owner": d.owner,
+            "car_name": d.car_name,
+            "car_model": d.car_model,
+            "plate": d.plate,
+            "connected": bool(connected_sockets.get(d.id)),
+            "last_snapshot": last,
+        })
+
+    out.sort(key=lambda item: item.get("last_snapshot", {}).get("ts") or "", reverse=True)
+    return jsonify({"vehicles": out, "count": len(out)})
+
 @app.route('/police')
 def police_dashboard():
+    if _current_role() not in {'admin', 'police'}:
+        return redirect(url_for('admin_login'))
     return render_template_string(POLICE_DASH_HTML)
 # -------------------------
 # End of police/watch block
@@ -2651,429 +3370,6 @@ def jam_detector_loop():
         except Exception:
             app.logger.exception("jam_detector_loop error")
         time.sleep(JAM_DETECT_INTERVAL_S)
-
-
-# -------------------------
-# Admin registration & vehicle views
-# -------------------------
-def admin_session_required():
-    return bool(session.get("admin_logged"))
-
-def _vehicle_last_snapshot(device_id):
-    snap = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).first()
-    last = None
-    if snap:
-        parsed_raw = None
-        if snap.raw:
-            try:
-                parsed_raw = json.loads(snap.raw)
-            except Exception:
-                parsed_raw = snap.raw
-        last = {
-            "ts": snap.ts.isoformat() if snap.ts else None,
-            "lat": snap.lat,
-            "lon": snap.lon,
-            "speed_mps": round(snap.speed_mps or 0.0, 3),
-            "bearing_deg": round(snap.bearing_deg or 0.0, 1),
-            "raw": parsed_raw,
-            "position": {"lat": snap.lat, "lon": snap.lon}
-        }
-    else:
-        with active_devices_lock:
-            entry = active_devices.get(device_id)
-        if entry:
-            last = {
-                "ts": entry.get("ts").isoformat() if entry.get("ts") else None,
-                "lat": entry.get("lat"),
-                "lon": entry.get("lon"),
-                "speed_mps": round(entry.get("speed_mps") or 0.0, 3),
-                "bearing_deg": round(entry.get("bearing_deg") or 0.0, 1),
-                "raw": entry.get("raw"),
-                "position": {"lat": entry.get("lat"), "lon": entry.get("lon")}
-            }
-    return last
-
-def _serialize_vehicle(d):
-    return {
-        "id": d.id,
-        "owner": d.owner,
-        "car_name": d.car_name,
-        "car_model": d.car_model,
-        "plate": d.plate,
-        "extra": d.extra,
-        "created_at": d.created_at.isoformat() if d.created_at else None,
-        "revoked": bool(d.revoked),
-        "last_snapshot": _vehicle_last_snapshot(d.id),
-        "connected": bool(connected_sockets.get(d.id))
-    }
-
-@app.route('/admin/register', methods=['GET', 'POST'])
-def admin_register():
-    admins_exist = Admin.query.count() > 0
-    if admins_exist and not session.get('admin_logged'):
-        flash("Registration is closed. An existing admin must add new admins.")
-        return redirect(url_for('admin_login'))
-
-    if request.method == 'GET':
-        if admins_exist and session.get('admin_logged'):
-            # If an admin wants to add another admin, use the admin management page.
-            return redirect(url_for('admin_admins'))
-        return render_template_string("""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Register Admin</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
-    .card{max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05);}
-    label{display:block;margin-top:12px;font-weight:700;}
-    input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;}
-    button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-    .muted{color:#64748b;font-size:14px;line-height:1.5;}
-    .error{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px;border-radius:10px;margin-top:12px;}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Register Admin</h1>
-    <p class="muted">Create the first administrator. After that, this route closes unless you are already logged in as an admin.</p>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}<div class="error">{{ messages[0] }}</div>{% endif %}
-    {% endwith %}
-    <form method="post">
-      <label>Username</label>
-      <input name="username" required>
-      <label>Password</label>
-      <input name="password" type="password" required>
-      <label>Confirm password</label>
-      <input name="password2" type="password" required>
-      <button type="submit">Create admin</button>
-    </form>
-    <a href="{{ url_for('admin_login') }}">Back to login</a>
-  </div>
-</body>
-</html>
-""")
-
-    username = (request.form.get("username") or "").strip()
-    password = request.form.get("password") or ""
-    password2 = request.form.get("password2") or ""
-    if not username or not password:
-        flash("Username and password are required")
-        return redirect(url_for("admin_register"))
-    if password != password2:
-        flash("Passwords do not match")
-        return redirect(url_for("admin_register"))
-    if admins_exist and not session.get('admin_logged'):
-        flash("Registration is closed. An existing admin must add new admins.")
-        return redirect(url_for("admin_login"))
-    if Admin.query.filter_by(username=username).first():
-        flash("Username already exists")
-        return redirect(url_for("admin_register"))
-
-    admin = Admin(username=username, password_hash=generate_password_hash(password))
-    db.session.add(admin)
-    db.session.commit()
-    flash("Admin created. Please log in.")
-    return redirect(url_for("admin_login"))
-
-@app.route('/admin/admins', methods=['GET', 'POST'])
-def admin_admins():
-    if not session.get('admin_logged'):
-        return redirect(url_for('admin_login'))
-
-    if request.method == 'POST':
-        username = (request.form.get("username") or "").strip()
-        password = request.form.get("password") or ""
-        password2 = request.form.get("password2") or ""
-        if not username or not password:
-            flash("Username and password are required")
-            return redirect(url_for("admin_admins"))
-        if password != password2:
-            flash("Passwords do not match")
-            return redirect(url_for("admin_admins"))
-        if Admin.query.filter_by(username=username).first():
-            flash("Username already exists")
-            return redirect(url_for("admin_admins"))
-
-        admin = Admin(username=username, password_hash=generate_password_hash(password))
-        db.session.add(admin)
-        db.session.commit()
-        flash("New admin added")
-        return redirect(url_for("admin_admins"))
-
-    admins = Admin.query.order_by(Admin.created_at.asc()).all()
-    return render_template_string("""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Admin Management</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
-    .wrap{max-width:920px;margin:0 auto;}
-    .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
-    table{width:100%;border-collapse:collapse;}
-    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;}
-    input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
-    button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-    .muted{color:#64748b;font-size:14px;}
-    .flash{background:#eff6ff;border:1px solid #dbeafe;color:#1e3a8a;padding:12px;border-radius:10px;margin-bottom:14px;}
-    .top{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <h1>Admin Management</h1>
-      <div>
-        <a href="{{ url_for('dashboard') }}">Dashboard</a>
-        <a href="{{ url_for('all_vehicles') }}">All Vehicles</a>
-        <a href="{{ url_for('admin_logout') }}">Logout</a>
-      </div>
-    </div>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
-    {% endwith %}
-    <div class="card">
-      <h2>Add admin</h2>
-      <form method="post">
-        <label>Username</label>
-        <input name="username" required>
-        <label>Password</label>
-        <input name="password" type="password" required>
-        <label>Confirm password</label>
-        <input name="password2" type="password" required>
-        <button type="submit">Create admin</button>
-      </form>
-    </div>
-    <div class="card">
-      <h2>Existing admins</h2>
-      <table>
-        <thead><tr><th>Username</th><th>Created</th></tr></thead>
-        <tbody>
-        {% for a in admins %}
-          <tr>
-            <td>{{ a.username }}</td>
-            <td>{{ a.created_at.isoformat() if a.created_at else '' }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-      <p class="muted">Registration stays closed to the public after the first admin. Only this page can add more admin accounts.</p>
-    </div>
-  </div>
-</body>
-</html>
-""", admins=admins)
-
-ADMIN_VEHICLES_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>All Vehicles</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <style>
-    :root{ --bg:#f6f8fb; --card:#fff; --muted:#64748b; --accent:#0b84ff; --line:#e2e8f0; }
-    body{ margin:0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background:var(--bg); color:#0f172a; }
-    header{ background: linear-gradient(90deg,#0b84ff 0%, #00c6ff 100%); color:white; padding:16px 18px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-    header h1{ margin:0; font-size:20px; }
-    header a{ color:white; text-decoration:none; font-weight:700; }
-    .wrap{ display:grid; grid-template-columns: 380px 1fr; gap:12px; padding:12px; height: calc(100vh - 72px); box-sizing:border-box; }
-    .card{ background:var(--card); border-radius:16px; box-shadow:0 10px 24px rgba(2,6,23,.06); overflow:hidden; border:1px solid var(--line); }
-    .left{ display:flex; flex-direction:column; min-height:0; }
-    .panel{ padding:14px; border-bottom:1px solid var(--line); }
-    .searchbar{ display:flex; gap:8px; }
-    .searchbar input, .searchbar select, .searchbar button, .searchbar a { padding:11px 12px; border-radius:12px; border:1px solid var(--line); font-size:14px; }
-    .searchbar input, .searchbar select{ flex:1; }
-    .searchbar button, .searchbar a{ background:var(--accent); color:white; border:none; cursor:pointer; text-decoration:none; font-weight:700; display:inline-flex; align-items:center; justify-content:center; }
-    #vehicleList{ overflow:auto; flex:1; padding:10px; }
-    .vehicle{ border:1px solid var(--line); border-radius:14px; padding:12px; margin-bottom:10px; cursor:pointer; }
-    .vehicle.selected{ border-color:#93c5fd; background:#eff6ff; }
-    .row{ display:flex; justify-content:space-between; gap:10px; }
-    .big{ font-weight:700; font-size:15px; }
-    .muted{ color:var(--muted); font-size:13px; line-height:1.5; }
-    #map{ height:100%; width:100%; }
-    .detail{ padding:14px; border-top:1px solid var(--line); }
-    .badge{ display:inline-block; margin-top:6px; padding:4px 9px; border-radius:999px; background:#e0f2fe; color:#075985; font-size:12px; font-weight:700; }
-    .stats{ display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; margin-top:10px; }
-    .stat{ border:1px solid var(--line); border-radius:12px; padding:10px; }
-    .stat .k{ color:var(--muted); font-size:12px; }
-    .stat .v{ font-weight:700; margin-top:3px; }
-    @media (max-width: 920px) { .wrap{ grid-template-columns:1fr; height:auto; } #map{ height: 58vh; } }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>All Vehicles</h1>
-    <a href="{{ url_for('dashboard') }}">Dashboard</a>
-    <a href="{{ url_for('admin_login') }}">Admin</a>
-    <span style="margin-left:auto; opacity:.95;">Search by plate or owner, then click a vehicle to jump to its position.</span>
-  </header>
-
-  <div class="wrap">
-    <div class="card left">
-      <div class="panel">
-        <div class="searchbar">
-          <input id="q" placeholder="Search by plate or owner..." />
-          <select id="field">
-            <option value="all">All</option>
-            <option value="plate">Plate</option>
-            <option value="owner">Owner</option>
-          </select>
-          <button id="btnSearch">Search</button>
-        </div>
-        <div class="muted" id="count" style="margin-top:8px;">Loading vehicles…</div>
-      </div>
-      <div id="vehicleList"></div>
-      <div class="detail" id="detailBox">
-        <div class="big" id="detailName">Select a vehicle</div>
-        <div class="muted" id="detailMeta">Its last beacon and location will appear here.</div>
-        <div class="stats">
-          <div class="stat"><div class="k">Plate</div><div class="v" id="detailPlate">—</div></div>
-          <div class="stat"><div class="k">Owner</div><div class="v" id="detailOwner">—</div></div>
-          <div class="stat"><div class="k">Speed</div><div class="v" id="detailSpeed">—</div></div>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div id="map"></div>
-    </div>
-  </div>
-
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-  const map = L.map('map', { center:[0,0], zoom:2, preferCanvas:true });
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19 }).addTo(map);
-  let vehicles = [];
-  let selected = null;
-  let marker = null;
-  let circle = null;
-
-  const qEl = document.getElementById('q');
-  const fieldEl = document.getElementById('field');
-  const listEl = document.getElementById('vehicleList');
-  const countEl = document.getElementById('count');
-
-  function escapeHtml(s) {
-    if (!s) return '';
-    return String(s).replace(/[&<>"'`]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'})[c]);
-  }
-
-  async function loadVehicles() {
-    const q = qEl.value.trim();
-    const field = fieldEl.value;
-    const res = await fetch(`/admin/vehicles?q=${encodeURIComponent(q)}&field=${encodeURIComponent(field)}`, { cache: 'no-store' });
-    const data = await res.json();
-    vehicles = data.vehicles || [];
-    countEl.innerText = `${vehicles.length} vehicle(s) shown`;
-    renderVehicles();
-    if (vehicles.length && !selected) selectVehicle(vehicles[0].id);
-    if (selected && !vehicles.some(v => v.id === selected)) {
-      selected = null;
-    }
-  }
-
-  function renderVehicles() {
-    listEl.innerHTML = '';
-    for (const v of vehicles) {
-      const div = document.createElement('div');
-      div.className = 'vehicle' + (v.id === selected ? ' selected' : '');
-      const last = v.last_snapshot || {};
-      const when = last.ts ? new Date(last.ts).toLocaleString() : 'no beacon yet';
-      const spd = (last.speed_mps != null) ? ((last.speed_mps * 3.6).toFixed(1) + ' km/h') : '—';
-      div.innerHTML = `
-        <div class="row">
-          <div>
-            <div class="big">${escapeHtml(v.car_name || v.car_model || v.id)}</div>
-            <div class="muted">${escapeHtml(v.owner || '')}</div>
-          </div>
-          <div style="text-align:right;">
-            <div class="muted">${escapeHtml(v.plate || '—')}</div>
-            <div class="badge">${escapeHtml(v.connected ? 'live' : 'offline')}</div>
-          </div>
-        </div>
-        <div class="muted" style="margin-top:8px;">Beacon: ${escapeHtml(when)} · ${escapeHtml(spd)}</div>
-      `;
-      div.addEventListener('click', () => selectVehicle(v.id));
-      listEl.appendChild(div);
-    }
-  }
-
-  function selectVehicle(id) {
-    selected = id;
-    renderVehicles();
-    const v = vehicles.find(x => x.id === id);
-    if (!v) return;
-    const last = v.last_snapshot || {};
-    document.getElementById('detailName').innerText = v.car_name || v.car_model || v.id;
-    document.getElementById('detailMeta').innerText = last.ts ? new Date(last.ts).toLocaleString() : 'No beacon yet';
-    document.getElementById('detailPlate').innerText = v.plate || '—';
-    document.getElementById('detailOwner').innerText = v.owner || '—';
-    document.getElementById('detailSpeed').innerText = last.speed_mps != null ? ((last.speed_mps * 3.6).toFixed(1) + ' km/h') : '—';
-
-    if (typeof last.lat === 'number' && typeof last.lon === 'number') {
-      if (!marker) marker = L.marker([last.lat, last.lon]).addTo(map);
-      else marker.setLatLng([last.lat, last.lon]);
-      if (!circle) circle = L.circle([last.lat, last.lon], { radius: 25 }).addTo(map);
-      else circle.setLatLng([last.lat, last.lon]);
-      marker.bindPopup(`<strong>${escapeHtml(v.car_name || v.id)}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
-      map.setView([last.lat, last.lon], 15, { animate:true });
-    }
-  }
-
-  document.getElementById('btnSearch').addEventListener('click', loadVehicles);
-  qEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') loadVehicles(); });
-  qEl.addEventListener('input', () => {
-    clearTimeout(window._vehTimer);
-    window._vehTimer = setTimeout(loadVehicles, 200);
-  });
-  fieldEl.addEventListener('change', loadVehicles);
-
-  loadVehicles();
-</script>
-</body>
-</html>
-"""
-
-@app.route('/all-vehicles')
-def all_vehicles():
-    if Admin.query.count() > 0 and not session.get("admin_logged"):
-        flash("Please log in to use the vehicle management pages.")
-        return redirect(url_for("admin_login"))
-    return render_template_string(ADMIN_VEHICLES_HTML)
-
-@app.route('/admin/vehicles')
-def admin_vehicles():
-    if Admin.query.count() > 0 and not session.get("admin_logged"):
-        return jsonify({"error": "Admin access required"}), 401
-
-    q = (request.args.get("q") or "").strip().lower()
-    field = (request.args.get("field") or "all").strip().lower()
-    devices = Device.query.all()
-    out = []
-    for d in devices:
-        hay_plate = (d.plate or "").lower()
-        hay_owner = (d.owner or "").lower()
-        hay_name = ((d.car_name or "") + " " + (d.car_model or "")).lower()
-        match = True
-        if q:
-            if field == "plate":
-                match = q in hay_plate
-            elif field == "owner":
-                match = q in hay_owner
-            else:
-                match = (q in hay_plate) or (q in hay_owner) or (q in hay_name)
-        if match:
-            out.append(_serialize_vehicle(d))
-
-    out.sort(key=lambda item: item.get("last_snapshot", {}).get("ts") or "", reverse=True)
-    return jsonify({"vehicles": out, "count": len(out)})
 
 # -------------------------
 # CLI entry & startup hooks
