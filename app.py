@@ -2188,85 +2188,80 @@ def admin_list_overspeeds():
 # -------------------------
 # Report generation utils (Excel & PDF)
 # -------------------------
+
 def generate_all_excel_bytes():
-    """
-    Build an Excel workbook with sheets:
-     - devices
-     - snapshots (recent)
-     - roads
-     - overspeeds
-    Return bytes (xlsx).
-    Requires pandas to be available.
-    """
-    if pd is None:
-        raise RuntimeError("pandas is required for Excel report generation")
+    """Create a simple workbook with devices, snapshots, roads, overspeeds."""
+    wb = Workbook()
 
-    # devices
-    devs = Device.query.all()
-    dev_rows = []
-    for d in devs:
-        dev_rows.append({
-            "id": d.id, "owner": d.owner, "car_name": d.car_name, "car_model": d.car_model,
-            "plate": d.plate, "created_at": d.created_at.isoformat() if d.created_at else None, "revoked": bool(d.revoked)
-        })
-    df_devs = pd.DataFrame(dev_rows)
+    ws = wb.active
+    ws.title = "devices"
+    ws.append(["id", "owner", "car_name", "car_model", "plate", "created_at", "revoked"])
+    for d in Device.query.all():
+        ws.append([d.id, d.owner, d.car_name, d.car_model, d.plate,
+                   d.created_at.isoformat() if d.created_at else "", bool(d.revoked)])
 
-    # snapshots (last N or recent window)
-    snaps_q = Snapshot.query.order_by(Snapshot.ts.desc()).limit(2000).all()
-    snaps_rows = []
-    for s in snaps_q:
-        parsed = None
+    ws = wb.create_sheet("snapshots")
+    ws.append(["id", "device_id", "ts", "lat", "lon", "speed_mps", "speed_kmh", "bearing_deg", "source", "raw"])
+    for s in Snapshot.query.order_by(Snapshot.ts.desc()).limit(2000).all():
+        raw = ""
         if s.raw:
             try:
-                parsed = json.loads(s.raw)
+                raw = json.dumps(json.loads(s.raw))
             except Exception:
-                parsed = s.raw
-        snaps_rows.append({
-            "id": s.id, "device_id": s.device_id, "ts": s.ts.isoformat() if s.ts else None,
-            "lat": s.lat, "lon": s.lon, "speed_mps": s.speed_mps, "speed_kmh": round((s.speed_mps or 0.0)*3.6,2),
-            "bearing_deg": s.bearing_deg, "source": s.source, "raw": json.dumps(parsed) if parsed is not None else None
-        })
-    df_snaps = pd.DataFrame(snaps_rows)
+                raw = str(s.raw)
+        ws.append([s.id, s.device_id, s.ts.isoformat() if s.ts else "", s.lat, s.lon, s.speed_mps,
+                   round((s.speed_mps or 0.0) * 3.6, 2), s.bearing_deg, s.source, raw])
 
-    # roads
-    roads = Road.query.order_by(Road.created_at.desc()).all()
-    roads_rows = []
-    for r in roads:
-        roads_rows.append({
-            "id": r.id, "name": r.name, "speed_limit_kmh": r.speed_limit_kmh,
-            "center_lat": r.center_lat, "center_lon": r.center_lon, "radius_m": r.radius_m,
-            "created_at": r.created_at.isoformat() if r.created_at else None
-        })
-    df_roads = pd.DataFrame(roads_rows)
+    ws = wb.create_sheet("roads")
+    ws.append(["id", "name", "speed_limit_kmh", "center_lat", "center_lon", "radius_m", "created_at"])
+    for r in Road.query.order_by(Road.created_at.desc()).all():
+        ws.append([r.id, r.name, r.speed_limit_kmh, r.center_lat, r.center_lon, r.radius_m,
+                   r.created_at.isoformat() if r.created_at else ""])
 
-    # overspeeds
-    overs = OverspeedEvent.query.order_by(OverspeedEvent.ts.desc()).limit(2000).all()
-    overs_rows = []
-    for o in overs:
-        parsed = None
+    ws = wb.create_sheet("overspeeds")
+    ws.append(["id", "device_id", "road_id", "snapshot_id", "ts", "speed_kmh", "lat", "lon", "raw"])
+    for o in OverspeedEvent.query.order_by(OverspeedEvent.ts.desc()).limit(2000).all():
+        raw = ""
         if o.raw:
             try:
-                parsed = json.loads(o.raw)
+                raw = json.dumps(json.loads(o.raw))
             except Exception:
-                parsed = o.raw
-        overs_rows.append({
-            "id": o.id, "device_id": o.device_id, "road_id": o.road_id,
-            "snapshot_id": o.snapshot_id, "ts": o.ts.isoformat() if o.ts else None,
-            "speed_kmh": o.speed_kmh, "lat": o.lat, "lon": o.lon, "raw": json.dumps(parsed) if parsed is not None else None
-        })
-    df_overs = pd.DataFrame(overs_rows)
+                raw = str(o.raw)
+        ws.append([o.id, o.device_id, o.road_id, o.snapshot_id, o.ts.isoformat() if o.ts else "",
+                   o.speed_kmh, o.lat, o.lon, raw])
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_devs.to_excel(writer, sheet_name='devices', index=False)
-        df_snaps.to_excel(writer, sheet_name='snapshots', index=False)
-        df_roads.to_excel(writer, sheet_name='roads', index=False)
-        df_overs.to_excel(writer, sheet_name='overspeeds', index=False)
-        writer.save()
-    output.seek(0)
-    return output.getvalue()
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 
 def generate_road_excel_bytes(road_id):
+    wb = Workbook()
+    road = Road.query.get_or_404(road_id)
+
+    ws = wb.active
+    ws.title = "road_info"
+    ws.append(["id", "name", "speed_limit_kmh", "center_lat", "center_lon", "radius_m", "created_at"])
+    ws.append([road.id, road.name, road.speed_limit_kmh, road.center_lat, road.center_lon, road.radius_m,
+               road.created_at.isoformat() if road.created_at else ""])
+
+    ws = wb.create_sheet("overspeeds")
+    ws.append(["id", "device_id", "snapshot_id", "ts", "speed_kmh", "lat", "lon", "raw"])
+    for o in OverspeedEvent.query.filter_by(road_id=road_id).order_by(OverspeedEvent.ts.desc()).all():
+        raw = ""
+        if o.raw:
+            try:
+                raw = json.dumps(json.loads(o.raw))
+            except Exception:
+                raw = str(o.raw)
+        ws.append([o.id, o.device_id, o.snapshot_id, o.ts.isoformat() if o.ts else "",
+                   o.speed_kmh, o.lat, o.lon, raw])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
     if pd is None:
         raise RuntimeError("pandas is required for Excel report generation")
     r = Road.query.get_or_404(road_id)
@@ -2687,7 +2682,10 @@ def admin_admins():
         return redirect(url_for('admin_admins'))
 
     admins = Admin.query.order_by(Admin.created_at.asc()).all()
-    police_users = PoliceUser.query.order_by(PoliceUser.created_at.asc()).all()
+    try:
+        police_users = PoliceUser.query.order_by(PoliceUser.created_at.asc()).all()
+    except Exception:
+        police_users = []
     return _safe_render("""
 <!doctype html>
 <html>
@@ -3401,6 +3399,8 @@ def jam_detector_loop():
         except Exception:
             app.logger.exception("jam_detector_loop error")
         time.sleep(JAM_DETECT_INTERVAL_S)
+
+init_db()
 
 # -------------------------
 # CLI entry & startup hooks
