@@ -588,58 +588,15 @@ def index():
         return redirect(url_for('dashboard'))
     if role == 'police':
         return redirect(url_for('police_dashboard'))
-    if _bootstrap_open():
-        return redirect(url_for('admin_register'))
     return redirect(url_for('admin_login'))
 
 
 # -------------------------
 # Web auth helpers
 # -------------------------
-BOOTSTRAP_STATE_KEY = "registration_open"
-
-
-def _bootstrap_state_row(create_if_missing=True):
-    try:
-        row = db.session.get(BootstrapState, BOOTSTRAP_STATE_KEY)
-        if row is None and create_if_missing:
-            row = BootstrapState(key=BOOTSTRAP_STATE_KEY, value="1")
-            db.session.add(row)
-            db.session.commit()
-        return row
-    except Exception:
-        db.session.rollback()
-        return None
-
-
-def _has_admin_accounts():
-    try:
-        return Admin.query.count() > 0
-    except Exception:
-        return False
-
-
-def _bootstrap_open():
-    # Keep registration open only until the first admin exists.
-    try:
-        return not _has_admin_accounts()
-    except Exception:
-        return True
-
-
-def _close_bootstrap():
-    # Kept for compatibility with older code paths, but the new bootstrap logic
-    # is driven directly by whether any admin exists.
-    try:
-        row = _bootstrap_state_row(create_if_missing=True)
-        if row is not None:
-            row.value = "0"
-            db.session.add(row)
-            db.session.commit()
-    except Exception:
-        db.session.rollback()
-
-
+# Hardcoded bootstrap admin for first access.
+BOOTSTRAP_ADMIN_USERNAME = 'bootstrap_admin'
+BOOTSTRAP_ADMIN_PASSWORD = 'beacon1234'
 
 def _current_role():
     return session.get('auth_role') or ('admin' if session.get('admin_logged') else None)
@@ -655,14 +612,16 @@ def _set_auth_session(username, role):
     session['police_logged'] = (role == 'police')
 
 
+
 def _safe_render(template, **ctx):
     try:
         return render_template_string(template, **ctx)
     except Exception as exc:
         app.logger.exception("Template render failed")
-        return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Beacon</title><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:860px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05)}a{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:10px;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class='card'><h1>Beacon</h1><p>The page loaded its core logic, but a template piece failed to render safely.</p><p><code>{{ exc }}</code></p><a href='{{ url_for("admin_login") }}'>Go to login</a></div></body></html>""", exc=str(exc))
+        return render_template_string("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Beacon</title><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:860px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05)}a{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:10px;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class='card'><h1>Beacon</h1><p>The page loaded its core logic, but a template piece failed to render safely.</p><p><code>{{ exc }}</code></p><a href='{{ url_for("admin_login") }}'>Go to login</a></div></body></html>""", exc=str(exc))
 
 def _pick_login_user(username):
+
     admin = Admin.query.filter_by(username=username).first()
     if admin:
         return admin, 'admin'
@@ -769,11 +728,6 @@ def _guard_web_pages():
     if path in public_paths or path.startswith(public_prefixes):
         return None
 
-    if _bootstrap_open():
-        if path.startswith(('/dashboard', '/friendly', '/police', '/admin', '/report', '/watch', '/all-vehicles', '/traffic')):
-            return redirect(url_for('admin_register'))
-        return None
-
     role = _current_role()
     if path.startswith(('/dashboard', '/friendly', '/admin', '/report', '/watch', '/traffic')):
         if role != 'admin':
@@ -785,6 +739,7 @@ def _guard_web_pages():
 
 # -------------------------
 # Authentication helpers
+
 # -------------------------
 from functools import wraps
 
@@ -1959,25 +1914,42 @@ DASHBOARD_HTML = """
 @app.route('/login', methods=['GET', 'POST'])
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
-    allow_register = _bootstrap_open()
     if request.method == 'GET':
-        return _safe_render(ADMIN_LOGIN_HTML, allow_register=allow_register)
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=False)
 
     username = (request.form.get('username') or '').strip()
     password = request.form.get('password') or ''
     if not username or not password:
         flash("Missing username or password")
-        return _safe_render(ADMIN_LOGIN_HTML, allow_register=allow_register), 400
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=False), 400
+
+    # Bootstrap login: lets you enter the app immediately on first use.
+    # The account is created on the fly if it does not already exist.
+    if username == BOOTSTRAP_ADMIN_USERNAME and password == BOOTSTRAP_ADMIN_PASSWORD:
+        try:
+            existing = Admin.query.filter_by(username=BOOTSTRAP_ADMIN_USERNAME).first()
+            if not existing:
+                existing = Admin(
+                    username=BOOTSTRAP_ADMIN_USERNAME,
+                    password_hash=generate_password_hash(BOOTSTRAP_ADMIN_PASSWORD),
+                )
+                db.session.add(existing)
+                db.session.commit()
+        except Exception:
+            db.session.rollback()
+        _set_auth_session(BOOTSTRAP_ADMIN_USERNAME, 'admin')
+        return redirect(url_for('dashboard'))
 
     user, role = _pick_login_user(username)
     if not user or not check_password_hash(user.password_hash, password):
         flash("Invalid credentials")
-        return _safe_render(ADMIN_LOGIN_HTML, allow_register=allow_register), 401
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=False), 401
 
     _set_auth_session(user.username, role)
     return _safe_login_redirect(role, request.args.get('next') or request.form.get('next'))
 
 @app.route('/logout')
+
 @app.route('/admin/logout')
 def admin_logout():
     session.pop('admin_logged', None)
@@ -1991,67 +1963,11 @@ def admin_logout():
 @app.route('/register', methods=['GET', 'POST'])
 @app.route('/admin/register', methods=['GET', 'POST'])
 def admin_register():
-    if not _bootstrap_open():
-        flash("Registration is closed. An existing admin must add more users.")
-        return redirect(url_for('admin_login'))
-
-    if request.method == 'GET':
-        return _safe_render("""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Register first admin</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
-    .card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05);}
-    label{display:block;margin-top:12px;font-weight:700;}
-    input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;}
-    button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-    .muted{color:#64748b;font-size:14px;line-height:1.5;}
-    .error{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px;border-radius:10px;margin-top:12px;}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Register first admin</h1>
-    <p class="muted">This only appears while the database has no admin account. After this, the register button disappears and only login stays public.</p>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        <div class="error">{{ messages[0] }}</div>
-      {% endif %}
-    {% endwith %}
-    <form method="post">
-      <label>Username</label>
-      <input name="username" required>
-      <label>Password</label>
-      <input name="password" type="password" required>
-      <label>Confirm password</label>
-      <input name="password2" type="password" required>
-      <button type="submit">Create first admin</button>
-    </form>
-  </div>
-</body>
-</html>
-""")
-    username = (request.form.get('username') or '').strip()
-    password = request.form.get('password') or ''
-    password2 = request.form.get('password2') or ''
-    if not username or not password:
-        flash("Username and password are required")
-        return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
-    if password != password2:
-        flash("Passwords do not match")
-        return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
-    user, err = _create_account(username, password, role='admin')
-    if err:
-        flash(err)
-        return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
-    flash("First admin created. Please log in.")
+    flash("Registration is disabled. Use the bootstrap login first, then add admins/police from inside the app.")
     return redirect(url_for('admin_login'))
 
 @app.route('/dashboard')
+
 def dashboard():
     if _current_role() != 'admin':
         return redirect(url_for('admin_login'))
@@ -2841,10 +2757,18 @@ def admin_admins():
       <div class="card">
         <h2>Admins</h2>
         <table>
-          <thead><tr><th>Username</th><th>Created</th></tr></thead>
+          <thead><tr><th>Username</th><th>Created</th><th>Action</th></tr></thead>
           <tbody>
           {% for a in admins %}
-            <tr><td>{{ a.username }}</td><td>{{ a.created_at.isoformat() if a.created_at else '' }}</td></tr>
+            <tr>
+              <td>{{ a.username }}</td>
+              <td>{{ a.created_at.isoformat() if a.created_at else '' }}</td>
+              <td>
+                <form method="post" action="{{ url_for('admin_delete_user', role='admin', user_id=a.id) }}" style="margin:0">
+                  <button type="submit" onclick="return confirm('Delete this admin?')">Delete</button>
+                </form>
+              </td>
+            </tr>
           {% endfor %}
           </tbody>
         </table>
@@ -2852,10 +2776,18 @@ def admin_admins():
       <div class="card">
         <h2>Police</h2>
         <table>
-          <thead><tr><th>Username</th><th>Created</th></tr></thead>
+          <thead><tr><th>Username</th><th>Created</th><th>Action</th></tr></thead>
           <tbody>
           {% for p in police_users %}
-            <tr><td>{{ p.username }}</td><td>{{ p.created_at.isoformat() if p.created_at else '' }}</td></tr>
+            <tr>
+              <td>{{ p.username }}</td>
+              <td>{{ p.created_at.isoformat() if p.created_at else '' }}</td>
+              <td>
+                <form method="post" action="{{ url_for('admin_delete_user', role='police', user_id=p.id) }}" style="margin:0">
+                  <button type="submit" onclick="return confirm('Delete this police user?')">Delete</button>
+                </form>
+              </td>
+            </tr>
           {% endfor %}
           </tbody>
         </table>
@@ -2866,6 +2798,38 @@ def admin_admins():
 </html>
 """, admins=admins, police_users=police_users)
 
+
+
+@app.route('/admin/users/delete/<role>/<int:user_id>', methods=['POST'])
+def admin_delete_user(role, user_id):
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
+
+    role = (role or '').strip().lower()
+    if role == 'admin':
+        user = Admin.query.get_or_404(user_id)
+        total_admins = Admin.query.count()
+        if total_admins <= 1:
+            flash("At least one admin must remain in the system.")
+            return redirect(url_for('admin_admins'))
+        # allow deleting the bootstrap admin too
+        db.session.delete(user)
+        db.session.commit()
+        if session.get('username') == user.username and session.get('auth_role') == 'admin':
+            session.clear()
+            flash("That admin was removed. Please log in again.")
+            return redirect(url_for('admin_login'))
+        flash("Admin removed")
+        return redirect(url_for('admin_admins'))
+
+    if role == 'police':
+        user = PoliceUser.query.get_or_404(user_id)
+        db.session.delete(user)
+        db.session.commit()
+        flash("Police user removed")
+        return redirect(url_for('admin_admins'))
+
+    abort(400)
 
 @app.route('/all-vehicles')
 def all_vehicles():
