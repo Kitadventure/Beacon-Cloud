@@ -612,22 +612,24 @@ def _bootstrap_state_row(create_if_missing=True):
         return None
 
 
-def _bootstrap_open():
-    # Allow first-time registration unless the bootstrap flag has explicitly been closed.
+def _has_admin_accounts():
     try:
-        row = _bootstrap_state_row(create_if_missing=False)
-        if row is None:
-            return True
-        value = (row.value or "1").strip().lower()
-        if value in {"0", "false", "closed", "off", "no"}:
-            return False
-        return True
+        return Admin.query.count() > 0
     except Exception:
-        # Fail open for fresh installs so the first admin can always be created.
+        return False
+
+
+def _bootstrap_open():
+    # Keep registration open only until the first admin exists.
+    try:
+        return not _has_admin_accounts()
+    except Exception:
         return True
 
 
 def _close_bootstrap():
+    # Kept for compatibility with older code paths, but the new bootstrap logic
+    # is driven directly by whether any admin exists.
     try:
         row = _bootstrap_state_row(create_if_missing=True)
         if row is not None:
@@ -636,6 +638,7 @@ def _close_bootstrap():
             db.session.commit()
     except Exception:
         db.session.rollback()
+
 
 
 def _current_role():
@@ -2045,7 +2048,6 @@ def admin_register():
     if err:
         flash(err)
         return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
-    _close_bootstrap()
     flash("First admin created. Please log in.")
     return redirect(url_for('admin_login'))
 
