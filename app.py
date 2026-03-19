@@ -1,3 +1,5 @@
+
+
 # app.py
 # Full file: keeps your original app logic intact, and adds:
 #  - Road model (name, speed limit, center lat/lon, radius)
@@ -168,6 +170,12 @@ class TrafficZone(db.Model):
     radius_m = db.Column(db.Float, nullable=True)
     notes = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class BootstrapState(db.Model):
+    key = db.Column(db.String(64), primary_key=True)
+    value = db.Column(db.String(64), nullable=False, default="1")
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # -------------------------
 # Simple in-memory rate tracking (per-device)
@@ -547,6 +555,11 @@ def detect_accident_for_device(device_id):
 def init_db():
     with app.app_context():
         db.create_all()
+        # ensure bootstrap state exists so the first admin can register even on a reused database
+        try:
+            _bootstrap_state_row(create_if_missing=True)
+        except Exception:
+            pass
         # create initial admin from env if provided and no admins exist
         try:
             if Admin.query.count() == 0 and ADMIN_USER and ADMIN_PASS:
@@ -554,6 +567,7 @@ def init_db():
                 a = Admin(username=ADMIN_USER, password_hash=h)
                 db.session.add(a)
                 db.session.commit()
+                _close_bootstrap()
                 app.logger.info("Admin user created from environment variable.")
         except Exception:
             pass
@@ -574,17 +588,59 @@ def index():
         return redirect(url_for('dashboard'))
     if role == 'police':
         return redirect(url_for('police_dashboard'))
+    if _bootstrap_open():
+        return redirect(url_for('admin_register'))
     return redirect(url_for('admin_login'))
 
 
 # -------------------------
 # Web auth helpers
 # -------------------------
+BOOTSTRAP_STATE_KEY = "registration_open"
+
+
+def _bootstrap_state_row(create_if_missing=True):
+    try:
+        row = db.session.get(BootstrapState, BOOTSTRAP_STATE_KEY)
+        if row is None and create_if_missing:
+            row = BootstrapState(key=BOOTSTRAP_STATE_KEY, value="1")
+            db.session.add(row)
+            db.session.commit()
+        return row
+    except Exception:
+        db.session.rollback()
+        return None
+
+
 def _bootstrap_open():
-    return Admin.query.count() == 0
+    # Allow first-time registration unless the bootstrap flag has explicitly been closed.
+    try:
+        row = _bootstrap_state_row(create_if_missing=False)
+        if row is None:
+            return True
+        value = (row.value or "1").strip().lower()
+        if value in {"0", "false", "closed", "off", "no"}:
+            return False
+        return True
+    except Exception:
+        # Fail open for fresh installs so the first admin can always be created.
+        return True
+
+
+def _close_bootstrap():
+    try:
+        row = _bootstrap_state_row(create_if_missing=True)
+        if row is not None:
+            row.value = "0"
+            db.session.add(row)
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+
 
 def _current_role():
     return session.get('auth_role') or ('admin' if session.get('admin_logged') else None)
+
 
 def _set_auth_session(username, role):
     session.clear()
@@ -594,6 +650,14 @@ def _set_auth_session(username, role):
     session['admin_logged'] = (role == 'admin')
     session['admin_user'] = username if role == 'admin' else None
     session['police_logged'] = (role == 'police')
+
+
+def _safe_render(template, **ctx):
+    try:
+        return render_template_string(template, **ctx)
+    except Exception as exc:
+        app.logger.exception("Template render failed")
+        return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Beacon</title><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:860px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05)}a{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:10px;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class='card'><h1>Beacon</h1><p>The page loaded its core logic, but a template piece failed to render safely.</p><p><code>{{ exc }}</code></p><a href='{{ url_for("admin_login") }}'>Go to login</a></div></body></html>""", exc=str(exc))
 
 def _pick_login_user(username):
     admin = Admin.query.filter_by(username=username).first()
@@ -1894,18 +1958,18 @@ DASHBOARD_HTML = """
 def admin_login():
     allow_register = _bootstrap_open()
     if request.method == 'GET':
-        return render_template_string(ADMIN_LOGIN_HTML, allow_register=allow_register)
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=allow_register)
 
     username = (request.form.get('username') or '').strip()
     password = request.form.get('password') or ''
     if not username or not password:
         flash("Missing username or password")
-        return render_template_string(ADMIN_LOGIN_HTML, allow_register=allow_register), 400
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=allow_register), 400
 
     user, role = _pick_login_user(username)
     if not user or not check_password_hash(user.password_hash, password):
         flash("Invalid credentials")
-        return render_template_string(ADMIN_LOGIN_HTML, allow_register=allow_register), 401
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=allow_register), 401
 
     _set_auth_session(user.username, role)
     return _safe_login_redirect(role, request.args.get('next') or request.form.get('next'))
@@ -1929,7 +1993,7 @@ def admin_register():
         return redirect(url_for('admin_login'))
 
     if request.method == 'GET':
-        return render_template_string("""
+        return _safe_render("""
 <!doctype html>
 <html>
 <head>
@@ -1973,14 +2037,15 @@ def admin_register():
     password2 = request.form.get('password2') or ''
     if not username or not password:
         flash("Username and password are required")
-        return render_template_string(ADMIN_LOGIN_HTML, allow_register=True), 400
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
     if password != password2:
         flash("Passwords do not match")
-        return render_template_string(ADMIN_LOGIN_HTML, allow_register=True), 400
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
     user, err = _create_account(username, password, role='admin')
     if err:
         flash(err)
-        return render_template_string(ADMIN_LOGIN_HTML, allow_register=True), 400
+        return _safe_render(ADMIN_LOGIN_HTML, allow_register=True), 400
+    _close_bootstrap()
     flash("First admin created. Please log in.")
     return redirect(url_for('admin_login'))
 
@@ -1988,14 +2053,14 @@ def admin_register():
 def dashboard():
     if _current_role() != 'admin':
         return redirect(url_for('admin_login'))
-    return render_template_string(DASHBOARD_HTML)
+    return _safe_render(DASHBOARD_HTML)
 
 # keep /friendly for compatibility
 @app.route('/friendly')
 def friendly():
     if _current_role() != 'admin':
         return redirect(url_for('admin_login'))
-    return render_template_string(DASHBOARD_HTML)
+    return _safe_render(DASHBOARD_HTML)
 
 @app.route('/admin/devices')
 def admin_devices():
@@ -2705,7 +2770,7 @@ def admin_admins():
 
     admins = Admin.query.order_by(Admin.created_at.asc()).all()
     police_users = PoliceUser.query.order_by(PoliceUser.created_at.asc()).all()
-    return render_template_string("""
+    return _safe_render("""
 <!doctype html>
 <html>
 <head>
@@ -2804,7 +2869,7 @@ def admin_admins():
 def all_vehicles():
     if _current_role() not in {'admin', 'police'}:
         return redirect(url_for('admin_login'))
-    return render_template_string("""
+    return _safe_render("""
 <!doctype html>
 <html>
 <head>
@@ -3192,7 +3257,7 @@ def admin_vehicles():
 def police_dashboard():
     if _current_role() not in {'admin', 'police'}:
         return redirect(url_for('admin_login'))
-    return render_template_string(POLICE_DASH_HTML)
+    return _safe_render(POLICE_DASH_HTML)
 # -------------------------
 # End of police/watch block
 # -------------------------
