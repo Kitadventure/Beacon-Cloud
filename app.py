@@ -581,6 +581,7 @@ def cleanup_old_snapshots():
 
 @app.route('/')
 def index():
+    # Presentation-friendly landing path.
     role = _current_role()
     if role == 'admin':
         return redirect(url_for('dashboard'))
