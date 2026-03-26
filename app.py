@@ -594,7 +594,7 @@ def index():
 # -------------------------
 # Hardcoded bootstrap admin for first access.
 BOOTSTRAP_ADMIN_USERNAME = 'bootstrap_admin'
-BOOTSTRAP_ADMIN_PASSWORD = 'beacon1234'
+BOOTSTRAP_ADMIN_PASSWORD = 'Beacon@2026!'
 
 def _current_role():
     return session.get('auth_role') or ('admin' if session.get('admin_logged') else None)
