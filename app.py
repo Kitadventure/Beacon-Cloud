@@ -1,3 +1,4 @@
+
 # app.py
 # Full file: keeps your original app logic intact, and adds:
 #  - Road model (name, speed limit, center lat/lon, radius)
@@ -29,6 +30,10 @@ from flask import (
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
+try:
+    from openpyxl import Workbook
+except Exception:
+    Workbook = None
 
 # New imports for reports & excel
 try:
@@ -671,23 +676,32 @@ def _zone_matches(zone, lat, lon):
     return haversine_m(lat, lon, zone.center_lat, zone.center_lon) <= float(zone.radius_m)
 
 def _traffic_snapshot(zone=None):
-    cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
-    snaps = Snapshot.query.filter(Snapshot.ts >= cutoff).order_by(Snapshot.ts.desc()).all()
+    # Use the latest known snapshot for each device, so registered vehicles still appear
+    # even when they have not sent a heartbeat in the last few seconds.
     latest = {}
-    for s in snaps:
-        if s.device_id not in latest:
-            latest[s.device_id] = s
+    for snap in Snapshot.query.order_by(Snapshot.ts.desc()).all():
+        if snap.device_id not in latest:
+            latest[snap.device_id] = snap
 
     vehicles = []
     counts = defaultdict(int)
-    for dev_id, snap in latest.items():
-        if zone and not _zone_matches(zone, snap.lat, snap.lon):
+    for d in Device.query.all():
+        snap = latest.get(d.id)
+        last_snapshot = {
+            "ts": snap.ts.isoformat() if snap and snap.ts else None,
+            "lat": snap.lat if snap else None,
+            "lon": snap.lon if snap else None,
+            "speed_mps": round(snap.speed_mps or 0.0, 3) if snap else None,
+            "bearing_deg": round(snap.bearing_deg or 0.0, 1) if snap else None,
+        }
+
+        if snap and zone and not _zone_matches(zone, snap.lat, snap.lon):
             continue
-        d = Device.query.get(dev_id)
-        if not d:
-            continue
+
         vehicle_type = _vehicle_type_label(d)
-        counts[vehicle_type] += 1
+        if snap:
+            counts[vehicle_type] += 1
+
         vehicles.append({
             "device_id": d.id,
             "owner": d.owner,
@@ -695,16 +709,28 @@ def _traffic_snapshot(zone=None):
             "car_model": d.car_model,
             "plate": d.plate,
             "vehicle_type": vehicle_type,
-            "last_snapshot": {
-                "ts": snap.ts.isoformat() if snap.ts else None,
-                "lat": snap.lat,
-                "lon": snap.lon,
-                "speed_mps": round(snap.speed_mps or 0.0, 3),
-                "bearing_deg": round(snap.bearing_deg or 0.0, 1),
-            }
+            "last_snapshot": last_snapshot,
         })
+
     vehicles.sort(key=lambda x: x.get("last_snapshot", {}).get("ts") or "", reverse=True)
     return vehicles, counts
+
+def _speeders_snapshot(min_speed_kmh=80.0, zone=None):
+    vehicles, _ = _traffic_snapshot(zone=zone)
+    speeders = []
+    for v in vehicles:
+        last = v.get("last_snapshot") or {}
+        spd = last.get("speed_mps")
+        if spd is None:
+            continue
+        speed_kmh = float(spd) * 3.6
+        if speed_kmh >= float(min_speed_kmh):
+            item = dict(v)
+            item["speed_kmh"] = round(speed_kmh, 1)
+            speeders.append(item)
+    speeders.sort(key=lambda x: x.get("speed_kmh", 0.0), reverse=True)
+    return speeders
+
 
 def _safe_login_redirect(role, next_path=None):
     if next_path and isinstance(next_path, str) and next_path.startswith('/'):
@@ -1435,6 +1461,7 @@ DASHBOARD_HTML = """
       <a href="{{ url_for('all_vehicles') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">All Vehicles</a>
       <a href="{{ url_for('admin_admins') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Users</a>
       <a href="{{ url_for('admin_traffic') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Traffic</a>
+      <a href="{{ url_for('admin_speeders') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Speeders</a>
       <span style="font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</span>
     </div>
   </header>
@@ -2184,12 +2211,97 @@ def admin_list_overspeeds():
         })
     return jsonify({"overspeeds": out})
 
+@app.route('/admin/speeders', methods=['GET'])
+def admin_speeders():
+    if _current_role() != 'admin':
+        return redirect(url_for('admin_login'))
+    min_kmh = float(request.args.get('min_kmh', 80))
+    zone_id = (request.args.get('zone_id') or '').strip()
+    zone = TrafficZone.query.filter_by(id=zone_id).first() if zone_id else None
+    speeders = _speeders_snapshot(min_speed_kmh=min_kmh, zone=zone)
+    zones = TrafficZone.query.order_by(TrafficZone.created_at.desc()).all()
+    return _safe_render("""
+<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8'>
+  <title>Speeders</title>
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <style>
+    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+    .wrap{max-width:1100px;margin:0 auto;}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
+    table{width:100%;border-collapse:collapse;}
+    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;}
+    input,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
+    button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+    .muted{color:#64748b;font-size:14px;line-height:1.5;}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
+  </style>
+</head>
+<body>
+  <div class='wrap'>
+    <div class='card'>
+      <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;'>
+        <div>
+          <h1 style='margin:0;'>Speeders</h1>
+          <div class='muted'>Vehicles whose latest speed is at or above the chosen threshold.</div>
+        </div>
+        <div>
+          <a href='{{ url_for("dashboard") }}'>Dashboard</a>
+          <a href='{{ url_for("all_vehicles") }}'>All Vehicles</a>
+          <a href='{{ url_for("admin_traffic") }}'>Traffic Search</a>
+          <a href='{{ url_for("admin_logout") }}'>Logout</a>
+        </div>
+      </div>
+    </div>
+
+    <div class='card'>
+      <form method='get'>
+        <label>Minimum speed (km/h)</label>
+        <input name='min_kmh' value='{{ min_kmh }}' />
+        <label>Saved zone (optional)</label>
+        <select name='zone_id'>
+          <option value=''>-- any area --</option>
+          {% for z in zones %}
+            <option value='{{ z.id }}' {% if zone and zone.id == z.id %}selected{% endif %}>{{ z.name }} ({{ z.scope }})</option>
+          {% endfor %}
+        </select>
+        <button type='submit'>Show speeders</button>
+      </form>
+    </div>
+
+    <div class='card'>
+      <h2 style='margin-top:0;'>{{ speeders|length }} vehicle(s)</h2>
+      <table>
+        <thead><tr><th>Plate</th><th>Owner</th><th>Vehicle</th><th>Speed</th><th>Last seen</th><th>Last location</th></tr></thead>
+        <tbody>
+        {% for v in speeders %}
+          <tr>
+            <td>{{ v.plate or '—' }}</td>
+            <td>{{ v.owner or '—' }}</td>
+            <td>{{ v.car_name or v.car_model or v.device_id }}</td>
+            <td>{{ '%.1f km/h'|format(v.speed_kmh) }}</td>
+            <td>{{ v.last_snapshot.ts or '—' }}</td>
+            <td>{{ v.last_snapshot.lat if v.last_snapshot.lat is not none else '—' }}, {{ v.last_snapshot.lon if v.last_snapshot.lon is not none else '—' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
+""", speeders=speeders, min_kmh=min_kmh, zone=zone, zones=zones)
+
 # -------------------------
 # Report generation utils (Excel & PDF)
 # -------------------------
 
 def generate_all_excel_bytes():
     """Create a simple workbook with devices, snapshots, roads, overspeeds."""
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required for Excel report generation")
     wb = Workbook()
 
     ws = wb.active
@@ -2235,6 +2347,8 @@ def generate_all_excel_bytes():
 
 
 def generate_road_excel_bytes(road_id):
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required for Excel report generation")
     wb = Workbook()
     road = Road.query.get_or_404(road_id)
 
@@ -3151,8 +3265,8 @@ def admin_traffic():
                 <td>{{ v.plate or '—' }}</td>
                 <td>{{ v.owner or '—' }}</td>
                 <td>{{ v.vehicle_type }}</td>
-                <td>{{ '%.1f km/h'|format(v.last_snapshot.speed_mps * 3.6) if v.last_snapshot.speed_mps is not none else '—' }}</td>
-                <td>{{ v.last_snapshot.lat }}, {{ v.last_snapshot.lon }}</td>
+                <td>{{ '%.1f km/h'|format(v.last_snapshot.speed_mps * 3.6) if v.last_snapshot and v.last_snapshot.speed_mps is not none else '—' }}</td>
+                <td>{{ v.last_snapshot.lat if v.last_snapshot and v.last_snapshot.lat is not none else '—' }}, {{ v.last_snapshot.lon if v.last_snapshot and v.last_snapshot.lon is not none else '—' }}</td>
               </tr>
             {% endfor %}
           </tbody>
