@@ -815,12 +815,20 @@ def restore_device_if_missing(device_id, token, payload=None):
     extra = None
     if payload:
         owner = payload.get("owner")
-        car_name = payload.get("car_name")
-        car_model = payload.get("car_model")
+        car_name = payload.get("car_name") or payload.get("vehicle_make") or payload.get("vehicle_type")
+        car_model = payload.get("car_model") or payload.get("vehicle_model_name") or payload.get("vehicle_category")
         plate = payload.get("plate")
         extra = payload.get("extra")
+        if extra is None:
+            extra = {}
+        if isinstance(extra, dict):
+            extra.setdefault("vehicle_make", payload.get("vehicle_make") or car_name)
+            extra.setdefault("vehicle_model_name", payload.get("vehicle_model_name") or car_model)
+            extra.setdefault("vehicle_type", payload.get("vehicle_type") or car_name)
+            extra.setdefault("vehicle_category", payload.get("vehicle_category") or car_model)
+            extra.setdefault("steering", payload.get("steering"))
     try:
-        d = Device(id=device_id, token=token, owner=owner, car_name=car_name, car_model=car_model, plate=plate, extra=(json.dumps(extra) if extra else None))
+        d = Device(id=device_id, token=token, owner=owner, car_name=car_name, car_model=car_model, plate=plate, extra=(json.dumps(extra) if extra is not None else None))
         db.session.add(d)
         db.session.commit()
         app.logger.info("Restored Device row for %s using token (auto-restore).", device_id)
@@ -973,11 +981,19 @@ def health():
 def onboard():
     payload = request.get_json(force=True, silent=True) or {}
     owner = payload.get("owner")
-    # prefer explicit vehicle_type/vehicle_category if provided (backwards compatible)
-    car_name = payload.get("car_name") or payload.get("vehicle_type")
-    car_model = payload.get("car_model") or payload.get("vehicle_category")
+    # prefer explicit vehicle fields if provided (backwards compatible)
+    car_name = payload.get("car_name") or payload.get("vehicle_make") or payload.get("vehicle_type")
+    car_model = payload.get("car_model") or payload.get("vehicle_model_name") or payload.get("vehicle_category")
     plate = payload.get("plate")
     extra = payload.get("extra")
+    if extra is None:
+        extra = {}
+    if isinstance(extra, dict):
+        extra.setdefault("vehicle_make", payload.get("vehicle_make") or car_name)
+        extra.setdefault("vehicle_model_name", payload.get("vehicle_model_name") or car_model)
+        extra.setdefault("vehicle_type", payload.get("vehicle_type") or car_name)
+        extra.setdefault("vehicle_category", payload.get("vehicle_category") or car_model)
+        extra.setdefault("steering", payload.get("steering"))
     device_id = uuid.uuid4().hex
     token = create_device_token()
     d = Device(
@@ -987,7 +1003,7 @@ def onboard():
         car_name=car_name,
         car_model=car_model,
         plate=plate,
-        extra=(json.dumps(extra) if extra else None)
+        extra=(json.dumps(extra) if extra is not None else None)
     )
     db.session.add(d)
     db.session.commit()
@@ -1337,12 +1353,12 @@ ADMIN_LOGIN_HTML = """
 <html>
 <head><meta charset="utf-8"><title>Beacon Login</title><meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
-.card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05);}
-input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
-button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-.muted{color:#64748b;font-size:14px;line-height:1.5;}
-.flash{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px;border-radius:10px;margin-top:12px;}
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
+.card{max-width:560px;margin:0 auto;background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.15);border-radius:24px;padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.28);backdrop-filter: blur(12px);} 
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(148,163,184,.18);border-radius:14px;margin-top:8px;background:#0b1324;color:#e5eefb;}
+button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800;cursor:pointer;}
+.muted{color:#94a3b8;font-size:14px;line-height:1.5;}
+.flash{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#fecaca;padding:12px;border-radius:14px;margin-top:12px;}
 .top{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;}
 </style>
 </head>
@@ -2229,14 +2245,14 @@ def admin_speeders():
   <title>Speeders</title>
   <meta name='viewport' content='width=device-width, initial-scale=1' />
   <style>
-    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
     .wrap{max-width:1100px;margin:0 auto;}
     .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
     table{width:100%;border-collapse:collapse;}
     td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;}
     input,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
     button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-    .muted{color:#64748b;font-size:14px;line-height:1.5;}
+    .muted{color:#94a3b8;font-size:14px;line-height:1.5;}
     .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
   </style>
 </head>
@@ -2735,7 +2751,7 @@ POLICE_DASH_HTML = """
 <!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Police Dashboard</title>
-<style>body{font-family: Arial, Helvetica, sans-serif; margin:0; padding:0;} #list{padding:12px;}</style>
+<style>body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;padding:0;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);color:#e5eefb;} #list{padding:12px;}</style>
 </head>
 <body>
   <h2 style="margin:12px 12px;">Police — Watch / Live Hits</h2>
@@ -2808,7 +2824,7 @@ def admin_admins():
   <title>User Management</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
+    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
     .wrap{max-width:980px;margin:0 auto;}
     .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
     table{width:100%;border-collapse:collapse;}
@@ -2954,32 +2970,54 @@ def all_vehicles():
   <meta charset="utf-8">
   <title>All Vehicles</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
-    :root{--bg:#f6f8fb;--card:#fff;--line:#e2e8f0;--muted:#64748b;--accent:#0b84ff;}
-    body{margin:0;font-family:Arial,sans-serif;background:var(--bg);}
-    header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:linear-gradient(90deg,#0b84ff,#00c6ff);color:#fff;}
-    header a{color:#fff;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;}
-    .wrap{display:grid;grid-template-columns:380px 1fr;gap:14px;padding:14px;height:calc(100vh - 76px);box-sizing:border-box;}
-    .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 8px 22px rgba(0,0,0,.05);overflow:auto;}
-    .searchbar{display:flex;gap:8px;flex-wrap:wrap;}
-    .searchbar input,.searchbar select,.searchbar button{padding:11px 12px;border-radius:12px;border:1px solid var(--line);font-size:14px;}
-    .searchbar input,.searchbar select{flex:1;}
-    .searchbar button{background:var(--accent);color:#fff;border:none;cursor:pointer;font-weight:700;flex:0 0 auto;}
-    #vehicleList{overflow:auto;flex:1;padding:10px 0;}
-    .vehicle{border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:10px;cursor:pointer;}
-    .vehicle.selected{border-color:#93c5fd;background:#eff6ff;}
-    .row{display:flex;justify-content:space-between;gap:10px;}
-    .big{font-weight:700;font-size:15px;}
-    .muted{color:var(--muted);font-size:13px;line-height:1.5;}
-    #map{height:100%;width:100%;}
-    .detail{padding:14px;border-top:1px solid var(--line);}
-    .badge{display:inline-block;margin-top:6px;padding:4px 9px;border-radius:999px;background:#e0f2fe;color:#075985;font-size:12px;font-weight:700;}
-    .stats{display:grid;grid-template-columns: repeat(3, 1fr);gap:8px;margin-top:10px;}
-    .stat{border:1px solid var(--line);border-radius:12px;padding:10px;}
-    .stat .k{color:var(--muted);font-size:12px;}
-    .stat .v{font-weight:700;margin-top:3px;}
-    @media (max-width: 920px) { .wrap{grid-template-columns:1fr;height:auto;} #map{height:58vh;} }
+    :root{
+      --bg:#0b1220; --panel:#101a2d; --line:rgba(148,163,184,.16); --muted:#94a3b8; --text:#e5eefb;
+      --accent:#8b5cf6; --accent2:#38bdf8; --good:#22c55e;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:
+      radial-gradient(circle at top left, rgba(139,92,246,.20), transparent 26%),
+      radial-gradient(circle at top right, rgba(56,189,248,.18), transparent 24%),
+      linear-gradient(180deg,#07111f 0%, #0b1220 100%);color:var(--text)}
+    header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:18px 20px;background:rgba(16,26,45,.88);backdrop-filter: blur(14px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+    header h1{margin:0;font-size:18px;letter-spacing:.2px}
+    header a{color:#fff;text-decoration:none;font-weight:800;background:linear-gradient(135deg,rgba(139,92,246,.95),rgba(56,189,248,.95));padding:9px 14px;border-radius:999px;box-shadow:0 10px 24px rgba(56,189,248,.15)}
+    header .hint{margin-left:auto;opacity:.9;font-size:13px;color:#dbeafe}
+    .wrap{display:grid;grid-template-columns:390px 1fr;gap:16px;padding:16px;height:calc(100vh - 78px);box-sizing:border-box}
+    .card{background:linear-gradient(180deg,rgba(16,26,45,.96),rgba(15,23,42,.96));border:1px solid var(--line);border-radius:24px;padding:16px;box-shadow:0 24px 64px rgba(0,0,0,.32);overflow:hidden}
+    .stack{display:flex;flex-direction:column;height:100%;gap:14px}
+    .searchbar{display:grid;grid-template-columns:1.1fr .7fr auto;gap:10px}
+    .searchbar input,.searchbar select,.searchbar button{padding:12px 14px;border-radius:14px;border:1px solid var(--line);font-size:14px;background:#0b1324;color:var(--text)}
+    .searchbar input::placeholder{color:#64748b}
+    .searchbar button{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;cursor:pointer;font-weight:800}
+    .statsGrid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+    .statCard{border:1px solid var(--line);background:rgba(255,255,255,.03);border-radius:18px;padding:12px}
+    .statCard .k{font-size:12px;color:var(--muted)}
+    .statCard .v{font-size:22px;font-weight:800;margin-top:4px}
+    #vehicleList{overflow:auto;flex:1;padding-right:4px}
+    .vehicle{border:1px solid var(--line);border-radius:18px;padding:14px;margin-bottom:10px;cursor:pointer;background:rgba(255,255,255,.03);transition:transform .15s ease, border-color .15s ease, background .15s ease}
+    .vehicle:hover{transform:translateY(-1px);border-color:rgba(56,189,248,.35)}
+    .vehicle.selected{border-color:rgba(34,197,94,.7);background:rgba(34,197,94,.08)}
+    .row{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+    .big{font-weight:800;font-size:15px}
+    .muted{color:var(--muted);font-size:13px;line-height:1.5}
+    .badge{display:inline-block;margin-top:8px;padding:5px 10px;border-radius:999px;background:rgba(56,189,248,.12);color:#7dd3fc;font-size:12px;font-weight:800;border:1px solid rgba(56,189,248,.24)}
+    .badge.live{background:rgba(34,197,94,.15);color:#86efac;border-color:rgba(34,197,94,.25)}
+    #map{height:100%;width:100%;border-radius:24px;overflow:hidden}
+    .detail{margin-top:auto;padding-top:14px;border-top:1px solid var(--line)}
+    .detailTop{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+    .detailTitle{font-size:20px;font-weight:800}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
+    .stat{border:1px solid var(--line);border-radius:16px;padding:12px;background:rgba(255,255,255,.03)}
+    .stat .k{color:var(--muted);font-size:12px}
+    .stat .v{font-weight:800;margin-top:4px;word-break:break-word}
+    .empty{padding:24px;border:1px dashed rgba(148,163,184,.35);border-radius:18px;text-align:center;color:var(--muted);margin-top:8px}
+    @media (max-width: 980px){ .wrap{grid-template-columns:1fr;height:auto} #map{height:58vh} .searchbar{grid-template-columns:1fr} .statsGrid,.stats{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -2989,25 +3027,42 @@ def all_vehicles():
     <a href="{{ url_for('admin_traffic') }}">Traffic Search</a>
     <a href="{{ url_for('admin_admins') }}">Users</a>
     <a href="{{ url_for('admin_logout') }}">Logout</a>
-    <span style="margin-left:auto;opacity:.95;">Search by plate or owner, then click a vehicle to jump to its position.</span>
+    <span class="hint">Search by plate, owner, make, model, or status. Vehicles with no beacon still stay visible.</span>
   </header>
 
   <div class="wrap">
-    <div class="card">
-      <div class="searchbar">
-        <input id="q" placeholder="Search by plate or owner..." />
-        <select id="field">
-          <option value="all">All</option>
-          <option value="plate">Plate</option>
-          <option value="owner">Owner</option>
-        </select>
-        <button id="btnSearch">Search</button>
+    <div class="card stack">
+      <div>
+        <div class="searchbar">
+          <input id="q" placeholder="Search by plate, owner, make, model..." />
+          <select id="field">
+            <option value="all">All</option>
+            <option value="plate">Plate</option>
+            <option value="owner">Owner</option>
+            <option value="model">Make / model</option>
+            <option value="status">Status</option>
+          </select>
+          <button id="btnSearch">Search</button>
+        </div>
+        <div class="statsGrid" style="margin-top:12px;">
+          <div class="statCard"><div class="k">Total</div><div class="v" id="statTotal">0</div></div>
+          <div class="statCard"><div class="k">Live</div><div class="v" id="statLive">0</div></div>
+          <div class="statCard"><div class="k">Offline</div><div class="v" id="statOffline">0</div></div>
+          <div class="statCard"><div class="k">With beacon</div><div class="v" id="statBeacon">0</div></div>
+        </div>
+        <div class="muted" id="count" style="margin-top:10px;">Loading vehicles…</div>
       </div>
-      <div class="muted" id="count" style="margin-top:8px;">Loading vehicles…</div>
+
       <div id="vehicleList"></div>
+
       <div class="detail" id="detailBox">
-        <div class="big" id="detailName">Select a vehicle</div>
-        <div class="muted" id="detailMeta">Its last beacon and location will appear here.</div>
+        <div class="detailTop">
+          <div>
+            <div class="detailTitle" id="detailName">Select a vehicle</div>
+            <div class="muted" id="detailMeta">Its last beacon and location will appear here.</div>
+          </div>
+          <span class="badge" id="detailStatus">—</span>
+        </div>
         <div class="stats">
           <div class="stat"><div class="k">Plate</div><div class="v" id="detailPlate">—</div></div>
           <div class="stat"><div class="k">Owner</div><div class="v" id="detailOwner">—</div></div>
@@ -3015,6 +3070,7 @@ def all_vehicles():
         </div>
       </div>
     </div>
+
     <div class="card"><div id="map"></div></div>
   </div>
 
@@ -3031,6 +3087,10 @@ def all_vehicles():
   const fieldEl = document.getElementById('field');
   const listEl = document.getElementById('vehicleList');
   const countEl = document.getElementById('count');
+  const statTotal = document.getElementById('statTotal');
+  const statLive = document.getElementById('statLive');
+  const statOffline = document.getElementById('statOffline');
+  const statBeacon = document.getElementById('statBeacon');
 
   function escapeHtml(s) {
     if (!s) return '';
@@ -3047,32 +3107,49 @@ def all_vehicles():
     }
     const data = await res.json();
     vehicles = data.vehicles || [];
-    countEl.innerText = `${vehicles.length} vehicle(s) shown`;
+    const total = data.count ?? vehicles.length;
+    const live = data.live ?? vehicles.filter(v => v.online).length;
+    const offline = Math.max(0, total - live);
+    const withBeacon = vehicles.filter(v => !!(v.last_snapshot && v.last_snapshot.ts)).length;
+    countEl.innerText = `${total} vehicle(s) shown`;
+    statTotal.innerText = total;
+    statLive.innerText = live;
+    statOffline.innerText = offline;
+    statBeacon.innerText = withBeacon;
     renderVehicles();
     if (vehicles.length && !selected) selectVehicle(vehicles[0].id);
     if (selected && !vehicles.some(v => v.id === selected)) selected = null;
   }
 
+  function vehicleLabel(v) {
+    return v.label || [v.make, v.model].filter(Boolean).join(' ').trim() || v.car_name || v.car_model || v.id;
+  }
+
   function renderVehicles() {
     listEl.innerHTML = '';
+    if (!vehicles.length) {
+      listEl.innerHTML = '<div class="empty">No vehicles match the current search.</div>';
+      return;
+    }
     for (const v of vehicles) {
       const div = document.createElement('div');
       div.className = 'vehicle' + (v.id === selected ? ' selected' : '');
       const last = v.last_snapshot || {};
       const when = last.ts ? new Date(last.ts).toLocaleString() : 'no beacon yet';
       const spd = (last.speed_mps != null) ? ((last.speed_mps * 3.6).toFixed(1) + ' km/h') : '—';
+      const status = v.online ? 'live' : 'offline';
       div.innerHTML = `
         <div class="row">
-          <div>
-            <div class="big">${escapeHtml(v.car_name || v.car_model || v.id)}</div>
-            <div class="muted">${escapeHtml(v.owner || '')}</div>
+          <div style="min-width:0;">
+            <div class="big">${escapeHtml(vehicleLabel(v))}</div>
+            <div class="muted">${escapeHtml(v.owner || 'No owner recorded')}</div>
           </div>
           <div style="text-align:right;">
             <div class="muted">${escapeHtml(v.plate || '—')}</div>
-            <div class="badge">${escapeHtml(v.connected ? 'live' : 'offline')}</div>
+            <div class="badge ${v.online ? 'live' : ''}">${escapeHtml(status)}</div>
           </div>
         </div>
-        <div class="muted" style="margin-top:8px;">Beacon: ${escapeHtml(when)} · ${escapeHtml(spd)}</div>
+        <div class="muted" style="margin-top:8px;">Beacon: ${escapeHtml(when)} · ${escapeHtml(spd)} · source: ${escapeHtml(v.source || 'none')}</div>
       `;
       div.addEventListener('click', () => selectVehicle(v.id));
       listEl.appendChild(div);
@@ -3085,18 +3162,19 @@ def all_vehicles():
     const v = vehicles.find(x => x.id === id);
     if (!v) return;
     const last = v.last_snapshot || {};
-    document.getElementById('detailName').innerText = v.car_name || v.car_model || v.id;
+    document.getElementById('detailName').innerText = vehicleLabel(v);
     document.getElementById('detailMeta').innerText = last.ts ? new Date(last.ts).toLocaleString() : 'No beacon yet';
     document.getElementById('detailPlate').innerText = v.plate || '—';
     document.getElementById('detailOwner').innerText = v.owner || '—';
     document.getElementById('detailSpeed').innerText = last.speed_mps != null ? ((last.speed_mps * 3.6).toFixed(1) + ' km/h') : '—';
+    document.getElementById('detailStatus').innerText = v.online ? 'LIVE' : 'OFFLINE';
 
     if (typeof last.lat === 'number' && typeof last.lon === 'number') {
       if (!marker) marker = L.marker([last.lat, last.lon]).addTo(map);
       else marker.setLatLng([last.lat, last.lon]);
       if (!circle) circle = L.circle([last.lat, last.lon], { radius: 25 }).addTo(map);
       else circle.setLatLng([last.lat, last.lon]);
-      marker.bindPopup(`<strong>${escapeHtml(v.car_name || v.id)}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
+      marker.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
       map.setView([last.lat, last.lon], 15, { animate:true });
     }
   }
@@ -3114,8 +3192,6 @@ def all_vehicles():
 </body>
 </html>
 """)
-
-
 @app.route('/admin/traffic', methods=['GET', 'POST'])
 def admin_traffic():
     if _current_role() != 'admin':
@@ -3150,12 +3226,25 @@ def admin_traffic():
         return redirect(url_for('admin_traffic', zone_id=zone.id))
 
     zone_id = (request.args.get('zone_id') or '').strip()
+    road_id = (request.args.get('road_id') or '').strip()
     zone = TrafficZone.query.filter_by(id=zone_id).first() if zone_id else None
     if not zone and (request.args.get('scope') or '').lower() == 'national':
         zone = TrafficZone(name='National Traffic', scope='national')
 
+    selected_road = Road.query.filter_by(id=road_id).first() if road_id else None
+    if not zone and selected_road:
+        zone = TrafficZone(
+            name=selected_road.name,
+            scope='road',
+            center_lat=selected_road.center_lat,
+            center_lon=selected_road.center_lon,
+            radius_m=selected_road.radius_m,
+            notes=f'Road preview: {selected_road.name}'
+        )
+
     vehicles, counts = _traffic_snapshot(zone)
     zones = TrafficZone.query.order_by(TrafficZone.created_at.desc()).all()
+    roads = Road.query.order_by(Road.created_at.desc()).all()
     return render_template_string("""
 <!doctype html>
 <html>
@@ -3163,50 +3252,78 @@ def admin_traffic():
   <meta charset="utf-8">
   <title>Traffic Search</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
-    body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:20px;}
-    .wrap{max-width:1200px;margin:0 auto;}
-    .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
-    .full{grid-column:1/-1;}
-    input,select,textarea{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
-    button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-    table{width:100%;border-collapse:collapse;}
-    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;}
-    .muted{color:#64748b;font-size:14px;line-height:1.5;}
-    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
+    :root{--bg:#08111f;--card:#0f172a;--line:rgba(148,163,184,.15);--muted:#94a3b8;--text:#e6eefc;--accent:#8b5cf6;--accent2:#38bdf8;--accent3:#22c55e;}
+    *{box-sizing:border-box}
+    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;background:radial-gradient(circle at top left, rgba(139,92,246,.22), transparent 28%),radial-gradient(circle at top right, rgba(56,189,248,.18), transparent 26%),linear-gradient(180deg,#050b14 0%, #08111f 100%);color:var(--text)}
+    .wrap{max-width:1340px;margin:0 auto;padding:18px}
+    .hero{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;background:linear-gradient(135deg,rgba(139,92,246,.16),rgba(56,189,248,.12));border:1px solid var(--line);border-radius:26px;padding:18px 20px;box-shadow:0 24px 64px rgba(0,0,0,.28)}
+    .hero h1{margin:0;font-size:28px}
+    .hero .muted{color:var(--muted);margin-top:6px;line-height:1.5}
+    .hero .actions a{display:inline-block;margin-left:8px;margin-top:8px;padding:10px 14px;border-radius:999px;background:rgba(255,255,255,.08);color:#fff;text-decoration:none;font-weight:800;border:1px solid var(--line)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+    .card{background:linear-gradient(180deg,rgba(16,28,49,.96),rgba(15,23,42,.96));border:1px solid var(--line);border-radius:24px;padding:16px;box-shadow:0 22px 50px rgba(0,0,0,.28)}
+    .full{grid-column:1/-1}
+    .sectionTitle{margin:0 0 12px;font-size:18px;font-weight:800}
+    .muted{color:var(--muted);font-size:13px;line-height:1.5}
+    input,select,textarea,button,a.linkBtn{width:100%;box-sizing:border-box;padding:12px 14px;border:1px solid var(--line);border-radius:14px;margin-top:8px;background:#0b1324;color:var(--text)}
+    button,a.linkBtn{display:inline-flex;justify-content:center;align-items:center;text-decoration:none;font-weight:800;cursor:pointer;border:none;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+    .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:rgba(56,189,248,.12);color:#d7f3ff;font-weight:800;margin:6px 6px 0 0;border:1px solid rgba(56,189,248,.18)}
+    .roadCard{border:1px solid var(--line);border-radius:18px;padding:14px;background:rgba(255,255,255,.03);margin-top:10px}
+    .roadTop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+    .roadName{font-weight:800;font-size:15px}
+    .roadMeta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.45}
+    .roadActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    .roadActions a,.roadActions button{width:auto;flex:1;min-width:120px;padding:10px 12px;border-radius:12px}
+    table{width:100%;border-collapse:collapse;margin-top:8px;background:rgba(255,255,255,.02);border-radius:18px;overflow:hidden}
+    td,th{padding:11px 10px;border-bottom:1px solid rgba(148,163,184,.12);text-align:left;font-size:13px;vertical-align:top}
+    th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#c7d2fe}
+    .tableWrap{overflow:auto;border:1px solid var(--line);border-radius:18px}
+    .summaryGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+    .summaryCard{border:1px solid var(--line);border-radius:18px;padding:12px;background:rgba(255,255,255,.03)}
+    .summaryCard .k{font-size:12px;color:var(--muted)}
+    .summaryCard .v{font-size:22px;font-weight:800;margin-top:4px}
+    @media (max-width: 980px){ .grid{grid-template-columns:1fr} .summaryGrid{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
-        <div>
-          <h1 style="margin:0;">Traffic Search</h1>
-          <div class="muted">Search traffic by county, constituency, region, road, or national view. Counts use the latest beacon from each vehicle.</div>
-        </div>
-        <div>
-          <a href="{{ url_for('dashboard') }}">Dashboard</a>
-          <a href="{{ url_for('all_vehicles') }}">All Vehicles</a>
-          <a href="{{ url_for('admin_admins') }}">Users</a>
-          <a href="{{ url_for('admin_logout') }}">Logout</a>
-        </div>
+    <div class="hero">
+      <div>
+        <h1>Traffic Search</h1>
+        <div class="muted">Search by zone, road, county, constituency, region, or national view. Created roads now appear directly under saved zones for quick operations.</div>
+      </div>
+      <div class="actions">
+        <a href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('all_vehicles') }}">All Vehicles</a>
+        <a href="{{ url_for('admin_admins') }}">Users</a>
+        <a href="{{ url_for('admin_logout') }}">Logout</a>
       </div>
     </div>
 
     {% with messages = get_flashed_messages() %}
-      {% if messages %}<div class="card" style="border-color:#bfdbfe;background:#eff6ff;">{{ messages[0] }}</div>{% endif %}
+      {% if messages %}<div class="card" style="margin-top:16px;border-color:rgba(34,197,94,.28);background:rgba(34,197,94,.06);">{{ messages[0] }}</div>{% endif %}
     {% endwith %}
 
     <div class="grid">
       <div class="card">
-        <h2 style="margin-top:0;">Search zone</h2>
+        <h2 class="sectionTitle">Search zone</h2>
         <form method="get">
           <label>Saved zone</label>
           <select name="zone_id">
             <option value="">-- pick a saved zone --</option>
             {% for z in zones %}
               <option value="{{ z.id }}" {% if zone and z.id == zone.id %}selected{% endif %}>{{ z.name }} ({{ z.scope }})</option>
+            {% endfor %}
+          </select>
+          <label>Saved road</label>
+          <select name="road_id">
+            <option value="">-- pick a created road --</option>
+            {% for r in roads %}
+              <option value="{{ r.id }}" {% if selected_road and r.id == selected_road.id %}selected{% endif %}>{{ r.name }} · {{ '%.1f km/h'|format(r.speed_limit_kmh) }}</option>
             {% endfor %}
           </select>
           <label>National view</label>
@@ -3218,10 +3335,10 @@ def admin_traffic():
         </form>
 
         <form method="post" style="margin-top:18px;">
-          <h3>Add / update zone</h3>
+          <h3 style="margin:4px 0 10px;">Add / update zone</h3>
           <input type="hidden" name="zone_id" value="{{ zone.id if zone else '' }}">
-          <label>Zone name</label>
-          <input name="name" placeholder="Nairobi County / Thika Road / Rift Valley" value="{{ zone.name if zone else '' }}">
+          <label>Name</label>
+          <input name="name" value="{{ zone.name if zone else '' }}" placeholder="e.g. Nairobi CBD">
           <label>Scope</label>
           <select name="scope">
             {% set scopes = ['county','constituency','region','road','national','custom'] %}
@@ -3242,44 +3359,82 @@ def admin_traffic():
       </div>
 
       <div class="card">
-        <h2 style="margin-top:0;">Summary</h2>
-        <div>
-          <span class="pill">Total {{ vehicles|length }}</span>
-          <span class="pill">Cars {{ counts.get('car', 0) }}</span>
-          <span class="pill">Trucks {{ counts.get('truck', 0) }}</span>
-          <span class="pill">Buses {{ counts.get('bus', 0) }}</span>
-          <span class="pill">Vans {{ counts.get('van', 0) }}</span>
-          <span class="pill">Motorcycles {{ counts.get('motorcycle', 0) }}</span>
-          <span class="pill">Pickups {{ counts.get('pickup', 0) }}</span>
-          <span class="pill">Taxis {{ counts.get('taxi', 0) }}</span>
+        <h2 class="sectionTitle">Created roads</h2>
+        <div class="muted">These are the roads you created in the road manager. Use them immediately for traffic search or convert them into a zone.</div>
+        <div style="margin-top:10px;">
+          {% for r in roads %}
+            <div class="roadCard">
+              <div class="roadTop">
+                <div>
+                  <div class="roadName">{{ r.name }}</div>
+                  <div class="roadMeta">Speed limit: {{ '%.1f km/h'|format(r.speed_limit_kmh) }} · Radius: {{ '%.0f m'|format(r.radius_m or 0) }} · {{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '' }}</div>
+                  <div class="roadMeta">Center: {{ '%.5f'|format(r.center_lat) if r.center_lat is not none else '—' }}, {{ '%.5f'|format(r.center_lon) if r.center_lon is not none else '—' }}</div>
+                </div>
+                <span class="pill">road</span>
+              </div>
+              <div class="roadActions">
+                <a class="linkBtn" href="{{ url_for('admin_traffic', road_id=r.id) }}">Use for search</a>
+                <button type="button" class="smallbtn" onclick="fillZoneFromRoad('{{ r.name|e }}', '{{ r.center_lat if r.center_lat is not none else '' }}', '{{ r.center_lon if r.center_lon is not none else '' }}', '{{ r.radius_m if r.radius_m is not none else '' }}')">Fill zone form</button>
+              </div>
+            </div>
+          {% endfor %}
+          {% if not roads %}
+            <div class="roadCard">No roads created yet.</div>
+          {% endif %}
         </div>
-        <p class="muted" style="margin-top:12px;">This count uses each vehicle’s latest beacon, so it does not conflict with the single-vehicle beacon view.</p>
       </div>
 
       <div class="card full">
-        <h2 style="margin-top:0;">Vehicles in this traffic area</h2>
-        <table>
-          <thead><tr><th>Plate</th><th>Owner</th><th>Type</th><th>Speed</th><th>Last position</th></tr></thead>
-          <tbody>
-            {% for v in vehicles %}
-              <tr>
-                <td>{{ v.plate or '—' }}</td>
-                <td>{{ v.owner or '—' }}</td>
-                <td>{{ v.vehicle_type }}</td>
-                <td>{{ '%.1f km/h'|format(v.last_snapshot.speed_mps * 3.6) if v.last_snapshot and v.last_snapshot.speed_mps is not none else '—' }}</td>
-                <td>{{ v.last_snapshot.lat if v.last_snapshot and v.last_snapshot.lat is not none else '—' }}, {{ v.last_snapshot.lon if v.last_snapshot and v.last_snapshot.lon is not none else '—' }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+        <div class="summaryGrid">
+          <div class="summaryCard"><div class="k">Total vehicles</div><div class="v">{{ vehicles|length }}</div></div>
+          <div class="summaryCard"><div class="k">Cars</div><div class="v">{{ counts.get('car', 0) }}</div></div>
+          <div class="summaryCard"><div class="k">Trucks</div><div class="v">{{ counts.get('truck', 0) }}</div></div>
+          <div class="summaryCard"><div class="k">Buses</div><div class="v">{{ counts.get('bus', 0) }}</div></div>
+          <div class="summaryCard"><div class="k">Vans</div><div class="v">{{ counts.get('van', 0) }}</div></div>
+          <div class="summaryCard"><div class="k">Motorcycles</div><div class="v">{{ counts.get('motorcycle', 0) }}</div></div>
+        </div>
+      </div>
+
+      <div class="card full">
+        <h2 class="sectionTitle">Vehicles in this traffic area</h2>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Plate</th><th>Vehicle</th><th>Owner</th><th>Type</th><th>Speed</th><th>Last position</th></tr></thead>
+            <tbody>
+              {% for v in vehicles %}
+                <tr>
+                  <td>{{ v.plate or '—' }}</td>
+                  <td>{{ v.label or v.car_name or v.car_model or v.device_id[:8] }}</td>
+                  <td>{{ v.owner or '—' }}</td>
+                  <td>{{ v.vehicle_type }}</td>
+                  <td>{{ '%.1f km/h'|format(v.last_snapshot.speed_mps * 3.6) if v.last_snapshot and v.last_snapshot.speed_mps is not none else '—' }}</td>
+                  <td>{{ v.last_snapshot.lat if v.last_snapshot and v.last_snapshot.lat is not none else '—' }}, {{ v.last_snapshot.lon if v.last_snapshot and v.last_snapshot.lon is not none else '—' }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
+  <script>
+    function fillZoneFromRoad(name, lat, lon, radius) {
+      const nameEl = document.querySelector('input[name="name"]');
+      const latEl = document.querySelector('input[name="center_lat"]');
+      const lonEl = document.querySelector('input[name="center_lon"]');
+      const radiusEl = document.querySelector('input[name="radius_m"]');
+      const scopeEl = document.querySelector('select[name="scope"]');
+      if (nameEl) nameEl.value = name || '';
+      if (latEl) latEl.value = lat || '';
+      if (lonEl) lonEl.value = lon || '';
+      if (radiusEl) radiusEl.value = radius || '';
+      if (scopeEl) scopeEl.value = 'road';
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  </script>
 </body>
 </html>
-""", zone=zone, zones=zones, vehicles=vehicles, counts=counts)
-
-
+""", zone=zone, zones=zones, vehicles=vehicles, counts=counts, roads=roads, selected_road=selected_road)
 @app.route('/admin/vehicles')
 def admin_vehicles():
     if _current_role() not in {'admin', 'police'}:
