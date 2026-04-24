@@ -165,6 +165,12 @@ class PoliceUser(db.Model):
     password_hash = db.Column(db.String(256), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class GKUser(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(128), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 class TrafficZone(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
     name = db.Column(db.String(256), nullable=False, index=True)
@@ -621,6 +627,8 @@ def index():
         return redirect(url_for('dashboard'))
     if role == 'police':
         return redirect(url_for('police_dashboard'))
+    if role == 'gk':
+        return redirect(url_for('gk_dashboard'))
     return redirect(url_for('admin_login'))
 
 
@@ -643,6 +651,7 @@ def _set_auth_session(username, role):
     session['admin_logged'] = (role == 'admin')
     session['admin_user'] = username if role == 'admin' else None
     session['police_logged'] = (role == 'police')
+    session['gk_logged'] = (role == 'gk')
 
 
 
@@ -661,6 +670,9 @@ def _pick_login_user(username):
     police = PoliceUser.query.filter_by(username=username).first()
     if police:
         return police, 'police'
+    gk = GKUser.query.filter_by(username=username).first()
+    if gk:
+        return gk, 'gk'
     return None, None
 
 def _create_account(username, password, role='admin'):
@@ -668,11 +680,17 @@ def _create_account(username, password, role='admin'):
     password = password or ''
     if not username or not password:
         return None, "Username and password are required"
-    if Admin.query.filter_by(username=username).first() or PoliceUser.query.filter_by(username=username).first():
+    if (
+        Admin.query.filter_by(username=username).first()
+        or PoliceUser.query.filter_by(username=username).first()
+        or GKUser.query.filter_by(username=username).first()
+    ):
         return None, "Username already exists"
     pw_hash = generate_password_hash(password)
     if role == 'police':
         obj = PoliceUser(username=username, password_hash=pw_hash)
+    elif role == 'gk':
+        obj = GKUser(username=username, password_hash=pw_hash)
     else:
         obj = Admin(username=username, password_hash=pw_hash)
     db.session.add(obj)
@@ -767,7 +785,15 @@ def _safe_login_redirect(role, next_path=None):
             return redirect(next_path)
         if role in {'admin', 'police'} and (next_path.startswith('/police') or next_path.startswith('/all-vehicles')):
             return redirect(next_path)
-    return redirect(url_for('dashboard' if role == 'admin' else 'police_dashboard'))
+        if role in {'admin', 'gk'} and (next_path.startswith('/GK') or next_path.startswith('/gk')):
+            return redirect(next_path)
+    if role == 'admin':
+        return redirect(url_for('dashboard'))
+    if role == 'police':
+        return redirect(url_for('police_dashboard'))
+    if role == 'gk':
+        return redirect(url_for('gk_dashboard'))
+    return redirect(url_for('admin_login'))
 
 @app.before_request
 def _guard_web_pages():
@@ -788,6 +814,9 @@ def _guard_web_pages():
             return redirect(url_for('admin_login', next=path))
     elif path.startswith(('/police', '/all-vehicles')):
         if role not in {'admin', 'police'}:
+            return redirect(url_for('admin_login', next=path))
+    elif path.startswith(('/GK', '/gk')):
+        if role not in {'admin', 'gk'}:
             return redirect(url_for('admin_login', next=path))
     return None
 
@@ -1409,7 +1438,7 @@ button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:99
       {% if allow_register %}
         <a href="{{ url_for('admin_register') }}">Register first admin</a>
       {% endif %}
-      <span class="muted">Admins open the dashboard. Police users open the police dashboard.</span>
+      <span class="muted">Admins open the dashboard. Police users open the police dashboard. GK users open /GK.</span>
     </div>
     {% if allow_register %}
       <p class="muted">This is the very first setup. Once the first admin exists, registration disappears.</p>
@@ -2026,6 +2055,7 @@ def admin_logout():
     session.pop('admin_logged', None)
     session.pop('admin_user', None)
     session.pop('police_logged', None)
+    session.pop('gk_logged', None)
     session.pop('auth_role', None)
     session.pop('username', None)
     session.pop('user_id', None)
@@ -2824,7 +2854,7 @@ def admin_admins():
         password = request.form.get('password') or ''
         password2 = request.form.get('password2') or ''
         role = (request.form.get('role') or 'admin').strip().lower()
-        if role not in {'admin', 'police'}:
+        if role not in {'admin', 'police', 'gk'}:
             role = 'admin'
         if not username or not password:
             flash("Username and password are required")
@@ -2844,6 +2874,10 @@ def admin_admins():
         police_users = PoliceUser.query.order_by(PoliceUser.created_at.asc()).all()
     except Exception:
         police_users = []
+    try:
+        gk_users = GKUser.query.order_by(GKUser.created_at.asc()).all()
+    except Exception:
+        gk_users = []
     return _safe_render("""
 <!doctype html>
 <html>
@@ -2882,13 +2916,14 @@ def admin_admins():
       {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
     {% endwith %}
     <div class="card">
-      <h2>Add admin or police</h2>
+      <h2>Add admin, police or GK</h2>
       <form method="post" class="grid">
         <div class="full">
           <label>Role</label>
           <select name="role">
             <option value="admin">Admin</option>
             <option value="police">Police</option>
+            <option value="gk">GK</option>
           </select>
         </div>
         <div>
@@ -2948,6 +2983,25 @@ def admin_admins():
           </tbody>
         </table>
       </div>
+      <div class="card">
+        <h2>GK</h2>
+        <table>
+          <thead><tr><th>Username</th><th>Created</th><th>Action</th></tr></thead>
+          <tbody>
+          {% for g in gk_users %}
+            <tr>
+              <td>{{ g.username }}</td>
+              <td>{{ g.created_at.isoformat() if g.created_at else '' }}</td>
+              <td>
+                <form method="post" action="{{ url_for('admin_delete_user', role='gk', user_id=g.id) }}" style="margin:0">
+                  <button type="submit" onclick="return confirm('Delete this GK user?')">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </body>
@@ -2983,6 +3037,13 @@ def admin_delete_user(role, user_id):
         db.session.delete(user)
         db.session.commit()
         flash("Police user removed")
+        return redirect(url_for('admin_admins'))
+
+    if role == 'gk':
+        user = GKUser.query.get_or_404(user_id)
+        db.session.delete(user)
+        db.session.commit()
+        flash("GK user removed")
         return redirect(url_for('admin_admins'))
 
     abort(400)
@@ -3519,6 +3580,58 @@ def police_dashboard():
     if _current_role() not in {'admin', 'police'}:
         return redirect(url_for('admin_login'))
     return _safe_render(POLICE_DASH_HTML)
+
+GK_LOGIN_HTML = '''
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>GK Login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;padding:24px;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);color:#e5eefb;}
+.card{max-width:560px;margin:0 auto;background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.15);border-radius:20px;padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.28);} 
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(148,163,184,.18);border-radius:14px;margin-top:8px;background:#0b1324;color:#e5eefb;}
+button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800;cursor:pointer;}
+.muted{color:#94a3b8;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>GK Auth</h1>
+    <p class="muted">Use a GK username and password to enter the GK area.</p>
+    <form method="post">
+      <label>Username</label>
+      <input name="username" required>
+      <label>Password</label>
+      <input name="password" type="password" required>
+      <button type="submit">Login</button>
+    </form>
+    <p class="muted" style="margin-top:12px;">Admins can also access this area, but GK accounts are the intended users.</p>
+  </div>
+</body>
+</html>
+'''
+
+@app.route('/GK', methods=['GET', 'POST'])
+@app.route('/gk', methods=['GET', 'POST'])
+def gk_dashboard():
+    if request.method == 'POST':
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+        if not username or not password:
+            flash('Missing username or password')
+            return _safe_render(GK_LOGIN_HTML), 400
+        user, role = _pick_login_user(username)
+        if not user or not check_password_hash(user.password_hash, password):
+            flash('Invalid credentials')
+            return _safe_render(GK_LOGIN_HTML), 401
+        if role not in {'gk', 'admin'}:
+            flash('This login is for GK users')
+            return _safe_render(GK_LOGIN_HTML), 403
+        _set_auth_session(user.username, 'gk' if role == 'gk' else 'admin')
+        return redirect(url_for('gk_dashboard'))
+    if _current_role() not in {'admin', 'gk'}:
+        return _safe_render(GK_LOGIN_HTML)
+    return _safe_render(GK_DASH_HTML)
 # -------------------------
 # End of police/watch block
 # -------------------------
