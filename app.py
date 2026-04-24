@@ -3435,8 +3435,8 @@ def admin_traffic():
 </body>
 </html>
 """, zone=zone, zones=zones, vehicles=vehicles, counts=counts, roads=roads, selected_road=selected_road)
-@app.route('/admin/vehicles')
-def admin_vehicles():
+@app.route('/admin/vehicles/raw')
+def admin_vehicles_raw():
     if _current_role() not in {'admin', 'police'}:
         return jsonify({"error": "Login required"}), 401
 
