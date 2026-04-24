@@ -56,17 +56,6 @@ except Exception:
 # Configuration (tunable)
 # -------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///beacon.db")
-# Render often provides DATABASE_URL; if the postgres driver is unavailable, boot with SQLite instead
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-if DATABASE_URL.startswith("postgresql"):
-    try:
-        import psycopg2  # noqa: F401
-    except Exception:
-        try:
-            import psycopg  # noqa: F401
-        except Exception:
-            DATABASE_URL = os.environ.get("SQLITE_FALLBACK_URL", "sqlite:///beacon.db")
 CLEANUP_STALE_SECONDS = int(os.environ.get("CLEANUP_STALE_SECONDS", "12"))  # remove snapshots older than this
 NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))  # 1 km default per your spec
 HEARTBEAT_MIN_INTERVAL_S = float(os.environ.get("HEARTBEAT_MIN_INTERVAL_S", "0.5"))  # basic rate-limit
@@ -176,6 +165,13 @@ class PoliceUser(db.Model):
     password_hash = db.Column(db.String(256), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class GKUser(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(128), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(256), nullable=False)
+    pin_hash = db.Column(db.String(256), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 class TrafficZone(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
     name = db.Column(db.String(256), nullable=False, index=True)
@@ -191,24 +187,6 @@ class BootstrapState(db.Model):
     key = db.Column(db.String(64), primary_key=True)
     value = db.Column(db.String(64), nullable=False, default="1")
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class GKUser(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(128), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    pin_hash = db.Column(db.String(256), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    created_by = db.Column(db.String(128))
-
-class AdminMessage(db.Model):
-    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
-    recipient_type = db.Column(db.String(32), default="all")  # all, device, plate
-    recipient_value = db.Column(db.String(128), nullable=True)
-    title = db.Column(db.String(256), nullable=False)
-    body = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    created_by = db.Column(db.String(128))
-    read_by = db.Column(db.Text, nullable=True)
 
 # -------------------------
 # Simple in-memory rate tracking (per-device)
@@ -586,27 +564,24 @@ def detect_accident_for_device(device_id):
 # DB helpers
 # -------------------------
 def init_db():
-    try:
-        with app.app_context():
-            db.create_all()
-            # ensure bootstrap state exists so the first admin can register even on a reused database
-            try:
-                _bootstrap_state_row(create_if_missing=True)
-            except Exception:
-                pass
-            # create initial admin from env if provided and no admins exist
-            try:
-                if Admin.query.count() == 0 and ADMIN_USER and ADMIN_PASS:
-                    h = generate_password_hash(ADMIN_PASS)
-                    a = Admin(username=ADMIN_USER, password_hash=h)
-                    db.session.add(a)
-                    db.session.commit()
-                    _close_bootstrap()
-                    app.logger.info("Admin user created from environment variable.")
-            except Exception:
-                db.session.rollback()
-    except Exception:
-        app.logger.exception("init_db failed; app will continue to boot.")
+    with app.app_context():
+        db.create_all()
+        # ensure bootstrap state exists so the first admin can register even on a reused database
+        try:
+            _bootstrap_state_row(create_if_missing=True)
+        except Exception:
+            pass
+        # create initial admin from env if provided and no admins exist
+        try:
+            if Admin.query.count() == 0 and ADMIN_USER and ADMIN_PASS:
+                h = generate_password_hash(ADMIN_PASS)
+                a = Admin(username=ADMIN_USER, password_hash=h)
+                db.session.add(a)
+                db.session.commit()
+                _close_bootstrap()
+                app.logger.info("Admin user created from environment variable.")
+        except Exception:
+            pass
 
 def create_device_token():
     return uuid.uuid4().hex
@@ -658,25 +633,32 @@ def _safe_render(template, **ctx):
         return render_template_string("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Beacon</title><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:860px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05)}a{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:10px;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class='card'><h1>Beacon</h1><p>The page loaded its core logic, but a template piece failed to render safely.</p><p><code>{{ exc }}</code></p><a href='{{ url_for("admin_login") }}'>Go to login</a></div></body></html>""", exc=str(exc))
 
 def _pick_login_user(username):
-
     admin = Admin.query.filter_by(username=username).first()
     if admin:
         return admin, 'admin'
     police = PoliceUser.query.filter_by(username=username).first()
     if police:
         return police, 'police'
+    gk = GKUser.query.filter_by(username=username).first()
+    if gk:
+        return gk, 'gk'
     return None, None
 
-def _create_account(username, password, role='admin'):
+def _create_account(username, password, role='admin', pin=None):
     username = (username or '').strip()
     password = password or ''
+    pin = (pin or '').strip()
     if not username or not password:
         return None, "Username and password are required"
-    if Admin.query.filter_by(username=username).first() or PoliceUser.query.filter_by(username=username).first():
+    if Admin.query.filter_by(username=username).first() or PoliceUser.query.filter_by(username=username).first() or GKUser.query.filter_by(username=username).first():
         return None, "Username already exists"
     pw_hash = generate_password_hash(password)
     if role == 'police':
         obj = PoliceUser(username=username, password_hash=pw_hash)
+    elif role == 'gk':
+        if not pin:
+            return None, "GK pin is required"
+        obj = GKUser(username=username, password_hash=pw_hash, pin_hash=generate_password_hash(pin))
     else:
         obj = Admin(username=username, password_hash=pw_hash)
     db.session.add(obj)
@@ -769,10 +751,8 @@ def _safe_login_redirect(role, next_path=None):
     if next_path and isinstance(next_path, str) and next_path.startswith('/'):
         if role == 'admin' and (next_path.startswith('/dashboard') or next_path.startswith('/friendly') or next_path.startswith('/admin/') or next_path.startswith('/report/') or next_path.startswith('/traffic')):
             return redirect(next_path)
-        if role in {'admin', 'police', 'gk'} and (next_path.startswith('/police') or next_path.startswith('/all-vehicles') or next_path.startswith('/GK')):
+        if role in {'admin', 'police'} and (next_path.startswith('/police') or next_path.startswith('/all-vehicles')):
             return redirect(next_path)
-    if role == 'gk':
-        return redirect(url_for('gk_dashboard'))
     return redirect(url_for('dashboard' if role == 'admin' else 'police_dashboard'))
 
 @app.before_request
@@ -782,7 +762,7 @@ def _guard_web_pages():
     public_paths = {
         '/', '/health', '/login', '/register',
         '/admin/login', '/admin/register',
-        '/logout', '/admin/logout', '/report'
+        '/logout', '/admin/logout',
     }
     public_prefixes = ('/static/', '/socket.io/', '/onboard', '/reconnect', '/heartbeat', '/nearby', '/ingest/')
     if path in public_paths or path.startswith(public_prefixes):
@@ -793,11 +773,8 @@ def _guard_web_pages():
         if role != 'admin':
             return redirect(url_for('admin_login', next=path))
     elif path.startswith(('/police', '/all-vehicles')):
-        if role not in {'admin', 'police', 'gk'}:
+        if role not in {'admin', 'police'}:
             return redirect(url_for('admin_login', next=path))
-    elif path.startswith('/GK'):
-        if role != 'gk':
-            return redirect(url_for('gk_login', next=path))
     return None
 
 # -------------------------
@@ -1233,8 +1210,8 @@ def nearby():
         except Exception:
             pass
         return jsonify(payload)
-    except Exception:
-        return redirect(url_for('report_chooser'))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 def compute_nearby_for_device(device_id, radius_m=NEARBY_DEFAULT_RADIUS_M):
     # obtain the latest snapshot for the device (or fallback to active_devices cache)
@@ -1515,8 +1492,6 @@ DASHBOARD_HTML = """
       <a href="{{ url_for('all_vehicles') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">All Vehicles</a>
       <a href="{{ url_for('admin_admins') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Users</a>
       <a href="{{ url_for('admin_traffic') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Traffic</a>
-      <a href="{{ url_for('admin_messages') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Messages</a>
-      <a href="{{ url_for('report_chooser') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Export</a>
       <a href="{{ url_for('admin_speeders') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Speeders</a>
       <span style="font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</span>
     </div>
@@ -1977,10 +1952,10 @@ DASHBOARD_HTML = """
   });
 
   btnExportAllXLSX.addEventListener('click', () => {
-    window.open('/report', '_blank');
+    window.open('/report/all.xlsx', '_blank');
   });
   btnExportAllPDF.addEventListener('click', () => {
-    window.open('/report', '_blank');
+    window.open('/report/all.pdf', '_blank');
   });
 
   // initial load for roads
@@ -2540,15 +2515,8 @@ def generate_road_pdf_bytes(road_id):
     return buffer.getvalue()
 
 # -------------------------
-# Report chooser + endpoints
+# Report endpoints
 # -------------------------
-@app.route('/report')
-def report_chooser():
-    if _current_role() != 'admin':
-        return redirect(url_for('admin_login'))
-    roads = Road.query.order_by(Road.created_at.desc()).all()
-    return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><title>Export Reports</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:840px;margin:auto;background:#fff;border-radius:16px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.08)}a,button{display:inline-block;padding:12px 16px;margin:6px 8px 0 0;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}.muted{color:#6b7280;font-size:13px}select{padding:10px;border-radius:10px;border:1px solid #dbe3ef;min-width:240px}</style></head><body><div class='card'><h2>Export Reports</h2><p class='muted'>Choose a format for the full export, or pick a road and export that one.</p><div><a href='{{ url_for("report_all_xlsx") }}'>Download XLSX</a><a href='{{ url_for("report_all_pdf") }}'>Download PDF</a></div><hr style='margin:16px 0;border:none;border-top:1px solid #e5e7eb'><h3>Per road</h3><form onsubmit="event.preventDefault(); window.open('/report/road/' + this.road.value + '.xlsx', '_blank');"><select name='road'>{% for r in roads %}<option value='{{ r.id }}'>{{ r.name }}</option>{% endfor %}</select><button type='submit'>Download XLSX</button><button type='button' onclick="window.open('/report/road/' + this.form.road.value + '.pdf', '_blank')">Download PDF</button></form></div></body></html>""", roads=roads)
-
 @app.route('/report/all.xlsx')
 def report_all_xlsx():
     try:
@@ -2559,8 +2527,8 @@ def report_all_xlsx():
     try:
         data = generate_all_excel_bytes()
         return send_file(io.BytesIO(data), download_name="beacon_full_report.xlsx", as_attachment=True, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception:
-        return redirect(url_for('report_chooser'))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/report/road/<road_id>.xlsx')
 def report_road_xlsx(road_id):
@@ -2573,8 +2541,8 @@ def report_road_xlsx(road_id):
         road = Road.query.get(road_id)
         name_safe = (road.name[:30].replace(" ", "_") if road else road_id)
         return send_file(io.BytesIO(data), download_name=f"road_{name_safe}_report.xlsx", as_attachment=True, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception:
-        return redirect(url_for('report_chooser'))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/report/all.pdf')
 def report_all_pdf():
@@ -2585,8 +2553,8 @@ def report_all_pdf():
     try:
         data = generate_all_pdf_bytes()
         return send_file(io.BytesIO(data), download_name="beacon_full_report.pdf", as_attachment=True, mimetype="application/pdf")
-    except Exception:
-        return redirect(url_for('report_chooser'))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/report/road/<road_id>.pdf')
 def report_road_pdf(road_id):
@@ -2599,8 +2567,8 @@ def report_road_pdf(road_id):
         road = Road.query.get(road_id)
         name_safe = (road.name[:30].replace(" ", "_") if road else road_id)
         return send_file(io.BytesIO(data), download_name=f"road_{name_safe}_report.pdf", as_attachment=True, mimetype="application/pdf")
-    except Exception:
-        return redirect(url_for('report_chooser'))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # -------------------------
 # Police / Watch features (drop-in)
@@ -2841,8 +2809,9 @@ def admin_admins():
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
         password2 = request.form.get('password2') or ''
+        pin = (request.form.get('pin') or '').strip()
         role = (request.form.get('role') or 'admin').strip().lower()
-        if role not in {'admin', 'police'}:
+        if role not in {'admin', 'police', 'gk'}:
             role = 'admin'
         if not username or not password:
             flash("Username and password are required")
@@ -2850,7 +2819,10 @@ def admin_admins():
         if password != password2:
             flash("Passwords do not match")
             return redirect(url_for('admin_admins'))
-        user, err = _create_account(username, password, role=role)
+        if role == 'gk' and _has_gk_users():
+            flash("GK can only be added once from this page. After that, add more GK users inside the GK portal.")
+            return redirect(url_for('admin_admins'))
+        user, err = _create_account(username, password, role=role, pin=pin)
         if err:
             flash(err)
             return redirect(url_for('admin_admins'))
@@ -2900,22 +2872,29 @@ def admin_admins():
       {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
     {% endwith %}
     <div class="card">
-      <h2>Add admin or police</h2>
+      <h2>Add accounts</h2>
       <form method="post" class="grid">
         <div class="full">
           <label>Role</label>
-          <select name="role">
+          <select name="role" id="roleSelect">
             <option value="admin">Admin</option>
             <option value="police">Police</option>
+            {% if not has_gk %}
+            <option value="gk">GK</option>
+            {% endif %}
           </select>
         </div>
         <div>
-          <label>Username</label>
+          <label>Name / Username</label>
           <input name="username" required>
         </div>
         <div>
           <label>Password</label>
           <input name="password" type="password" required>
+        </div>
+        <div class="full" id="gkPinWrap" style="display: {{ 'block' if not has_gk else 'none' }};">
+          <label>GK pin</label>
+          <input name="pin" type="password" placeholder="Only for GK accounts">
         </div>
         <div class="full">
           <label>Confirm password</label>
@@ -2925,7 +2904,7 @@ def admin_admins():
           <button type="submit">Create account</button>
         </div>
       </form>
-      <p class="muted">Registration stays closed to the public after the first admin. Only this page can add more accounts.</p>
+      <p class="muted">GK can be added here once. After that, GK accounts are managed inside the GK portal and do not appear in the admin/police list below.</p>
     </div>
     <div class="grid">
       <div class="card">
@@ -2968,55 +2947,23 @@ def admin_admins():
       </div>
     </div>
   </div>
+  <script>
+    const roleSelect = document.getElementById('roleSelect');
+    const gkPinWrap = document.getElementById('gkPinWrap');
+    function toggleGKPin(){
+      if(!roleSelect || !gkPinWrap) return;
+      gkPinWrap.style.display = roleSelect.value === 'gk' ? 'block' : 'none';
+    }
+    if(roleSelect){
+      roleSelect.addEventListener('change', toggleGKPin);
+      toggleGKPin();
+    }
+  </script>
 </body>
 </html>
-""", admins=admins, police_users=police_users)
+""", admins=admins, police_users=police_users, has_gk=_has_gk_users())
 
 
-
-
-@app.route('/admin/gk', methods=['GET', 'POST'])
-def admin_gk():
-    if _current_role() != 'admin':
-        return redirect(url_for('admin_login'))
-    if request.method == 'POST':
-        username = (request.form.get('username') or '').strip()
-        password = (request.form.get('password') or '').strip()
-        pin = (request.form.get('pin') or '').strip()
-        if not username or not password or not pin:
-            flash('GK username, password, and pin are required')
-            return redirect(url_for('admin_admins'))
-        if GKUser.query.filter_by(username=username).first():
-            flash('GK username already exists')
-            return redirect(url_for('admin_admins'))
-        gk = GKUser(username=username, password_hash=generate_password_hash(password), pin_hash=generate_password_hash(pin), created_by=session.get('username'))
-        db.session.add(gk)
-        db.session.commit()
-        flash('GK account created')
-        return redirect(url_for('admin_admins'))
-    gks = GKUser.query.order_by(GKUser.created_at.desc()).all()
-    return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><title>GK Accounts</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:900px;margin:auto;background:#fff;border-radius:16px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.08)}input{width:100%;padding:10px;margin:6px 0 12px;border:1px solid #dbe3ef;border-radius:10px}button,a{padding:10px 14px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;font-size:14px}.muted{color:#6b7280;font-size:13px}</style></head><body><div class='card'><h2>GK Accounts</h2><p class='muted'>Create a separate GK login with username, password, and PIN. GK accounts are not shown in the normal admin list.</p><form method='post'><label>GK Username</label><input name='username' required><label>GK Password</label><input name='password' type='password' required><label>GK PIN</label><input name='pin' type='password' required><button type='submit'>Add GK</button></form><table><tr><th>Username</th><th>Created At</th></tr>{% for g in gks %}<tr><td>{{ g.username }}</td><td>{{ g.created_at }}</td></tr>{% endfor %}</table><p style='margin-top:12px'><a href='{{ url_for("admin_admins") }}'>Back</a></p></div></body></html>""", gks=gks)
-
-@app.route('/GK', methods=['GET', 'POST'])
-def gk_login():
-    if request.method == 'GET':
-        return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><title>GK Login</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial,sans-serif;background:#06101c;color:#e5eefb;margin:0;padding:24px}.card{max-width:520px;margin:auto;background:#0f172a;border-radius:18px;padding:20px;box-shadow:0 18px 48px rgba(0,0,0,.3)}input{width:100%;padding:12px;margin:6px 0 12px;border:1px solid #243047;border-radius:12px;background:#0b1324;color:#e5eefb}button,a{padding:12px 16px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800}small{color:#94a3b8}</style></head><body><div class='card'><h2>GK Login</h2><form method='post'><label>Username</label><input name='username' required><label>Password</label><input type='password' name='password' required><label>PIN</label><input type='password' name='pin' required><button type='submit'>Enter GK</button></form><p><small>Authorized GK users only.</small></p></div></body></html>""")
-    username = (request.form.get('username') or '').strip()
-    password = request.form.get('password') or ''
-    pin = request.form.get('pin') or ''
-    gk = GKUser.query.filter_by(username=username).first()
-    if not gk or not check_password_hash(gk.password_hash, password) or not check_password_hash(gk.pin_hash, pin):
-        flash('Invalid GK credentials')
-        return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><title>GK Login</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial,sans-serif;background:#06101c;color:#e5eefb;margin:0;padding:24px}.card{max-width:520px;margin:auto;background:#0f172a;border-radius:18px;padding:20px}.flash{background:#3b0f17;color:#fecaca;padding:10px;border-radius:10px;margin-bottom:10px}input{width:100%;padding:12px;margin:6px 0 12px;border:1px solid #243047;border-radius:12px;background:#0b1324;color:#e5eefb}button,a{padding:12px 16px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800}</style></head><body><div class='card'><div class='flash'>Invalid GK credentials</div><form method='post'><input name='username' placeholder='Username' required><input type='password' name='password' placeholder='Password' required><input type='password' name='pin' placeholder='PIN' required><button type='submit'>Enter GK</button></form></div></body></html>""")
-    _set_auth_session(gk.username, 'gk')
-    return redirect(url_for('gk_dashboard'))
-
-@app.route('/GK/home')
-def gk_dashboard():
-    if _current_role() != 'gk':
-        return redirect(url_for('gk_login'))
-    vehicles, counts = _traffic_snapshot()
-    return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><title>GK</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:1000px;margin:auto;background:#fff;border-radius:16px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.08)}a,button{padding:10px 14px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.item{border:1px solid #e5e7eb;padding:12px;border-radius:12px;margin:8px 0}.muted{color:#6b7280;font-size:13px}</style></head><body><div class='card'><h2>GK Dashboard</h2><p class='muted'>Restricted GK view.</p><div class='grid'><div><h3>All Vehicles</h3>{% for v in vehicles %}<div class='item'><strong>{{ v.plate or v.car_name or v.device_id }}</strong><div class='muted'>{{ v.owner or '' }}</div></div>{% endfor %}</div><div><h3>Counts</h3><div class='item'>Cars: {{ counts.get('car',0) }}</div><div class='item'>Buses: {{ counts.get('bus',0) }}</div><div class='item'>Trucks: {{ counts.get('truck',0) }}</div></div></div><p style='margin-top:12px'><a href='{{ url_for("admin_logout") }}'>Logout</a></p></div></body></html>""", vehicles=vehicles, counts=counts)
 
 @app.route('/admin/users/delete/<role>/<int:user_id>', methods=['POST'])
 def admin_delete_user(role, user_id):
@@ -3527,14 +3474,13 @@ def admin_traffic():
 """, zone=zone, zones=zones, vehicles=vehicles, counts=counts, roads=roads, selected_road=selected_road)
 @app.route('/admin/vehicles')
 def admin_vehicles():
+    if _current_role() not in {'admin', 'police'}:
+        return jsonify({"error": "Login required"}), 401
+
     q = (request.args.get("q") or "").strip().lower()
     field = (request.args.get("field") or "all").strip().lower()
     devices = Device.query.all()
     out = []
-
-    latest = {}
-    for snap in Snapshot.query.order_by(Snapshot.ts.desc()).all():
-        latest.setdefault(snap.device_id, snap)
 
     for d in devices:
         hay_plate = (d.plate or "").lower()
@@ -3553,9 +3499,8 @@ def admin_vehicles():
         if not match:
             continue
 
-        snap = latest.get(d.id)
+        snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
         last = None
-        online = False
         if snap:
             last = {
                 "ts": snap.ts.isoformat() if snap.ts else None,
@@ -3564,24 +3509,19 @@ def admin_vehicles():
                 "speed_mps": round(snap.speed_mps or 0.0, 3),
                 "bearing_deg": round(snap.bearing_deg or 0.0, 1),
             }
-            online = True
 
         out.append({
             "id": d.id,
             "owner": d.owner,
-            "make": d.car_name,
-            "model": d.car_model,
             "car_name": d.car_name,
             "car_model": d.car_model,
             "plate": d.plate,
-            "online": online,
             "connected": bool(connected_sockets.get(d.id)),
             "last_snapshot": last,
         })
 
     out.sort(key=lambda item: item.get("last_snapshot", {}).get("ts") or "", reverse=True)
-    live = sum(1 for x in out if x.get('online'))
-    return jsonify({"vehicles": out, "count": len(out), "live": live})
+    return jsonify({"vehicles": out, "count": len(out)})
 
 @app.route('/police')
 def police_dashboard():
@@ -3606,26 +3546,6 @@ def admin_clear_alerts():
     require_admin_api()
     clear_alerts()
     return jsonify({"ok": True})
-
-@app.route('/admin/messages', methods=['GET', 'POST'])
-def admin_messages():
-    if _current_role() != 'admin':
-        return redirect(url_for('admin_login'))
-    if request.method == 'POST':
-        recipient_type = (request.form.get('recipient_type') or 'all').strip().lower()
-        recipient_value = (request.form.get('recipient_value') or '').strip() or None
-        title = (request.form.get('title') or '').strip()
-        body = (request.form.get('body') or '').strip()
-        if not title or not body:
-            flash('Title and message body are required')
-        else:
-            msg = AdminMessage(recipient_type=recipient_type, recipient_value=recipient_value, title=title, body=body, created_by=session.get('username'))
-            db.session.add(msg)
-            db.session.commit()
-            flash('Message saved')
-        return redirect(url_for('admin_messages'))
-    msgs = AdminMessage.query.order_by(AdminMessage.created_at.desc()).all()
-    return _safe_render("""<!doctype html><html><head><meta charset='utf-8'><title>Messages</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:980px;margin:auto;background:#fff;border-radius:16px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.08)}input,select,textarea{width:100%;padding:10px;margin:6px 0 12px;border:1px solid #dbe3ef;border-radius:10px;box-sizing:border-box}textarea{min-height:120px}button,a{padding:10px 14px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}.muted{color:#6b7280;font-size:13px}.msg{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:10px 0}</style></head><body><div class='card'><h2>Send Message</h2><p class='muted'>Send to all users, one vehicle, or one plate.</p><form method='post'><label>Recipient Type</label><select name='recipient_type'><option value='all'>All users</option><option value='device'>One device</option><option value='plate'>One plate</option></select><label>Recipient value (device id or plate, optional for all)</label><input name='recipient_value'><label>Title</label><input name='title' required><label>Message</label><textarea name='body' required></textarea><button type='submit'>Save Message</button></form><hr><h3>Saved messages</h3>{% for m in msgs %}<div class='msg'><strong>{{ m.title }}</strong><div class='muted'>{{ m.recipient_type }}{% if m.recipient_value %}: {{ m.recipient_value }}{% endif %} · {{ m.created_at }}</div><div>{{ m.body }}</div></div>{% endfor %}<p><a href='{{ url_for("dashboard") }}'>Back</a></p></div></body></html>""", msgs=msgs)
 
 @app.route('/admin/jams', methods=['GET'])
 def admin_list_jams():
@@ -3786,14 +3706,712 @@ def jam_detector_loop():
             app.logger.exception("jam_detector_loop error")
         time.sleep(JAM_DETECT_INTERVAL_S)
 
-
-@app.before_first_request
-def _ensure_db_on_first_request():
-    init_db()
+init_db()
 
 # -------------------------
 # CLI entry & startup hooks
 # -------------------------
+
+# -------------------------
+# GK security / messages / tighter notifications
+# -------------------------
+class GKGrant(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    username = db.Column(db.String(128), unique=True, nullable=False, index=True)
+    granted_by = db.Column(db.String(128))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class OverspeedNotice(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    device_id = db.Column(db.String(36), index=True, nullable=False)
+    road_id = db.Column(db.String(36), index=True, nullable=False)
+    last_sent_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+class UserMessage(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    target_device_id = db.Column(db.String(36), index=True)
+    target_plate = db.Column(db.String(64), index=True)
+    title = db.Column(db.String(160), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    created_by = db.Column(db.String(128))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    delivered_at = db.Column(db.DateTime, nullable=True)
+
+GK_ACCESS_PIN = os.environ.get('GK_ACCESS_PIN', 'GK-2026')
+GK_IDLE_REAUTH_SECONDS = int(os.environ.get('GK_IDLE_REAUTH_SECONDS', '600'))
+OVERSPEED_REPEAT_SECONDS = int(os.environ.get('OVERSPEED_REPEAT_SECONDS', '86400'))
+
+
+def _is_gk_allowed(username: str) -> bool:
+    username = (username or '').strip()
+    if not username:
+        return False
+    if username == BOOTSTRAP_ADMIN_USERNAME:
+        return True
+    try:
+        return GKGrant.query.filter_by(username=username).first() is not None
+    except Exception:
+        return False
+
+
+def _has_gk_users():
+    try:
+        return GKUser.query.count() > 0
+    except Exception:
+        return False
+
+
+def _require_gk_session():
+    if session.get('gk_logged') and session.get('gk_user'):
+        return True
+    abort(403, 'GK access required')
+
+
+def _vehicle_public_label(d):
+    raw = " ".join([str(d.car_name or ''), str(d.car_model or ''), str(d.extra or '')]).lower()
+    if 'range rover' in raw or 'rangerover' in raw:
+        return 'Range Rover'
+    if 'land cruiser' in raw:
+        return 'Toyota Land Cruiser'
+    if 'v8' in raw:
+        return 'Toyota V8'
+    if 'jeep' in raw:
+        return 'Jeep'
+    if 'toyota' in raw:
+        return 'Toyota'
+    if 'mercedes' in raw or 'benz' in raw:
+        return 'Mercedes-Benz'
+    if 'nissan' in raw:
+        return 'Nissan'
+    if 'mazda' in raw:
+        return 'Mazda'
+    if 'honda' in raw:
+        return 'Honda'
+    if 'bus' in raw:
+        return 'Bus'
+    if 'truck' in raw or 'lorry' in raw or 'hgv' in raw:
+        return 'Truck'
+    return _vehicle_type_label(d).title()
+
+
+def _masked_vehicle_payload(d, snap=None):
+    last = None
+    if snap:
+        last = {
+            'ts': snap.ts.isoformat() if snap.ts else None,
+            'lat': snap.lat,
+            'lon': snap.lon,
+            'speed_mps': round(snap.speed_mps or 0.0, 3),
+            'bearing_deg': round(snap.bearing_deg or 0.0, 1),
+        }
+    return {
+        'id': d.id,
+        'owner': d.owner,
+        'label': _vehicle_public_label(d),
+        'make': _vehicle_public_label(d),
+        'model': '',
+        'plate': d.plate,
+        'connected': bool(connected_sockets.get(d.id)),
+        'last_snapshot': last,
+    }
+
+
+def _full_vehicle_payload(d, snap=None):
+    data = _masked_vehicle_payload(d, snap=snap)
+    try:
+        extra = json.loads(d.extra) if d.extra else None
+    except Exception:
+        extra = d.extra
+    data.update({
+        'car_name': d.car_name,
+        'car_model': d.car_model,
+        'extra': extra,
+        'phone': getattr(d, 'phone_number', None),
+        'email': getattr(d, 'email', None),
+        'county': getattr(d, 'county', None),
+        'region': getattr(d, 'region', None),
+        'constituency': getattr(d, 'constituency', None),
+        'location': getattr(d, 'location', None),
+        'sublocation': getattr(d, 'sublocation', None),
+    })
+    return data
+
+
+def _send_user_message_to_device(device_id, title, body, created_by=None, target_plate=None):
+    try:
+        msg = UserMessage(
+            target_device_id=device_id,
+            target_plate=target_plate,
+            title=title[:160],
+            body=body,
+            created_by=created_by,
+        )
+        db.session.add(msg)
+        db.session.commit()
+        payload = {
+            'id': msg.id,
+            'title': msg.title,
+            'body': msg.body,
+            'ts': msg.created_at.isoformat() if msg.created_at else None,
+        }
+        send_ws_to_device(device_id, 'device_message', payload)
+        return True
+    except Exception:
+        db.session.rollback()
+        return False
+
+
+def _broadcast_message(title, body, created_by=None, target='all', device_id=None, plate=None):
+    devices = Device.query.filter_by(revoked=False).all()
+    sent = 0
+    for d in devices:
+        if target == 'device' and device_id and d.id != device_id:
+            continue
+        if target == 'plate' and plate and (d.plate or '').strip().lower() != plate.strip().lower():
+            continue
+        if _send_user_message_to_device(d.id, title, body, created_by=created_by, target_plate=d.plate):
+            sent += 1
+    return sent
+
+
+def _overspeed_notice_allowed(device_id, road_id):
+    now = datetime.utcnow()
+    window = now - timedelta(seconds=OVERSPEED_REPEAT_SECONDS)
+    row = OverspeedNotice.query.filter_by(device_id=device_id, road_id=road_id).first()
+    if not row:
+        row = OverspeedNotice(device_id=device_id, road_id=road_id, last_sent_at=now)
+        db.session.add(row)
+        db.session.commit()
+        return True
+    if not row.last_sent_at or row.last_sent_at < window:
+        row.last_sent_at = now
+        db.session.commit()
+        return True
+    return False
+
+
+def _render_gk_login(error=None):
+    return _safe_render(GK_LOGIN_HTML, error=error or '', pin_hint='GK access pin required')
+
+
+def _render_gk_dashboard():
+    admins = Admin.query.order_by(Admin.created_at.asc()).all()
+    gk_users = GKUser.query.order_by(GKUser.created_at.asc()).all()
+    return _safe_render(GK_DASH_HTML, admins=admins, gk_users=gk_users)
+
+
+GK_LOGIN_HTML = """
+<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>GK Access</title>
+<style>
+body{font-family:Inter,system-ui,Arial;margin:0;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);color:#e5eefb;padding:24px}
+.card{max-width:560px;margin:0 auto;background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.15);border-radius:22px;padding:22px;box-shadow:0 24px 64px rgba(0,0,0,.28)}
+input,button{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:12px;border:1px solid rgba(148,163,184,.2);margin-top:10px;background:#0b1324;color:#fff}
+button{background:linear-gradient(135deg,#8b5cf6,#38bdf8);font-weight:800;border:0}
+.small{color:#94a3b8;font-size:13px;line-height:1.5}
+.flash{margin-top:12px;padding:12px;border-radius:12px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#fecaca}
+</style></head><body>
+<div class='card'>
+  <h2>GK authentication</h2>
+  <p class='small'>Only granted administrators can enter this section.</p>
+  {% if error %}<div class='flash'>{{ error }}</div>{% endif %}
+  <form method='post'>
+    <label>Username</label>
+    <input name='username' required>
+    <label>Password</label>
+    <input name='password' type='password' required>
+    <label>GK pin</label>
+    <input name='pin' type='password' placeholder='{{ pin_hint }}' required>
+    <button type='submit'>Enter GK</button>
+  </form>
+  <p class='small'>Use the main dashboard first, then grant GK access to selected admins inside this section.</p>
+</div></body></html>
+"""
+
+GK_DASH_HTML = """
+<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>GK Control</title>
+<style>
+body{font-family:Inter,system-ui,Arial;margin:0;background:linear-gradient(180deg,#06101b 0%, #0b1220 100%);color:#e5eefb}
+header{padding:16px 20px;background:rgba(16,26,45,.96);display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid rgba(148,163,184,.15)}
+header a{color:#fff;text-decoration:none;background:linear-gradient(135deg,#8b5cf6,#38bdf8);padding:10px 14px;border-radius:999px;font-weight:800}
+.wrap{display:grid;grid-template-columns:360px 1fr;gap:14px;padding:14px}
+.card{background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.15);border-radius:20px;padding:16px;box-shadow:0 12px 32px rgba(0,0,0,.22)}
+input,select,textarea,button{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:12px;border:1px solid rgba(148,163,184,.18);margin-top:8px;background:#0b1324;color:#e5eefb}
+button{border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);font-weight:800;cursor:pointer}
+.small{color:#94a3b8;font-size:13px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.18);font-size:12px}
+table{width:100%;border-collapse:collapse;margin-top:10px}td,th{padding:8px;border-bottom:1px solid rgba(148,163,184,.12);text-align:left;font-size:13px}
+#map{height:68vh;border-radius:16px;overflow:hidden}
+@media (max-width: 960px){.wrap{grid-template-columns:1fr}#map{height:52vh}}
+</style></head>
+<body>
+<header>
+  <strong>GK Control</strong>
+  <a href='{{ url_for("dashboard") }}'>Friendly</a>
+  <a href='{{ url_for("all_vehicles") }}'>All vehicles</a>
+  <a href='{{ url_for("admin_traffic") }}'>Traffic</a>
+  <a href='{{ url_for("admin_logout") }}'>Logout</a>
+</header>
+<div class='wrap'>
+  <div class='card'>
+    <h3 style='margin-top:0'>Restricted actions</h3>
+    <form id='gkVehicleForm'>
+      <strong>Add vehicle</strong>
+      <input name='plate' placeholder='Plate' required>
+      <input name='owner' placeholder='Owner'>
+      <input name='car_name' placeholder='Sensitive label / car name'>
+      <input name='car_model' placeholder='Sensitive model'>
+      <input name='phone_number' placeholder='Phone number (optional)'>
+      <input name='email' placeholder='Email (optional)'>
+      <button type='submit'>Add vehicle</button>
+    </form>
+    <form id='grantForm' style='margin-top:16px'>
+      <strong>Add GK user</strong>
+      <input name='username' placeholder='GK name / username' required>
+      <input name='password' type='password' placeholder='Password' required>
+      <input name='pin' type='password' placeholder='GK pin' required>
+      <button type='submit'>Create GK</button>
+    </form>
+    <div style='margin-top:14px'>
+      <strong>Existing GK users</strong>
+      <table>
+        <thead><tr><th>Name</th><th>Created</th></tr></thead>
+        <tbody>
+          {% for g in gk_users %}
+          <tr><td>{{ g.username }}</td><td>{{ g.created_at.isoformat() if g.created_at else '' }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <form id='messageForm' style='margin-top:16px'>
+      <strong>Send message</strong>
+      <select name='target'>
+        <option value='all'>All users</option>
+        <option value='device'>One device id</option>
+        <option value='plate'>One plate</option>
+      </select>
+      <input name='device_id' placeholder='Device id (for one device)'>
+      <input name='plate' placeholder='Plate (for plate target)'>
+      <input name='title' placeholder='Title' required>
+      <textarea name='body' rows='4' placeholder='Message body' required></textarea>
+      <button type='submit'>Send</button>
+    </form>
+    <p class='small'>Messages go to the device when it is online and are also stored for review.</p>
+  </div>
+  <div class='card'>
+    <div class='row' style='margin-bottom:10px'>
+      <input id='searchBox' placeholder='Search all vehicles by plate, owner, or type'>
+      <button id='refreshBtn' style='max-width:160px'>Refresh</button>
+    </div>
+    <div id='map'></div>
+    <div id='list' style='margin-top:12px'></div>
+  </div>
+</div>
+<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+<script>
+const map = L.map('map').setView([-0.0236, 37.9062], 6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:18}).addTo(map);
+let markers = [];
+function clearMap(){markers.forEach(m=>map.removeLayer(m));markers=[];}
+async function loadGK(){
+  const q = document.getElementById('searchBox').value.trim();
+  const res = await fetch('/GK/vehicles?q='+encodeURIComponent(q));
+  const data = await res.json();
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  clearMap();
+  (data.vehicles || []).forEach(v => {
+    const d = v.last_snapshot || {};
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.marginTop = '10px';
+    card.innerHTML = `<div><strong>${v.plate || '—'}</strong> <span class='badge'>${v.label || 'Vehicle'}</span></div>
+      <div class='small'>${v.owner || 'No owner'} · ${v.phone || ''} ${v.email ? ' · ' + v.email : ''}</div>
+      <div class='small'>${d.ts || 'no beacon'} · ${(d.speed_mps != null ? (d.speed_mps*3.6).toFixed(1)+' km/h' : '—')}</div>`;
+    list.appendChild(card);
+    if (typeof d.lat === 'number' && typeof d.lon === 'number') {
+      const m = L.circleMarker([d.lat, d.lon], {radius:7}).addTo(map).bindPopup(v.plate || v.label || 'Vehicle');
+      markers.push(m);
+    }
+  });
+  if ((data.vehicles || []).length) {
+    const first = data.vehicles.find(v => v.last_snapshot && typeof v.last_snapshot.lat === 'number' && typeof v.last_snapshot.lon === 'number');
+    if (first) map.setView([first.last_snapshot.lat, first.last_snapshot.lon], 11);
+  }
+}
+document.getElementById('refreshBtn').onclick = (e)=>{e.preventDefault();loadGK();};
+document.getElementById('searchBox').addEventListener('input', ()=>{clearTimeout(window.__gkt);window.__gkt=setTimeout(loadGK,200);});
+document.getElementById('gkVehicleForm').addEventListener('submit', async (e)=>{e.preventDefault();const fd=new FormData(e.target);const body=Object.fromEntries(fd.entries());const r=await fetch('/GK/vehicles/new',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});alert((await r.json()).message || 'done');loadGK();});
+document.getElementById('grantForm').addEventListener('submit', async (e)=>{e.preventDefault();const fd=new FormData(e.target);const body=Object.fromEntries(fd.entries());const r=await fetch('/GK/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});alert((await r.json()).message || 'done');});
+document.getElementById('messageForm').addEventListener('submit', async (e)=>{e.preventDefault();const fd=new FormData(e.target);const body=Object.fromEntries(fd.entries());const r=await fetch('/admin/messages/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});alert((await r.json()).message || 'done');});
+loadGK();
+</script>
+</body></html>
+"""
+
+@app.route('/GK', methods=['GET', 'POST'])
+def gk_portal():
+    if request.method == 'POST':
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+        pin = request.form.get('pin') or ''
+        user, role = _pick_login_user(username)
+        if role != 'gk' or not user or not check_password_hash(user.password_hash, password):
+            return _render_gk_login('Invalid GK credentials')
+        if not check_password_hash(user.pin_hash, pin):
+            return _render_gk_login('Invalid GK pin')
+        session['gk_logged'] = True
+        session['gk_user'] = username
+        session['username'] = username
+        session['user_id'] = username
+        session['auth_role'] = 'gk'
+        session['admin_logged'] = False
+        return redirect(url_for('gk_portal'))
+
+    if _current_role() not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login', next='/GK'))
+    if not session.get('gk_logged') or session.get('gk_user') != session.get('username'):
+        return _render_gk_login()
+    return _render_gk_dashboard()
+
+@app.route('/GK/logout')
+def gk_logout():
+    session.pop('gk_logged', None)
+    session.pop('gk_user', None)
+    return redirect(url_for('admin_login'))
+
+@app.route('/GK/grant', methods=['POST'])
+def gk_grant():
+    if _current_role() not in {'admin', 'gk'} or not session.get('gk_logged'):
+        return jsonify({'error': 'GK access required'}), 403
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get('username') or '').strip()
+    password = payload.get('password') or ''
+    pin = payload.get('pin') or ''
+    if not username or not password or not pin:
+        return jsonify({'error': 'username, password and pin required'}), 400
+    user, err = _create_account(username, password, role='gk', pin=pin)
+    if err:
+        return jsonify({'error': err}), 400
+    return jsonify({'ok': True, 'message': f'GK account created for {username}'})
+
+@app.route('/GK/vehicles', methods=['GET'])
+def gk_vehicles():
+    if _current_role() != 'admin' or not session.get('gk_logged'):
+        return jsonify({'error': 'GK access required'}), 403
+    q = (request.args.get('q') or '').strip().lower()
+    devices = Device.query.all()
+    out = []
+    for d in devices:
+        if q:
+            hay = ' '.join([(d.plate or ''), (d.owner or ''), (d.car_name or ''), (d.car_model or ''), (d.extra or '')]).lower()
+            if q not in hay:
+                continue
+        snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
+        out.append(_full_vehicle_payload(d, snap=snap))
+    out.sort(key=lambda item: item.get('last_snapshot', {}).get('ts') or '', reverse=True)
+    return jsonify({'vehicles': out, 'count': len(out)})
+
+@app.route('/GK/vehicles/new', methods=['POST'])
+def gk_new_vehicle():
+    if _current_role() != 'admin' or not session.get('gk_logged'):
+        return jsonify({'error': 'GK access required'}), 403
+    payload = request.get_json(force=True, silent=True) or {}
+    plate = (payload.get('plate') or '').strip()
+    if not plate:
+        return jsonify({'error': 'plate required'}), 400
+    token = create_device_token()
+    device_id = uuid.uuid4().hex
+    extra = payload.get('extra') or {}
+    if not isinstance(extra, dict):
+        extra = {'raw_extra': str(extra)}
+    extra.setdefault('phone_number', payload.get('phone_number'))
+    extra.setdefault('email', payload.get('email'))
+    d = Device(
+        id=device_id,
+        token=token,
+        owner=payload.get('owner'),
+        car_name=payload.get('car_name'),
+        car_model=payload.get('car_model'),
+        plate=plate,
+        extra=json.dumps(extra),
+    )
+    db.session.add(d)
+    db.session.commit()
+    return jsonify({'ok': True, 'message': f'Vehicle added. Token: {token}', 'device_id': device_id, 'token': token})
+
+@app.route('/admin/messages/send', methods=['POST'])
+def admin_messages_send():
+    if _current_role() != 'admin':
+        return jsonify({'error': 'Admin required'}), 403
+    payload = request.get_json(force=True, silent=True) or {}
+    target = (payload.get('target') or 'all').strip().lower()
+    title = (payload.get('title') or '').strip()
+    body = (payload.get('body') or '').strip()
+    if not title or not body:
+        return jsonify({'error': 'title and body required'}), 400
+    sent = _broadcast_message(title, body, created_by=session.get('username'), target=target, device_id=payload.get('device_id'), plate=payload.get('plate'))
+    return jsonify({'ok': True, 'message': f'Message queued for {sent} device(s)'})
+
+@app.route('/admin/messages', methods=['GET'])
+def admin_messages_list():
+    if _current_role() != 'admin':
+        return jsonify({'error': 'Admin required'}), 403
+    rows = UserMessage.query.order_by(UserMessage.created_at.desc()).limit(200).all()
+    return jsonify({'messages': [
+        {'id': r.id, 'title': r.title, 'body': r.body, 'target_device_id': r.target_device_id, 'target_plate': r.target_plate, 'created_by': r.created_by, 'created_at': r.created_at.isoformat() if r.created_at else None}
+        for r in rows
+    ]})
+
+@app.route('/admin/vehicles')
+def admin_vehicles():
+    if _current_role() not in {'admin', 'police'}:
+        return jsonify({'error': 'Login required'}), 401
+    q = (request.args.get('q') or '').strip().lower()
+    field = (request.args.get('field') or 'all').strip().lower()
+    devices = Device.query.all()
+    out = []
+    for d in devices:
+        hay_plate = (d.plate or '').lower()
+        hay_owner = (d.owner or '').lower()
+        hay_name = ((d.car_name or '') + ' ' + (d.car_model or '')).lower()
+        match = True
+        if q:
+            if field == 'plate':
+                match = q in hay_plate
+            elif field == 'owner':
+                match = q in hay_owner
+            else:
+                match = (q in hay_plate) or (q in hay_owner) or (q in hay_name)
+        if not match:
+            continue
+        snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
+        out.append(_masked_vehicle_payload(d, snap=snap))
+    out.sort(key=lambda item: item.get('last_snapshot', {}).get('ts') or '', reverse=True)
+    return jsonify({'vehicles': out, 'count': len(out)})
+
+app.view_functions['admin_vehicles'] = admin_vehicles
+
+# Replace the original overspeed hook with a cooldown-aware version.
+def check_overspeed_for_snapshot(snap):
+    try:
+        try:
+            speed_kmh = float(snap.speed_mps) * 3.6
+        except Exception:
+            speed_kmh = 0.0
+        roads = Road.query.all()
+        if not roads:
+            return
+        for road in roads:
+            if road.center_lat is None or road.center_lon is None or road.radius_m is None:
+                continue
+            d = haversine_m(snap.lat, snap.lon, road.center_lat, road.center_lon)
+            if d > float(road.radius_m):
+                continue
+            if speed_kmh <= float(road.speed_limit_kmh):
+                continue
+            exists = OverspeedEvent.query.filter_by(snapshot_id=snap.id, road_id=road.id).first()
+            if exists:
+                continue
+            ev = OverspeedEvent(
+                device_id=snap.device_id,
+                road_id=road.id,
+                snapshot_id=snap.id,
+                ts=snap.ts,
+                speed_kmh=round(speed_kmh, 2),
+                lat=snap.lat,
+                lon=snap.lon,
+                raw=snap.raw,
+            )
+            db.session.add(ev)
+            try:
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            # resend only after cooldown so users do not get hammered every heartbeat
+            if _overspeed_notice_allowed(snap.device_id, road.id):
+                try:
+                    push_alert({
+                        'type': 'overspeed',
+                        'road_id': road.id,
+                        'road_name': road.name,
+                        'device_id': snap.device_id,
+                        'speed_kmh': round(speed_kmh, 2),
+                        'lat': snap.lat,
+                        'lon': snap.lon,
+                        'ts': snap.ts.isoformat(),
+                        'repeat_cooldown_s': OVERSPEED_REPEAT_SECONDS,
+                    })
+                except Exception:
+                    pass
+                try:
+                    send_ws_to_device(snap.device_id, 'overspeed_alert', {
+                        'road_id': road.id,
+                        'road_name': road.name,
+                        'speed_kmh': round(speed_kmh, 2),
+                        'ts': snap.ts.isoformat(),
+                        'lat': snap.lat,
+                        'lon': snap.lon,
+                    })
+                except Exception:
+                    pass
+    except Exception:
+        app.logger.exception('check_overspeed_for_snapshot error')
+
+# make sure first/bootstrapped admin gets GK access automatically when no grants exist yet
+try:
+    if GKGrant.query.count() == 0:
+        if Admin.query.filter_by(username=BOOTSTRAP_ADMIN_USERNAME).first():
+            db.session.add(GKGrant(username=BOOTSTRAP_ADMIN_USERNAME, granted_by='system'))
+            db.session.commit()
+except Exception:
+    try:
+        db.session.rollback()
+    except Exception:
+        pass
+
+
+
+# Filtered reporting helpers for day / month / year / geography
+try:
+    from openpyxl import Workbook as _XLSXWorkbook
+except Exception:
+    _XLSXWorkbook = None
+
+
+def _device_extra_json(device):
+    try:
+        return json.loads(device.extra) if device.extra else {}
+    except Exception:
+        return {}
+
+
+def _device_geo_match(device, args):
+    extra = _device_extra_json(device)
+    for key in ('county', 'region', 'constituency', 'location', 'sublocation'):
+        wanted = (args.get(key) or '').strip().lower()
+        if not wanted:
+            continue
+        got = str(extra.get(key) or getattr(device, key, '') or '').strip().lower()
+        if wanted not in got:
+            return False
+    return True
+
+
+def _snapshot_time_match(snap, period, date_str):
+    if not period and not date_str:
+        return True
+    if not snap.ts:
+        return False
+    period = (period or 'all').lower().strip()
+    if date_str:
+        try:
+            dt = datetime.fromisoformat(date_str)
+            if dt.date() != snap.ts.date():
+                return False
+        except Exception:
+            pass
+    if period == 'day':
+        return snap.ts.date() == datetime.utcnow().date()
+    if period == 'month':
+        now = datetime.utcnow()
+        return snap.ts.year == now.year and snap.ts.month == now.month
+    if period == 'year':
+        return snap.ts.year == datetime.utcnow().year
+    return True
+
+
+def _filtered_report_rows(args):
+    period = (args.get('period') or 'all').strip().lower()
+    date_str = (args.get('date') or '').strip()
+    county = (args.get('county') or '').strip().lower()
+    region = (args.get('region') or '').strip().lower()
+    constituency = (args.get('constituency') or '').strip().lower()
+    location = (args.get('location') or '').strip().lower()
+    sublocation = (args.get('sublocation') or '').strip().lower()
+    rows = []
+    for d in Device.query.all():
+        if county or region or constituency or location or sublocation:
+            extra = _device_extra_json(d)
+            hay = ' '.join([str(extra.get('county','')), str(extra.get('region','')), str(extra.get('constituency','')), str(extra.get('location','')), str(extra.get('sublocation',''))]).lower()
+            ok = True
+            for wanted in (county, region, constituency, location, sublocation):
+                if wanted and wanted not in hay:
+                    ok = False
+                    break
+            if not ok:
+                continue
+        snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
+        if snap and not _snapshot_time_match(snap, period, date_str):
+            continue
+        rows.append((d, snap))
+    return rows
+
+
+def report_all_xlsx():
+    require_admin_api()
+    if _XLSXWorkbook is None:
+        return jsonify({'error': 'openpyxl required'}), 500
+    wb = _XLSXWorkbook()
+    ws = wb.active
+    ws.title = 'vehicles'
+    ws.append(['id','plate','owner','label','phone','email','county','region','constituency','location','sublocation','last_ts','last_lat','last_lon','last_speed_kmh'])
+    for d, snap in _filtered_report_rows(request.args):
+        extra = _device_extra_json(d)
+        ws.append([
+            d.id, d.plate, d.owner, _vehicle_public_label(d),
+            extra.get('phone_number') or extra.get('phone'),
+            extra.get('email'), extra.get('county'), extra.get('region'), extra.get('constituency'), extra.get('location'), extra.get('sublocation'),
+            snap.ts.isoformat() if snap and snap.ts else '',
+            snap.lat if snap else '',
+            snap.lon if snap else '',
+            round((snap.speed_mps or 0.0) * 3.6, 2) if snap else '',
+        ])
+    ws2 = wb.create_sheet('snapshots')
+    ws2.append(['device_id','ts','lat','lon','speed_kmh','bearing_deg'])
+    for d, snap in _filtered_report_rows(request.args):
+        if not snap:
+            continue
+        ws2.append([d.id, snap.ts.isoformat() if snap.ts else '', snap.lat, snap.lon, round((snap.speed_mps or 0.0) * 3.6, 2), snap.bearing_deg])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, download_name='filtered_report.xlsx', as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+def report_all_pdf():
+    require_admin_api()
+    if not REPORTLAB_AVAILABLE:
+        return jsonify({'error': 'reportlab required'}), 500
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4))
+    styles = getSampleStyleSheet()
+    elems = [Paragraph('Filtered Vehicle Report', styles['Heading1']), Spacer(1, 12)]
+    data = [['Plate','Owner','Label','Last Seen','Speed km/h','County','Region','Constituency']]
+    for d, snap in _filtered_report_rows(request.args):
+        extra = _device_extra_json(d)
+        data.append([
+            d.plate or '', d.owner or '', _vehicle_public_label(d),
+            snap.ts.isoformat() if snap and snap.ts else '',
+            f"{((snap.speed_mps or 0.0) * 3.6):.1f}" if snap else '',
+            extra.get('county') or '', extra.get('region') or '', extra.get('constituency') or '',
+        ])
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.lightblue),('GRID',(0,0),(-1,-1),0.25,colors.grey)]))
+    elems.append(table)
+    doc.build(elems)
+    buffer.seek(0)
+    return send_file(buffer, download_name='filtered_report.pdf', as_attachment=True, mimetype='application/pdf')
+
+# point the existing route endpoints at these tighter versions
+app.view_functions['report_all_xlsx'] = report_all_xlsx
+app.view_functions['report_all_pdf'] = report_all_pdf
+
+
 if __name__ == "__main__":
     init_db()
     # start jam detector background thread
