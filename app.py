@@ -187,6 +187,25 @@ class BootstrapState(db.Model):
     value = db.Column(db.String(64), nullable=False, default="1")
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class BroadcastMessage(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    title = db.Column(db.String(255), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    target_type = db.Column(db.String(32), nullable=False)  # single/all/overspeeders/zone/road/county/search
+    target_value = db.Column(db.String(255))
+    creator_role = db.Column(db.String(32))
+    creator_username = db.Column(db.String(128))
+    recipient_count = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class BroadcastDelivery(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    message_id = db.Column(db.String(36), db.ForeignKey('broadcast_message.id'), index=True)
+    device_id = db.Column(db.String(36), db.ForeignKey('device.id'), index=True)
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    read_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 # -------------------------
 # Bootstrap state helpers
 # -------------------------
@@ -663,7 +682,6 @@ def _safe_render(template, **ctx):
         return render_template_string("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Beacon</title><style>body{font-family:Arial,sans-serif;background:#f6f8fb;margin:0;padding:24px}.card{max-width:860px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.05)}a{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:10px;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class='card'><h1>Beacon</h1><p>The page loaded its core logic, but a template piece failed to render safely.</p><p><code>{{ exc }}</code></p><a href='{{ url_for("admin_login") }}'>Go to login</a></div></body></html>""", exc=str(exc))
 
 def _pick_login_user(username):
-
     admin = Admin.query.filter_by(username=username).first()
     if admin:
         return admin, 'admin'
@@ -785,7 +803,7 @@ def _safe_login_redirect(role, next_path=None):
             return redirect(next_path)
         if role in {'admin', 'police'} and (next_path.startswith('/police') or next_path.startswith('/all-vehicles')):
             return redirect(next_path)
-        if role in {'admin', 'gk'} and (next_path.startswith('/GK') or next_path.startswith('/gk')):
+        if role == 'gk' and (next_path.startswith('/GK') or next_path.startswith('/gk')):
             return redirect(next_path)
     if role == 'admin':
         return redirect(url_for('dashboard'))
@@ -802,7 +820,8 @@ def _guard_web_pages():
     public_paths = {
         '/', '/health', '/login', '/register',
         '/admin/login', '/admin/register',
-        '/logout', '/admin/logout',
+        '/gk', '/GK', '/gk/login', '/GK/login',
+        '/logout', '/admin/logout', '/gk/logout', '/GK/logout',
     }
     public_prefixes = ('/static/', '/socket.io/', '/onboard', '/reconnect', '/heartbeat', '/nearby', '/ingest/')
     if path in public_paths or path.startswith(public_prefixes):
@@ -810,14 +829,17 @@ def _guard_web_pages():
 
     role = _current_role()
     if path.startswith(('/dashboard', '/friendly', '/admin', '/report', '/watch', '/traffic')):
-        if role != 'admin':
+        if path.startswith(('/admin/messages', '/admin/message/')):
+            if role not in {'admin', 'gk'}:
+                return redirect(url_for('gk_login', next=path))
+        elif role != 'admin':
             return redirect(url_for('admin_login', next=path))
     elif path.startswith(('/police', '/all-vehicles')):
         if role not in {'admin', 'police'}:
             return redirect(url_for('admin_login', next=path))
     elif path.startswith(('/GK', '/gk')):
         if role not in {'admin', 'gk'}:
-            return redirect(url_for('admin_login', next=path))
+            return redirect(url_for('gk_login', next=path))
     return None
 
 # -------------------------
@@ -1536,6 +1558,7 @@ DASHBOARD_HTML = """
       <a href="{{ url_for('admin_admins') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Users</a>
       <a href="{{ url_for('admin_traffic') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Traffic</a>
       <a href="{{ url_for('admin_speeders') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Speeders</a>
+      <a href="{{ url_for('admin_messages') }}" style="color:white;text-decoration:none;font-weight:700;background:rgba(255,255,255,.15);padding:8px 12px;border-radius:10px;">Messages</a>
       <span style="font-size:13px; opacity:0.95;">Auto-refresh every 5s — open this page on desktop or phone</span>
     </div>
   </header>
@@ -2064,8 +2087,38 @@ def admin_logout():
 @app.route('/register', methods=['GET', 'POST'])
 @app.route('/admin/register', methods=['GET', 'POST'])
 def admin_register():
-    flash("Registration is disabled. Use the bootstrap login first, then add admins/police from inside the app.")
+    flash("Registration is disabled. Use the bootstrap login first, then add admins/police/GK from inside the app.")
     return redirect(url_for('admin_login'))
+
+@app.route('/gk', methods=['GET', 'POST'])
+@app.route('/GK', methods=['GET', 'POST'])
+@app.route('/gk/login', methods=['GET', 'POST'])
+@app.route('/GK/login', methods=['GET', 'POST'])
+def gk_login():
+    if request.method == 'GET':
+        if _current_role() == 'gk':
+            return redirect(url_for('gk_dashboard'))
+        return _safe_render(GK_LOGIN_HTML, allow_register=False)
+
+    username = (request.form.get('username') or '').strip()
+    password = request.form.get('password') or ''
+    if not username or not password:
+        flash("Missing username or password")
+        return _safe_render(GK_LOGIN_HTML, allow_register=False), 400
+
+    user, role = _pick_login_user(username)
+    if role != 'gk' or not user or not check_password_hash(user.password_hash, password):
+        flash("Invalid GK credentials")
+        return _safe_render(GK_LOGIN_HTML, allow_register=False), 401
+
+    _set_auth_session(user.username, 'gk')
+    return redirect(url_for('gk_dashboard'))
+
+@app.route('/gk/logout')
+@app.route('/GK/logout')
+def gk_logout():
+    session.clear()
+    return redirect(url_for('gk_login'))
 
 @app.route('/dashboard')
 
@@ -2081,6 +2134,319 @@ def friendly():
         return redirect(url_for('admin_login'))
     return _safe_render(DASHBOARD_HTML)
 
+GK_LOGIN_HTML = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>GK Login</title><meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
+.card{max-width:560px;margin:0 auto;background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.15);border-radius:24px;padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.28);backdrop-filter: blur(12px);} 
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(148,163,184,.18);border-radius:14px;margin-top:8px;background:#0b1324;color:#e5eefb;}
+button,a{display:inline-block;margin-top:16px;padding:12px 16px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800;cursor:pointer;}
+.muted{color:#94a3b8;font-size:14px;line-height:1.5;}
+.flash{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#fecaca;padding:12px;border-radius:14px;margin-top:12px;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>GK Login</h2>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="flash">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+    <form method="post" action="{{ request.path }}">
+      <label>Username</label>
+      <input name="username" required>
+      <label>Password</label>
+      <input name="password" type="password" required>
+      <button type="submit">Login</button>
+    </form>
+    <p class="muted">GK users are created from Users & Access. After login, the GK panel opens here.</p>
+  </div>
+</body>
+</html>
+"""
+
+GK_DASHBOARD_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>GK Panel</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
+    .wrap{max-width:1100px;margin:0 auto;}
+    .card{background:#fff;color:#0f172a;border:1px solid #e2e8f0;border-radius:18px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
+    a,button{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+    input,textarea,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
+    table{width:100%;border-collapse:collapse;}
+    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top;}
+    .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:14px;}
+    .muted{color:#64748b;font-size:14px;}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
+    @media (max-width: 900px){ .grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+        <div>
+          <h1 style="margin:0;">GK Panel</h1>
+          <div class="muted">Send a message to one user, overspeeders, all users, or a zone/road.</div>
+        </div>
+        <div>
+          <a href="{{ url_for('gk_logout') }}">Logout</a>
+          <a href="{{ url_for('admin_messages') }}">Open Messages Center</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Quick send</h2>
+        <form method="post" action="{{ url_for('admin_messages') }}" id="quickSendForm">
+          <label>Title</label>
+          <input name="title" value="Attention" required>
+          <label>Message</label>
+          <textarea name="body" rows="5" placeholder="Type your text here..." required>Hi</textarea>
+          <input type="hidden" name="target_type" value="single">
+          <label>Device ID</label>
+          <input name="target_device_id" placeholder="Paste a device ID from search results">
+          <button type="submit">Send to one user</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Recent messages</h2>
+        {% if recent_messages %}
+          <table>
+            <thead><tr><th>Title</th><th>Target</th><th>Recipients</th></tr></thead>
+            <tbody>
+            {% for m in recent_messages %}
+              <tr>
+                <td>{{ m.title }}</td>
+                <td>{{ m.target_type }}</td>
+                <td>{{ m.recipient_count }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="muted">No messages have been sent yet.</div>
+        {% endif %}
+        <p class="muted" style="margin-top:12px;">Messages sent here are also pushed to devices live through the app socket and the device message endpoint.</p>
+      </div>
+    </div>
+  </div>
+  <script>
+  // The actual native pop-up delivery is done through the socket event and /device/messages on the app side.
+  </script>
+</body>
+</html>
+"""
+
+@app.route('/gk/dashboard')
+@app.route('/GK/dashboard')
+def gk_dashboard():
+    if _current_role() not in {'gk', 'admin'}:
+        return redirect(url_for('gk_login'))
+    recent_messages = BroadcastMessage.query.order_by(BroadcastMessage.created_at.desc()).limit(10).all()
+    return _safe_render(GK_DASHBOARD_HTML, recent_messages=recent_messages)
+
+MESSAGES_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Messages Center</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
+    .wrap{max-width:1400px;margin:0 auto;}
+    .card{background:#fff;color:#0f172a;border:1px solid #e2e8f0;border-radius:18px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
+    a,button{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
+    input,textarea,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
+    table{width:100%;border-collapse:collapse;}
+    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top;}
+    .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;}
+    .mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .muted{color:#64748b;font-size:14px;}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
+    .result{border:1px solid #e2e8f0;border-radius:12px;padding:10px;margin-top:10px;display:flex;justify-content:space-between;gap:10px;align-items:flex-start;}
+    .result small{color:#64748b;display:block;}
+    @media (max-width: 900px){ .grid,.mini-grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+        <div>
+          <h1 style="margin:0;">Messages Center</h1>
+          <div class="muted">Send one message to one user, overspeeders, a zone, a road, a county, or everyone.</div>
+        </div>
+        <div>
+          <a href="{{ url_for('dashboard') }}">Dashboard</a>
+          <a href="{{ url_for('admin_admins') }}">Users</a>
+          <a href="{{ url_for('admin_traffic') }}">Traffic</a>
+          <a href="{{ url_for('admin_speeders') }}">Speeders</a>
+          <a href="{{ url_for('admin_logout') }}">Logout</a>
+        </div>
+      </div>
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}<div class="pill">{{ messages[0] }}</div>{% endif %}
+      {% endwith %}
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Compose message</h2>
+        <form method="post" action="{{ url_for('admin_messages') }}">
+          <div class="mini-grid">
+            <div>
+              <label>Title</label>
+              <input name="title" required placeholder="Enter title">
+            </div>
+            <div>
+              <label>Target type</label>
+              <select name="target_type" id="target_type" onchange="toggleTargetFields()">
+                <option value="single">One user</option>
+                <option value="all">All users</option>
+                <option value="overspeeders">Overspeeders</option>
+                <option value="zone">Zone / region</option>
+                <option value="road">Road</option>
+                <option value="county">County / text match</option>
+                <option value="search">Search text</option>
+              </select>
+            </div>
+          </div>
+
+          <label>Message</label>
+          <textarea name="body" rows="5" required placeholder="Type your message here"></textarea>
+
+          <div id="field_single" style="margin-top:10px;">
+            <label>Target device ID</label>
+            <input name="target_device_id" id="target_device_id" placeholder="Use the search results on the right">
+          </div>
+          <div id="field_overspeeders" style="margin-top:10px;display:none;">
+            <label>Overspeed threshold (km/h)</label>
+            <input name="min_kmh" value="80">
+          </div>
+          <div id="field_zone" style="margin-top:10px;display:none;">
+            <label>Zone</label>
+            <select name="zone_id">
+              <option value="">Select zone</option>
+              {% for z in zones %}
+                <option value="{{ z.id }}">{{ z.name }} ({{ z.scope }})</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div id="field_road" style="margin-top:10px;display:none;">
+            <label>Road</label>
+            <select name="road_id">
+              <option value="">Select road</option>
+              {% for r in roads %}
+                <option value="{{ r.id }}">{{ r.name }} — {{ r.speed_limit_kmh }} km/h</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div id="field_county" style="margin-top:10px;display:none;">
+            <label>County / text match</label>
+            <input name="county" placeholder="e.g. Nairobi">
+          </div>
+          <div id="field_search" style="margin-top:10px;display:none;">
+            <label>Search text</label>
+            <input name="query" placeholder="plate, owner, make, model">
+          </div>
+
+          <button type="submit">Send message</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Search users</h2>
+        <input id="searchBox" placeholder="Search plate, owner, make, model..." oninput="searchDevices()">
+        <div class="muted" style="margin-top:8px;">Tap a result to copy its device ID into the message form.</div>
+        <div id="searchResults" style="margin-top:10px;max-height:520px;overflow:auto;"></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Recent messages</h2>
+        <table>
+          <thead><tr><th>Title</th><th>Target</th><th>Recipients</th><th>Created</th></tr></thead>
+          <tbody>
+          {% for m in recent_messages %}
+            <tr>
+              <td>{{ m.title }}</td>
+              <td>{{ m.target_type }} {% if m.target_value %}({{ m.target_value }}){% endif %}</td>
+              <td>{{ m.recipient_count }}</td>
+              <td>{{ m.created_at.isoformat() if m.created_at else '' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Quick targets</h2>
+        <div class="muted">One-click helper buttons</div>
+        <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;">
+          <button type="button" onclick="setTarget('all')">All users</button>
+          <button type="button" onclick="setTarget('overspeeders')">Overspeeders</button>
+          <button type="button" onclick="setTarget('zone')">Zone</button>
+          <button type="button" onclick="setTarget('road')">Road</button>
+          <button type="button" onclick="setTarget('county')">County</button>
+          <button type="button" onclick="setTarget('single')">One user</button>
+        </div>
+        <div class="muted" style="margin-top:12px;">The app can pop these up through the native message listener or the live socket event.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+function toggleTargetFields(){
+  const t = document.getElementById('target_type').value;
+  const ids = ['field_single','field_overspeeders','field_zone','field_road','field_county','field_search'];
+  ids.forEach(id => document.getElementById(id).style.display = 'none');
+  if (t === 'single') document.getElementById('field_single').style.display = 'block';
+  if (t === 'overspeeders') document.getElementById('field_overspeeders').style.display = 'block';
+  if (t === 'zone') document.getElementById('field_zone').style.display = 'block';
+  if (t === 'road') document.getElementById('field_road').style.display = 'block';
+  if (t === 'county') document.getElementById('field_county').style.display = 'block';
+  if (t === 'search') document.getElementById('field_search').style.display = 'block';
+}
+function setTarget(v){
+  document.getElementById('target_type').value = v;
+  toggleTargetFields();
+}
+async function searchDevices(){
+  const q = document.getElementById('searchBox').value.trim();
+  const res = await fetch('/admin/message/search-devices?q=' + encodeURIComponent(q), {cache:'no-store'});
+  const j = await res.json();
+  const box = document.getElementById('searchResults');
+  const devices = j.devices || [];
+  if (!devices.length){ box.innerHTML = '<div class="muted" style="padding:10px;">No devices found.</div>'; return; }
+  box.innerHTML = devices.map(d => {
+    const line1 = [d.owner, d.car_name, d.car_model, d.plate].filter(Boolean).join(' • ');
+    const line2 = [d.speed_kmh ? d.speed_kmh + ' km/h' : '', d.ts || ''].filter(Boolean).join(' • ');
+    return `<div class="result"><div><strong>${line1 || d.id}</strong><small>${line2}</small><small>${d.id}</small></div><div><button type="button" onclick="pickDevice('${d.id}')">Use</button></div></div>`;
+  }).join('');
+}
+function pickDevice(id){
+  document.getElementById('target_type').value = 'single';
+  toggleTargetFields();
+  document.getElementById('target_device_id').value = id;
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+toggleTargetFields();
+searchDevices();
+</script>
+</body>
+</html>
+"""
 @app.route('/admin/devices')
 def admin_devices():
     if _current_role() != 'admin':
@@ -2198,8 +2564,270 @@ def admin_device_revoke(device_id):
     return jsonify({"ok": True, "revoked": True})
 
 # -------------------------
-# New admin endpoints for roads & overspeeds (requires admin session or ADMIN_API_TOKEN)
+# Messaging helpers / routes
 # -------------------------
+
+def _latest_snapshots_map():
+    latest = {}
+    for snap in Snapshot.query.order_by(Snapshot.ts.desc()).all():
+        if snap.device_id not in latest:
+            latest[snap.device_id] = snap
+    return latest
+
+
+def _device_blob(device):
+    extra_obj = None
+    if device.extra:
+        try:
+            extra_obj = json.loads(device.extra)
+        except Exception:
+            extra_obj = device.extra
+    return {
+        'id': device.id,
+        'token': device.token,
+        'owner': device.owner,
+        'car_name': device.car_name,
+        'car_model': device.car_model,
+        'plate': device.plate,
+        'extra': extra_obj,
+    }
+
+
+def _device_text_match(device, q):
+    if not q:
+        return True
+    q = q.lower().strip()
+    hay = ' '.join([
+        str(device.id or ''), str(device.owner or ''), str(device.car_name or ''),
+        str(device.car_model or ''), str(device.plate or ''), str(device.extra or '')
+    ]).lower()
+    return q in hay
+
+
+def _target_devices_for_message(body):
+    latest = _latest_snapshots_map()
+    target_type = (body.get('target_type') or 'single').strip().lower()
+    target_value = (body.get('target_value') or '').strip()
+    recipients = []
+
+    devices = Device.query.filter_by(revoked=False).all()
+    if target_type == 'all':
+        recipients = devices
+    elif target_type == 'single':
+        did = (body.get('target_device_id') or target_value or '').strip()
+        if did:
+            d = Device.query.filter_by(id=did, revoked=False).first()
+            recipients = [d] if d else []
+    elif target_type == 'overspeeders':
+        min_kmh = float(body.get('min_kmh') or 80.0)
+        recipients = []
+        for d in devices:
+            snap = latest.get(d.id)
+            if snap and (float(snap.speed_mps or 0.0) * 3.6) >= min_kmh:
+                recipients.append(d)
+    elif target_type == 'road':
+        road_id = (body.get('road_id') or target_value or '').strip()
+        road = Road.query.get(road_id) if road_id else None
+        if road and road.center_lat is not None and road.center_lon is not None and road.radius_m is not None:
+            for d in devices:
+                snap = latest.get(d.id)
+                if snap and haversine_m(snap.lat, snap.lon, road.center_lat, road.center_lon) <= float(road.radius_m):
+                    recipients.append(d)
+    elif target_type == 'zone':
+        zone_id = (body.get('zone_id') or target_value or '').strip()
+        zone = TrafficZone.query.get(zone_id) if zone_id else None
+        if zone:
+            for d in devices:
+                snap = latest.get(d.id)
+                if snap and _zone_matches(zone, snap.lat, snap.lon):
+                    recipients.append(d)
+    elif target_type == 'county':
+        county = (body.get('county') or target_value or '').strip().lower()
+        if county:
+            for d in devices:
+                if county in ' '.join([str(d.owner or ''), str(d.car_name or ''), str(d.car_model or ''), str(d.plate or ''), str(d.extra or '')]).lower():
+                    recipients.append(d)
+    elif target_type == 'search':
+        q = (body.get('query') or target_value or '').strip()
+        recipients = [d for d in devices if _device_text_match(d, q)]
+    else:
+        recipients = []
+
+    seen = set()
+    out = []
+    for d in recipients:
+        if not d or d.id in seen:
+            continue
+        seen.add(d.id)
+        out.append(d)
+    return out
+
+
+def _serialize_message(msg, recipient_count=None):
+    return {
+        'id': msg.id,
+        'title': msg.title,
+        'body': msg.body,
+        'target_type': msg.target_type,
+        'target_value': msg.target_value,
+        'creator_role': msg.creator_role,
+        'creator_username': msg.creator_username,
+        'recipient_count': recipient_count if recipient_count is not None else msg.recipient_count,
+        'created_at': msg.created_at.isoformat() if msg.created_at else None,
+    }
+
+
+def _pending_messages_for_device(device_id, mark_delivered=True):
+    rows = (
+        db.session.query(BroadcastDelivery, BroadcastMessage)
+        .join(BroadcastMessage, BroadcastMessage.id == BroadcastDelivery.message_id)
+        .filter(BroadcastDelivery.device_id == device_id)
+        .filter(BroadcastDelivery.delivered_at.is_(None))
+        .order_by(BroadcastMessage.created_at.asc())
+        .all()
+    )
+    messages = []
+    now = datetime.utcnow()
+    for delivery, msg in rows:
+        messages.append(_serialize_message(msg))
+        if mark_delivered:
+            delivery.delivered_at = now
+    if mark_delivered and rows:
+        db.session.commit()
+    return messages
+
+
+def _create_message_and_dispatch(body):
+    title = (body.get('title') or '').strip()
+    message_body = (body.get('body') or body.get('message') or '').strip()
+    if not title or not message_body:
+        return None, 'title and body are required'
+
+    recipients = _target_devices_for_message(body)
+    msg = BroadcastMessage(
+        title=title,
+        body=message_body,
+        target_type=(body.get('target_type') or 'single').strip().lower(),
+        target_value=(body.get('target_value') or body.get('target_device_id') or body.get('zone_id') or body.get('road_id') or body.get('county') or body.get('query') or ''),
+        creator_role=_current_role() or 'admin',
+        creator_username=session.get('username') or session.get('admin_user') or '' ,
+        recipient_count=len(recipients),
+    )
+    db.session.add(msg)
+    db.session.commit()
+
+    now = datetime.utcnow()
+    for d in recipients:
+        db.session.add(BroadcastDelivery(message_id=msg.id, device_id=d.id, delivered_at=None, read_at=None))
+    db.session.commit()
+
+    payload = _serialize_message(msg, recipient_count=len(recipients))
+    payload['device_ids'] = [d.id for d in recipients]
+    payload['app_action'] = 'popup'
+
+    for d in recipients:
+        try:
+            send_ws_to_device(d.id, 'admin_message', payload)
+        except Exception:
+            pass
+    return payload, None
+
+
+@app.route('/admin/messages', methods=['GET', 'POST'])
+def admin_messages():
+    role = _current_role()
+    if role not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login'))
+
+    if request.method == 'POST':
+        body = request.form.to_dict(flat=True)
+        if not body.get('title') and request.is_json:
+            body = request.get_json(force=True, silent=True) or {}
+        payload, err = _create_message_and_dispatch(body)
+        if err:
+            flash(err)
+        else:
+            flash(f"Message sent to {payload.get('recipient_count', 0)} device(s)")
+        if request.is_json:
+            if err:
+                return jsonify({'error': err}), 400
+            return jsonify({'ok': True, 'message': payload})
+        return redirect(url_for('admin_messages'))
+
+    latest = _latest_snapshots_map()
+    devices = Device.query.filter_by(revoked=False).order_by(Device.created_at.desc()).all()
+    speeders = []
+    for d in devices:
+        snap = latest.get(d.id)
+        if snap and (float(snap.speed_mps or 0.0) * 3.6) >= 80:
+            speeders.append(d)
+    roads = Road.query.order_by(Road.created_at.desc()).all()
+    zones = TrafficZone.query.order_by(TrafficZone.created_at.desc()).all()
+    recent_messages = BroadcastMessage.query.order_by(BroadcastMessage.created_at.desc()).limit(20).all()
+    return _safe_render(MESSAGES_HTML, devices=devices, speeders=speeders, roads=roads, zones=zones, recent_messages=recent_messages)
+
+
+@app.route('/admin/message/search-devices')
+def admin_message_search_devices():
+    role = _current_role()
+    if role not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login'))
+    q = (request.args.get('q') or '').strip().lower()
+    devices = Device.query.filter_by(revoked=False).order_by(Device.created_at.desc()).all()
+    latest = _latest_snapshots_map()
+    out = []
+    for d in devices:
+        if q and q not in ' '.join([str(d.id or ''), str(d.owner or ''), str(d.car_name or ''), str(d.car_model or ''), str(d.plate or ''), str(d.extra or '')]).lower():
+            continue
+        snap = latest.get(d.id)
+        out.append({
+            'id': d.id,
+            'owner': d.owner,
+            'car_name': d.car_name,
+            'car_model': d.car_model,
+            'plate': d.plate,
+            'extra': d.extra,
+            'speed_kmh': round(float(snap.speed_mps or 0.0) * 3.6, 1) if snap else None,
+            'ts': snap.ts.isoformat() if snap and snap.ts else None,
+        })
+        if len(out) >= 50:
+            break
+    return jsonify({'devices': out})
+
+
+@app.route('/device/messages', methods=['GET'])
+def device_messages():
+    body = request.get_json(silent=True) or {}
+    device = find_or_restore_from_request(body)
+    if not device:
+        try:
+            device = require_auth_token()
+        except Exception:
+            return jsonify({'error': 'Missing or invalid token'}), 401
+    messages = _pending_messages_for_device(device.id, mark_delivered=True)
+    return jsonify({'ok': True, 'messages': messages})
+
+
+@app.route('/admin/message/send', methods=['POST'])
+def admin_message_send():
+    role = _current_role()
+    if role not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login'))
+    body = request.get_json(force=True, silent=True) or request.form.to_dict(flat=True)
+    payload, err = _create_message_and_dispatch(body)
+    if err:
+        return jsonify({'error': err}), 400
+    return jsonify({'ok': True, 'message': payload})
+
+
+@app.route('/admin/messages/html-snippet')
+def admin_messages_html_snippet():
+    role = _current_role()
+    if role not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login'))
+    return _safe_render(MESSAGES_HTML, devices=[], speeders=[], roads=[], zones=[], recent_messages=[])
+
+
 @app.route('/admin/roads', methods=['GET', 'POST'])
 def admin_roads():
     # GET: list roads
@@ -2854,7 +3482,7 @@ def admin_admins():
         password = request.form.get('password') or ''
         password2 = request.form.get('password2') or ''
         role = (request.form.get('role') or 'admin').strip().lower()
-        if role not in {'admin', 'police', 'gk'}:
+        if role not in {'admin', 'police'}:
             role = 'admin'
         if not username or not password:
             flash("Username and password are required")
@@ -2909,6 +3537,7 @@ def admin_admins():
         <a href="{{ url_for('dashboard') }}">Dashboard</a>
         <a href="{{ url_for('all_vehicles') }}">All Vehicles</a>
         <a href="{{ url_for('admin_traffic') }}">Traffic Search</a>
+        <a href="{{ url_for('admin_messages') }}">Messages</a>
         <a href="{{ url_for('admin_logout') }}">Logout</a>
       </div>
     </div>
@@ -3006,7 +3635,7 @@ def admin_admins():
   </div>
 </body>
 </html>
-""", admins=admins, police_users=police_users)
+""", admins=admins, police_users=police_users, gk_users=gk_users)
 
 
 
@@ -3580,58 +4209,6 @@ def police_dashboard():
     if _current_role() not in {'admin', 'police'}:
         return redirect(url_for('admin_login'))
     return _safe_render(POLICE_DASH_HTML)
-
-GK_LOGIN_HTML = '''
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>GK Login</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;padding:24px;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);color:#e5eefb;}
-.card{max-width:560px;margin:0 auto;background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.15);border-radius:20px;padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.28);} 
-input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(148,163,184,.18);border-radius:14px;margin-top:8px;background:#0b1324;color:#e5eefb;}
-button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800;cursor:pointer;}
-.muted{color:#94a3b8;}
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>GK Auth</h1>
-    <p class="muted">Use a GK username and password to enter the GK area.</p>
-    <form method="post">
-      <label>Username</label>
-      <input name="username" required>
-      <label>Password</label>
-      <input name="password" type="password" required>
-      <button type="submit">Login</button>
-    </form>
-    <p class="muted" style="margin-top:12px;">Admins can also access this area, but GK accounts are the intended users.</p>
-  </div>
-</body>
-</html>
-'''
-
-@app.route('/GK', methods=['GET', 'POST'])
-@app.route('/gk', methods=['GET', 'POST'])
-def gk_dashboard():
-    if request.method == 'POST':
-        username = (request.form.get('username') or '').strip()
-        password = request.form.get('password') or ''
-        if not username or not password:
-            flash('Missing username or password')
-            return _safe_render(GK_LOGIN_HTML), 400
-        user, role = _pick_login_user(username)
-        if not user or not check_password_hash(user.password_hash, password):
-            flash('Invalid credentials')
-            return _safe_render(GK_LOGIN_HTML), 401
-        if role not in {'gk', 'admin'}:
-            flash('This login is for GK users')
-            return _safe_render(GK_LOGIN_HTML), 403
-        _set_auth_session(user.username, 'gk' if role == 'gk' else 'admin')
-        return redirect(url_for('gk_dashboard'))
-    if _current_role() not in {'admin', 'gk'}:
-        return _safe_render(GK_LOGIN_HTML)
-    return _safe_render(GK_DASH_HTML)
 # -------------------------
 # End of police/watch block
 # -------------------------
