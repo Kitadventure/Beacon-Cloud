@@ -3832,8 +3832,8 @@ def all_vehicles():
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19 }).addTo(map);
   let vehicles = [];
   let selected = null;
-  let marker = null;
-  let circle = null;
+  const markers = new Map();
+  const circles = new Map();
 
   const qEl = document.getElementById('q');
   const fieldEl = document.getElementById('field');
@@ -3869,6 +3869,7 @@ def all_vehicles():
     statOffline.innerText = offline;
     statBeacon.innerText = withBeacon;
     renderVehicles();
+    fitAllBeacons();
     if (vehicles.length && !selected) selectVehicle(vehicles[0].id);
     if (selected && !vehicles.some(v => v.id === selected)) selected = null;
   }
@@ -3881,6 +3882,7 @@ def all_vehicles():
     listEl.innerHTML = '';
     if (!vehicles.length) {
       listEl.innerHTML = '<div class="empty">No vehicles match the current search.</div>';
+      renderMap();
       return;
     }
     for (const v of vehicles) {
@@ -3906,11 +3908,35 @@ def all_vehicles():
       div.addEventListener('click', () => selectVehicle(v.id));
       listEl.appendChild(div);
     }
+    renderMap();
+  }
+
+  function renderMap() {
+    for (const m of markers.values()) map.removeLayer(m);
+    for (const c of circles.values()) map.removeLayer(c);
+    markers.clear();
+    circles.clear();
+    const points = [];
+    for (const v of vehicles) {
+      const last = v.last_snapshot || {};
+      if (typeof last.lat !== 'number' || typeof last.lon !== 'number') continue;
+      const pos = [last.lat, last.lon];
+      const m = L.circleMarker(pos, { radius: 8 }).addTo(map);
+      m.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}`);
+      markers.set(v.id, m);
+      const c = L.circle(pos, { radius: 25 }).addTo(map);
+      circles.set(v.id, c);
+      points.push(pos);
+    }
+    if (points.length === 1) {
+      map.setView(points[0], 15, { animate:true });
+    } else if (points.length > 1) {
+      map.fitBounds(points, { padding:[30,30] });
+    }
   }
 
   function selectVehicle(id) {
     selected = id;
-    renderVehicles();
     const v = vehicles.find(x => x.id === id);
     if (!v) return;
     const last = v.last_snapshot || {};
@@ -3922,12 +3948,9 @@ def all_vehicles():
     document.getElementById('detailStatus').innerText = v.online ? 'LIVE' : 'OFFLINE';
 
     if (typeof last.lat === 'number' && typeof last.lon === 'number') {
-      if (!marker) marker = L.marker([last.lat, last.lon]).addTo(map);
-      else marker.setLatLng([last.lat, last.lon]);
-      if (!circle) circle = L.circle([last.lat, last.lon], { radius: 25 }).addTo(map);
-      else circle.setLatLng([last.lat, last.lon]);
-      marker.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
-      map.setView([last.lat, last.lon], 15, { animate:true });
+      const pos = [last.lat, last.lon];
+      if (markers.has(v.id)) markers.get(v.id).openPopup();
+      map.setView(pos, 15, { animate:true });
     }
   }
 
