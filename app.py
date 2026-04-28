@@ -79,12 +79,12 @@ ACCIDENT_SPEED_DROP_MPS = float(os.environ.get("ACCIDENT_SPEED_DROP_MPS", "10.0"
 ACCIDENT_BEARING_JUMP_DEG = float(os.environ.get("ACCIDENT_BEARING_JUMP_DEG", "60.0"))# abrupt heading change
 ACCIDENT_TIME_WINDOW_S = float(os.environ.get("ACCIDENT_TIME_WINDOW_S", "3.0"))       # examine last N seconds
 
-# Jam detection tuning (new)
+# Jam detection disabled server-side to avoid false jam warnings.
 JAM_DETECT_INTERVAL_S = float(os.environ.get("JAM_DETECT_INTERVAL_S", "5.0"))
 JAM_MIN_DEVICES = int(os.environ.get("JAM_MIN_DEVICES", "3"))
-JAM_SPEED_THRESHOLD_MPS = float(os.environ.get("JAM_SPEED_THRESHOLD_MPS", "3.0"))  # < ~11 km/h
+JAM_SPEED_THRESHOLD_MPS = float(os.environ.get("JAM_SPEED_THRESHOLD_MPS", "3.0"))
 JAM_CLUSTER_RADIUS_M = float(os.environ.get("JAM_CLUSTER_RADIUS_M", "50.0"))
-JAM_RETENTION_S = int(os.environ.get("JAM_RETENTION_S", "60"))  # keep jams recent for this many seconds
+JAM_RETENTION_S = int(os.environ.get("JAM_RETENTION_S", "60"))
 
 # -------------------------
 # Flask + SQLAlchemy + SocketIO init
@@ -274,19 +274,15 @@ def prune_active_devices():
         pass
 
 # -------------------------
-# In-memory alert & jam stores (new)
+# In-memory alert store (jam store disabled)
 # -------------------------
 alerts_store = []  # list of alert dicts (accident alerts)
 alerts_lock = threading.Lock()
-
-jams_store = []    # list of jam dicts
-jams_lock = threading.Lock()
 
 def push_alert(alert):
     try:
         with alerts_lock:
             alerts_store.insert(0, alert)  # newest first
-            # trim to recent N (keep reasonable)
             if len(alerts_store) > 200:
                 alerts_store[:] = alerts_store[:200]
     except Exception:
@@ -301,24 +297,13 @@ def clear_alerts():
         alerts_store.clear()
 
 def push_jam(jam):
-    try:
-        with jams_lock:
-            jams_store.insert(0, jam)
-            # remove old
-            cutoff = datetime.utcnow() - timedelta(seconds=JAM_RETENTION_S)
-            jams_store[:] = [j for j in jams_store if datetime.fromisoformat(j["ts"]) >= cutoff]
-            if len(jams_store) > 200:
-                jams_store[:] = jams_store[:200]
-    except Exception:
-        pass
+    return None
 
 def list_jams(limit=100):
-    with jams_lock:
-        return jams_store[:limit]
+    return []
 
 def clear_jams():
-    with jams_lock:
-        jams_store.clear()
+    return None
 
 # -------------------------
 # Helpers: geodesy + relative computations
@@ -1716,12 +1701,34 @@ DASHBOARD_HTML = """
 
   // Leaflet map init
   const map = L.map('map', { center: [0,0], zoom: 2, preferCanvas:true });
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  let currentTileLayer = null;
+  const tileLayers = {
+    street: L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }),
+    satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: 'Tiles © Esri' }),
+    terrain: L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17, attribution: 'Map data © OpenTopoMap' }),
+    cycle: L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', { maxZoom: 19 })
+  };
+  function setMapStyle(style) {
+    const key = tileLayers[style] ? style : 'street';
+    if (currentTileLayer) map.removeLayer(currentTileLayer);
+    currentTileLayer = tileLayers[key];
+    currentTileLayer.addTo(map);
+    mapStyle.value = key;
+    localStorage.setItem('allVehiclesMapStyle', key);
+  }
   let marker = null;
   let circle = null;
+  const beaconLayer = L.layerGroup().addTo(map);
+  const mapStyle = document.getElementById('mapStyle');
 
   btnRefresh.addEventListener('click', fetchDevices);
   btnExpand.addEventListener('click', () => { if (selectedId) openModal(selectedId); });
+  if (mapStyle) {
+    mapStyle.addEventListener('change', () => setMapStyle(mapStyle.value));
+    setMapStyle(localStorage.getItem('allVehiclesMapStyle') || 'street');
+  } else {
+    setMapStyle('street');
+  }
 
   async function fetchDevices(){
     statusBar.innerText = "Status: fetching /admin/devices...";
@@ -1744,6 +1751,7 @@ DASHBOARD_HTML = """
       devicesCache = data.devices || [];
       statusBar.innerText = `Status: fetched ${devicesCache.length} device(s)`;
       renderList();
+      renderBeacons();
     } catch (err) {
       console.error("fetchDevices error:", err);
       statusBar.innerText = "Status: fetch error — see console for details";
@@ -1787,6 +1795,31 @@ DASHBOARD_HTML = """
     }
   }
 
+  function renderBeacons() {
+    beaconLayer.clearLayers();
+    const bounds = [];
+    for (const d of devicesCache) {
+      const s = d.last_snapshot || {};
+      if (typeof s.lat !== 'number' || typeof s.lon !== 'number') continue;
+      const p = [s.lat, s.lon];
+      bounds.push(p);
+      const label = escapeHtml(d.car_name || d.car_model || d.id);
+      const marker = L.circleMarker(p, {
+        radius: 8,
+        color: '#111827',
+        weight: 2,
+        fillColor: '#38bdf8',
+        fillOpacity: 0.9
+      }).addTo(beaconLayer);
+      marker.bindPopup(`<strong>${label}</strong><br/>${escapeHtml(d.owner || '')}<br/>${s.ts ? new Date(s.ts).toLocaleString() : ''}`);
+      marker.on('click', () => selectDevice(d.id));
+    }
+    if (bounds.length > 0) {
+      const fit = L.latLngBounds(bounds);
+      map.fitBounds(fit.pad(0.18));
+    }
+  }
+
   function selectDevice(id) {
     selectedId = id;
     document.querySelectorAll('#devicesList li').forEach(li => {
@@ -1801,6 +1834,7 @@ DASHBOARD_HTML = """
       clearMarker();
     }
   }
+
 
   function showDetail(d) {
     document.getElementById('placeholderDetail').style.display = 'none';
@@ -3800,8 +3834,6 @@ def all_vehicles():
   let selected = null;
   let marker = null;
   let circle = null;
-  const vehicleLayer = L.layerGroup().addTo(map);
-  const vehicleMarkers = new Map();
 
   const qEl = document.getElementById('q');
   const fieldEl = document.getElementById('field');
@@ -3833,43 +3865,16 @@ def all_vehicles():
     const withBeacon = vehicles.filter(v => !!(v.last_snapshot && v.last_snapshot.ts)).length;
     countEl.innerText = `${total} vehicle(s) shown`;
     statTotal.innerText = total;
-    renderAllMarkers();
     statLive.innerText = live;
     statOffline.innerText = offline;
     statBeacon.innerText = withBeacon;
     renderVehicles();
-    renderAllMarkers();
     if (vehicles.length && !selected) selectVehicle(vehicles[0].id);
     if (selected && !vehicles.some(v => v.id === selected)) selected = null;
   }
 
   function vehicleLabel(v) {
     return v.label || [v.make, v.model].filter(Boolean).join(' ').trim() || v.car_name || v.car_model || v.id;
-  }
-
-  function renderAllMarkers() {
-    vehicleLayer.clearLayers();
-    vehicleMarkers.clear();
-    const bounds = [];
-    for (const v of vehicles) {
-      const last = v.last_snapshot || {};
-      if (typeof last.lat === 'number' && typeof last.lon === 'number') {
-        const online = !!v.online;
-        const markerIcon = L.divIcon({
-          className: '',
-          html: `<div style="width:14px;height:14px;border-radius:999px;border:2px solid #fff;background:${online ? '#22c55e' : '#94a3b8'};box-shadow:0 0 0 6px rgba(255,255,255,.10);"></div>`,
-          iconSize: [14, 14],
-          iconAnchor: [7, 7]
-        });
-        const m = L.marker([last.lat, last.lon], { icon: markerIcon }).addTo(vehicleLayer);
-        m.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}<br/>${escapeHtml(v.owner || '')}`);
-        vehicleMarkers.set(v.id, m);
-        bounds.push([last.lat, last.lon]);
-      }
-    }
-    if (bounds.length) {
-      map.fitBounds(bounds, { padding:[40,40] });
-    }
   }
 
   function renderVehicles() {
@@ -3917,10 +3922,6 @@ def all_vehicles():
     document.getElementById('detailStatus').innerText = v.online ? 'LIVE' : 'OFFLINE';
 
     if (typeof last.lat === 'number' && typeof last.lon === 'number') {
-      const m = vehicleMarkers.get(v.id);
-      if (m) {
-        m.openPopup();
-      }
       if (!marker) marker = L.marker([last.lat, last.lon]).addTo(map);
       else marker.setLatLng([last.lat, last.lon]);
       if (!circle) circle = L.circle([last.lat, last.lon], { radius: 25 }).addTo(map);
@@ -3928,7 +3929,6 @@ def all_vehicles():
       marker.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
       map.setView([last.lat, last.lon], 15, { animate:true });
     }
-    renderAllMarkers();
   }
 
   document.getElementById('btnSearch').addEventListener('click', loadVehicles);
@@ -4337,11 +4337,10 @@ def ws_get_nearby(data):
         emit('error', {'error': str(e)})
 
 # -------------------------
-# Jam detection background worker (new)
+# Jam detection background worker disabled
 # -------------------------
 def jam_detector_once():
-    """Jam warnings are disabled in this build."""
-    return
+    return None
 
 def jam_detector_loop():
     while True:
@@ -4354,13 +4353,5 @@ init_db()
 # -------------------------
 if __name__ == "__main__":
     init_db()
-    # start jam detector background thread
-    try:
-        t = threading.Thread(target=jam_detector_loop, daemon=True)
-        t.start()
-        app.logger.info("Jam detector thread started.")
-    except Exception:
-        app.logger.exception("Failed to start jam detector thread.")
-
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
 # End of file
