@@ -3800,6 +3800,8 @@ def all_vehicles():
   let selected = null;
   let marker = null;
   let circle = null;
+  const vehicleLayer = L.layerGroup().addTo(map);
+  const vehicleMarkers = new Map();
 
   const qEl = document.getElementById('q');
   const fieldEl = document.getElementById('field');
@@ -3831,16 +3833,43 @@ def all_vehicles():
     const withBeacon = vehicles.filter(v => !!(v.last_snapshot && v.last_snapshot.ts)).length;
     countEl.innerText = `${total} vehicle(s) shown`;
     statTotal.innerText = total;
+    renderAllMarkers();
     statLive.innerText = live;
     statOffline.innerText = offline;
     statBeacon.innerText = withBeacon;
     renderVehicles();
+    renderAllMarkers();
     if (vehicles.length && !selected) selectVehicle(vehicles[0].id);
     if (selected && !vehicles.some(v => v.id === selected)) selected = null;
   }
 
   function vehicleLabel(v) {
     return v.label || [v.make, v.model].filter(Boolean).join(' ').trim() || v.car_name || v.car_model || v.id;
+  }
+
+  function renderAllMarkers() {
+    vehicleLayer.clearLayers();
+    vehicleMarkers.clear();
+    const bounds = [];
+    for (const v of vehicles) {
+      const last = v.last_snapshot || {};
+      if (typeof last.lat === 'number' && typeof last.lon === 'number') {
+        const online = !!v.online;
+        const markerIcon = L.divIcon({
+          className: '',
+          html: `<div style="width:14px;height:14px;border-radius:999px;border:2px solid #fff;background:${online ? '#22c55e' : '#94a3b8'};box-shadow:0 0 0 6px rgba(255,255,255,.10);"></div>`,
+          iconSize: [14, 14],
+          iconAnchor: [7, 7]
+        });
+        const m = L.marker([last.lat, last.lon], { icon: markerIcon }).addTo(vehicleLayer);
+        m.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}<br/>${escapeHtml(v.owner || '')}`);
+        vehicleMarkers.set(v.id, m);
+        bounds.push([last.lat, last.lon]);
+      }
+    }
+    if (bounds.length) {
+      map.fitBounds(bounds, { padding:[40,40] });
+    }
   }
 
   function renderVehicles() {
@@ -3888,6 +3917,10 @@ def all_vehicles():
     document.getElementById('detailStatus').innerText = v.online ? 'LIVE' : 'OFFLINE';
 
     if (typeof last.lat === 'number' && typeof last.lon === 'number') {
+      const m = vehicleMarkers.get(v.id);
+      if (m) {
+        m.openPopup();
+      }
       if (!marker) marker = L.marker([last.lat, last.lon]).addTo(map);
       else marker.setLatLng([last.lat, last.lon]);
       if (!circle) circle = L.circle([last.lat, last.lon], { radius: 25 }).addTo(map);
@@ -3895,6 +3928,7 @@ def all_vehicles():
       marker.bindPopup(`<strong>${escapeHtml(vehicleLabel(v))}</strong><br/>${escapeHtml(v.plate || '')}`).openPopup();
       map.setView([last.lat, last.lon], 15, { animate:true });
     }
+    renderAllMarkers();
   }
 
   document.getElementById('btnSearch').addEventListener('click', loadVehicles);
@@ -4306,85 +4340,11 @@ def ws_get_nearby(data):
 # Jam detection background worker (new)
 # -------------------------
 def jam_detector_once():
-    """
-    Simple clustering: gather recent active snapshots and find clusters of devices
-    within JAM_CLUSTER_RADIUS_M whose average speed is below JAM_SPEED_THRESHOLD_MPS.
-    Produces a jam dict: { id, ts, lat, lon, count, avg_speed, device_ids }
-    """
-    try:
-        cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
-        snaps = Snapshot.query.filter(Snapshot.ts >= cutoff).all()
-        # add in-memory cache snapshot fallback for devices not in DB recent snaps
-        with active_devices_lock:
-            for did, entry in active_devices.items():
-                if entry.get("ts") and entry.get("ts") >= cutoff:
-                    # skip if DB already has a recent snapshot for same device
-                    if any(s.device_id == did for s in snaps):
-                        continue
-                    class _T:
-                        pass
-                    t = _T()
-                    t.device_id = did
-                    t.lat = entry.get("lat")
-                    t.lon = entry.get("lon")
-                    t.speed_mps = entry.get("speed_mps") or 0.0
-                    t.bearing_deg = entry.get("bearing_deg") or 0.0
-                    t.ts = entry.get("ts")
-                    snaps.append(t)
-        if not snaps:
-            return
-
-        used = set()
-        clusters = []
-        for s in snaps:
-            if s.device_id in used:
-                continue
-            # build cluster around s
-            members = [s]
-            for t in snaps:
-                if t.device_id == s.device_id or t.device_id in used:
-                    continue
-                d = haversine_m(s.lat, s.lon, t.lat, t.lon)
-                if d <= JAM_CLUSTER_RADIUS_M:
-                    members.append(t)
-            for m in members:
-                used.add(m.device_id)
-            # evaluate cluster
-            count = len(members)
-            avg_speed = sum([(m.speed_mps or 0.0) for m in members]) / max(1, count)
-            if count >= JAM_MIN_DEVICES and avg_speed <= JAM_SPEED_THRESHOLD_MPS:
-                # compute centroid
-                avg_lat = sum([m.lat for m in members]) / count
-                avg_lon = sum([m.lon for m in members]) / count
-                cluster = {
-                    "id": uuid.uuid4().hex,
-                    "ts": datetime.utcnow().isoformat(),
-                    "lat": round(avg_lat, 6),
-                    "lon": round(avg_lon, 6),
-                    "count": count,
-                    "avg_speed_mps": round(avg_speed, 2),
-                    "device_ids": [m.device_id for m in members]
-                }
-                clusters.append(cluster)
-
-        # push clusters to jams_store and optionally emit to involved device sockets
-        for jam in clusters:
-            push_jam(jam)
-            # emit to each device in jam that has sockets
-            for did in jam["device_ids"]:
-                try:
-                    send_ws_to_device(did, "jam_alert", jam)
-                except Exception:
-                    pass
-    except Exception:
-        app.logger.exception("jam_detector_once error")
+    """Jam warnings are disabled in this build."""
+    return
 
 def jam_detector_loop():
     while True:
-        try:
-            jam_detector_once()
-        except Exception:
-            app.logger.exception("jam_detector_loop error")
         time.sleep(JAM_DETECT_INTERVAL_S)
 
 init_db()
