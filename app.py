@@ -16,6 +16,7 @@
 
 import os
 import uuid
+import re
 import threading
 from math import radians, sin, cos, atan2, sqrt, degrees
 from datetime import datetime, timedelta
@@ -1073,6 +1074,84 @@ def onboard():
     db.session.add(d)
     db.session.commit()
     return jsonify({"device_id": device_id, "token": token})
+
+def _normalize_lookup_text(value):
+    return (value or "").strip().lower()
+
+
+def _normalize_phone_number(value):
+    return re.sub(r"\D+", "", value or "")
+
+
+def _device_extra_object(device):
+    if not device or not getattr(device, "extra", None):
+        return None
+    try:
+        return json.loads(device.extra) if isinstance(device.extra, str) else device.extra
+    except Exception:
+        return None
+
+
+def _device_phone_number(device):
+    extra_obj = _device_extra_object(device)
+    if isinstance(extra_obj, dict):
+        phone = extra_obj.get("phone_number") or extra_obj.get("phone") or extra_obj.get("mobile")
+        if phone:
+            return str(phone)
+    return None
+
+
+def _find_matching_device(owner, plate, phone_number):
+    owner_norm = _normalize_lookup_text(owner)
+    plate_norm = _normalize_lookup_text(plate).upper()
+    phone_norm = _normalize_phone_number(phone_number)
+    if not owner_norm or not plate_norm or not phone_norm:
+        return None
+
+    devices = Device.query.filter_by(revoked=False).all()
+    for d in devices:
+        d_plate = _normalize_lookup_text(d.plate).upper()
+        d_owner = _normalize_lookup_text(d.owner)
+        d_phone = _normalize_phone_number(_device_phone_number(d))
+        if d_plate != plate_norm:
+            continue
+        if d_owner != owner_norm:
+            continue
+        if d_phone != phone_norm:
+            continue
+        return d
+    return None
+
+
+@app.route("/vehicle/lookup", methods=["POST"])
+def vehicle_lookup():
+    """Return an existing device token if owner + plate + phone match an existing vehicle."""
+    payload = request.get_json(force=True, silent=True) or {}
+    owner = payload.get("owner") or payload.get("name")
+    plate = payload.get("plate")
+    phone = payload.get("phone_number") or payload.get("phone")
+
+    device = _find_matching_device(owner, plate, phone)
+    if not device:
+        return jsonify({"ok": False, "found": False, "message": "vehicle not found"}), 404
+
+    extra_obj = _device_extra_object(device)
+    return jsonify({
+        "ok": True,
+        "found": True,
+        "device_id": device.id,
+        "token": device.token,
+        "device": {
+            "id": device.id,
+            "owner": device.owner,
+            "car_name": device.car_name,
+            "car_model": device.car_model,
+            "plate": device.plate,
+            "phone_number": _device_phone_number(device),
+            "extra": extra_obj,
+        }
+    })
+
 
 @app.route("/reconnect", methods=["POST"])
 def reconnect():
