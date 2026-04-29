@@ -2760,10 +2760,11 @@ def _create_message_and_dispatch(body):
     payload['app_action'] = 'popup'
 
     for d in recipients:
-        try:
-            send_ws_to_device(d.id, 'admin_message', payload)
-        except Exception:
-            pass
+        for event_name in ('admin_message', 'device_message'):
+            try:
+                send_ws_to_device(d.id, event_name, payload)
+            except Exception:
+                pass
     return payload, None
 
 
