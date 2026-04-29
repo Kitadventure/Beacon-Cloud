@@ -66,6 +66,7 @@ ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN")
 # Optionally seed admin via env on first run:
 ADMIN_USER = os.environ.get("ADMIN_USER")
 ADMIN_PASS = os.environ.get("ADMIN_PASS")
+# BOOTSTRAP_ADMIN_PASSWORD is used only for the on-the-fly first login bootstrap.
 
 VEHICLE_LENGTH_M = float(os.environ.get("VEHICLE_LENGTH_M", "5.0"))
 OVERTAKE_EXTRA_M = float(os.environ.get("OVERTAKE_EXTRA_M", "5.0"))
@@ -639,9 +640,9 @@ def index():
 # -------------------------
 # Web auth helpers
 # -------------------------
-# Hardcoded bootstrap admin for first access.
-BOOTSTRAP_ADMIN_USERNAME = 'bootstrap_admin'
-BOOTSTRAP_ADMIN_PASSWORD = 'Beacon@2026!'
+# Bootstrap admin for first access. You can override the password from the cloud env.
+BOOTSTRAP_ADMIN_USERNAME = os.environ.get('BOOTSTRAP_ADMIN_USERNAME', 'bootstrap_admin')
+BOOTSTRAP_ADMIN_PASSWORD = os.environ.get('BOOTSTRAP_ADMIN_PASSWORD', 'ChangeMeTemp@123')
 
 def _current_role():
     return session.get('auth_role') or ('admin' if session.get('admin_logged') else None)
@@ -2760,11 +2761,10 @@ def _create_message_and_dispatch(body):
     payload['app_action'] = 'popup'
 
     for d in recipients:
-        for event_name in ('admin_message', 'device_message'):
-            try:
-                send_ws_to_device(d.id, event_name, payload)
-            except Exception:
-                pass
+        try:
+            send_ws_to_device(d.id, 'admin_message', payload)
+        except Exception:
+            pass
     return payload, None
 
 
