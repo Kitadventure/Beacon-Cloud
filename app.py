@@ -1316,6 +1316,11 @@ def heartbeat():
 
     return jsonify({"ok": True, "saved_at": snap.ts.isoformat()})
 
+@app.route("/pulse_receiver", methods=["POST"])
+def pulse_receiver():
+    # Backward-compatible alias for older clients that still post here.
+    return heartbeat()
+
 # -------------------------
 # Nearby & compute_for_device functions (unchanged)
 # -------------------------
