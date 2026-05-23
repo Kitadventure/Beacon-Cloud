@@ -199,6 +199,7 @@ class BroadcastMessage(db.Model):
     creator_username = db.Column(db.String(128))
     recipient_count = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    edited_at = db.Column(db.DateTime, nullable=True)
 
 class BroadcastDelivery(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
@@ -207,6 +208,14 @@ class BroadcastDelivery(db.Model):
     delivered_at = db.Column(db.DateTime, nullable=True)
     read_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class BroadcastReply(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    message_id = db.Column(db.String(36), db.ForeignKey('broadcast_message.id'), index=True, nullable=False)
+    device_id = db.Column(db.String(36), db.ForeignKey('device.id'), index=True, nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    edited_at = db.Column(db.DateTime, nullable=True)
 
 # -------------------------
 # Bootstrap state helpers
@@ -2496,13 +2505,15 @@ MESSAGES_HTML = """
       <div class="card">
         <h2>Recent messages</h2>
         <table>
-          <thead><tr><th>Title</th><th>Target</th><th>Recipients</th><th>Created</th></tr></thead>
+          <thead><tr><th>Title</th><th>Target</th><th>Recipients</th><th>Viewed</th><th>Replies</th><th>Created</th></tr></thead>
           <tbody>
           {% for m in recent_messages %}
             <tr>
               <td>{{ m.title }}</td>
               <td>{{ m.target_type }} {% if m.target_value %}({{ m.target_value }}){% endif %}</td>
               <td>{{ m.recipient_count }}</td>
+              <td>{{ message_summary(m.id).view_ratio }}</td>
+              <td>{{ message_summary(m.id).reply_count }}</td>
               <td>{{ m.created_at.isoformat() if m.created_at else '' }}</td>
             </tr>
           {% endfor %}
@@ -2520,7 +2531,7 @@ MESSAGES_HTML = """
           <button type="button" onclick="setTarget('county')">County</button>
           <button type="button" onclick="setTarget('single')">One user</button>
         </div>
-        <div class="muted" style="margin-top:12px;">The app can pop these up through the native message listener or the live socket event.</div>
+        <div class="muted" style="margin-top:12px;">The app can pop these up through the native message listener, the live socket event, or the mobile WebView comm screen.</div>
       </div>
     </div>
   </div>
@@ -2782,17 +2793,75 @@ def _target_devices_for_message(body):
     return out
 
 
-def _serialize_message(msg, recipient_count=None):
+def _message_bucket(target_type):
+    t = (target_type or '').strip().lower()
+    if t == 'single':
+        return 'personal'
+    if t in {'all'}:
+        return 'general'
+    return 'group'
+
+
+def _message_color(target_type):
+    bucket = _message_bucket(target_type)
+    if bucket == 'general':
+        return '#22c55e'
+    if bucket == 'group':
+        return '#3b82f6'
+    return '#ef4444'
+
+
+def _message_summary(msg_id):
+    deliveries = BroadcastDelivery.query.filter_by(message_id=msg_id).all()
+    read_count = len([d for d in deliveries if d.read_at is not None])
+    delivered_count = len([d for d in deliveries if d.delivered_at is not None])
+    reply_count = BroadcastReply.query.filter_by(message_id=msg_id).count()
+    return {
+        'delivered_count': delivered_count,
+        'read_count': read_count,
+        'reply_count': reply_count,
+        'total_count': len(deliveries),
+        'view_ratio': f"{read_count}/{len(deliveries)}" if deliveries else "0/0",
+    }
+
+
+def _message_replies(msg_id):
+    rows = BroadcastReply.query.filter_by(message_id=msg_id).order_by(BroadcastReply.created_at.asc()).all()
+    out = []
+    for r in rows:
+        out.append({
+            'id': r.id,
+            'device_id': r.device_id,
+            'body': r.body,
+            'created_at': r.created_at.isoformat() if r.created_at else None,
+            'edited_at': r.edited_at.isoformat() if r.edited_at else None,
+            'can_edit': bool(r.created_at and (datetime.utcnow() - r.created_at).total_seconds() <= 300),
+        })
+    return out
+
+
+def _serialize_message(msg, recipient_count=None, device_id=None):
+    summary = _message_summary(msg.id)
+    replies = _message_replies(msg.id)
     return {
         'id': msg.id,
         'title': msg.title,
         'body': msg.body,
         'target_type': msg.target_type,
+        'message_bucket': _message_bucket(msg.target_type),
+        'message_color': _message_color(msg.target_type),
         'target_value': msg.target_value,
         'creator_role': msg.creator_role,
         'creator_username': msg.creator_username,
         'recipient_count': recipient_count if recipient_count is not None else msg.recipient_count,
         'created_at': msg.created_at.isoformat() if msg.created_at else None,
+        'edited_at': msg.edited_at.isoformat() if getattr(msg, 'edited_at', None) else None,
+        'read_count': summary['read_count'],
+        'delivered_count': summary['delivered_count'],
+        'reply_count': summary['reply_count'],
+        'view_ratio': summary['view_ratio'],
+        'replies': replies,
+        'can_edit': bool(msg.created_at and (datetime.utcnow() - msg.created_at).total_seconds() <= 300),
     }
 
 
@@ -2883,7 +2952,7 @@ def admin_messages():
     roads = Road.query.order_by(Road.created_at.desc()).all()
     zones = TrafficZone.query.order_by(TrafficZone.created_at.desc()).all()
     recent_messages = BroadcastMessage.query.order_by(BroadcastMessage.created_at.desc()).limit(20).all()
-    return _safe_render(MESSAGES_HTML, devices=devices, speeders=speeders, roads=roads, zones=zones, recent_messages=recent_messages)
+    return _safe_render(MESSAGES_HTML, devices=devices, speeders=speeders, roads=roads, zones=zones, recent_messages=recent_messages, message_summary=_message_summary)
 
 
 @app.route('/admin/message/search-devices')
@@ -2927,6 +2996,260 @@ def device_messages():
     return jsonify({'ok': True, 'messages': messages})
 
 
+@app.route('/device/message/seen', methods=['POST'])
+def device_message_seen():
+    body = request.get_json(force=True, silent=True) or {}
+    device = find_or_restore_from_request(body)
+    if not device:
+        try:
+            device = require_auth_token()
+        except Exception:
+            return jsonify({'error': 'Missing or invalid token'}), 401
+
+    message_ids = body.get('message_ids') or []
+    if isinstance(message_ids, str):
+        message_ids = [message_ids]
+    now = datetime.utcnow()
+    updated = 0
+    rows = BroadcastDelivery.query.filter(BroadcastDelivery.device_id == device.id).filter(BroadcastDelivery.message_id.in_(message_ids)).all()
+    for row in rows:
+        if row.read_at is None:
+            row.read_at = now
+            updated += 1
+    if updated:
+        db.session.commit()
+    return jsonify({'ok': True, 'updated': updated})
+
+
+@app.route('/device/message/reply', methods=['POST'])
+def device_message_reply():
+    body = request.get_json(force=True, silent=True) or {}
+    device = find_or_restore_from_request(body)
+    if not device:
+        try:
+            device = require_auth_token()
+        except Exception:
+            return jsonify({'error': 'Missing or invalid token'}), 401
+
+    message_id = (body.get('message_id') or '').strip()
+    reply_body = (body.get('body') or '').strip()
+    if not message_id or not reply_body:
+        return jsonify({'error': 'message_id and body required'}), 400
+
+    msg = BroadcastMessage.query.get(message_id)
+    if not msg:
+        return jsonify({'error': 'message not found'}), 404
+
+    reply = BroadcastReply(message_id=msg.id, device_id=device.id, body=reply_body)
+    db.session.add(reply)
+    db.session.commit()
+
+    payload = {
+        'id': reply.id,
+        'message_id': msg.id,
+        'device_id': device.id,
+        'body': reply.body,
+        'created_at': reply.created_at.isoformat() if reply.created_at else None,
+        'edited_at': None,
+        'can_edit': True,
+    }
+    try:
+        send_ws_to_device(device.id, 'message_reply_ack', payload)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'reply': payload})
+
+
+@app.route('/device/message/reply/edit', methods=['POST'])
+def device_message_reply_edit():
+    body = request.get_json(force=True, silent=True) or {}
+    device = find_or_restore_from_request(body)
+    if not device:
+        try:
+            device = require_auth_token()
+        except Exception:
+            return jsonify({'error': 'Missing or invalid token'}), 401
+
+    reply_id = (body.get('reply_id') or '').strip()
+    new_body = (body.get('body') or '').strip()
+    if not reply_id or not new_body:
+        return jsonify({'error': 'reply_id and body required'}), 400
+
+    reply = BroadcastReply.query.filter_by(id=reply_id, device_id=device.id).first()
+    if not reply:
+        return jsonify({'error': 'reply not found'}), 404
+
+    if (datetime.utcnow() - reply.created_at).total_seconds() > 300:
+        return jsonify({'error': 'edit window expired'}), 403
+
+    reply.body = new_body
+    reply.edited_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'ok': True, 'reply': {
+        'id': reply.id,
+        'message_id': reply.message_id,
+        'device_id': reply.device_id,
+        'body': reply.body,
+        'created_at': reply.created_at.isoformat() if reply.created_at else None,
+        'edited_at': reply.edited_at.isoformat() if reply.edited_at else None,
+        'can_edit': False,
+    }})
+
+
+MOBILE_COMM_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Comm</title>
+  <style>
+    body{margin:0;font-family:Arial,sans-serif;background:#f4f7fb;color:#0f172a}
+    .top{position:sticky;top:0;background:#fff;border-bottom:1px solid #e2e8f0;padding:12px;z-index:3}
+    .tabs,.actions{display:flex;gap:8px;flex-wrap:wrap}
+    .pill{border:none;border-radius:16px;padding:12px 10px;color:#fff;font-weight:800;flex:1 1 30%;min-width:110px;text-align:left}
+    .pill small{display:block;opacity:.9;margin-top:4px}
+    .general{background:linear-gradient(135deg,#22c55e,#16a34a)}
+    .group{background:linear-gradient(135deg,#3b82f6,#2563eb)}
+    .personal{background:linear-gradient(135deg,#ef4444,#dc2626)}
+    .actions{margin-top:10px}
+    .actions button{border:none;border-radius:14px;padding:10px 12px;background:#111827;color:#fff;font-weight:700}
+    .feed{padding:12px}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:20px;padding:12px;margin-bottom:12px;box-shadow:0 8px 24px rgba(15,23,42,.06)}
+    .meta{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
+    .tag{display:inline-block;font-size:12px;font-weight:800;padding:4px 10px;border-radius:999px;color:#fff;margin-left:8px}
+    .tag.generalTag{background:#22c55e}.tag.groupTag{background:#3b82f6}.tag.personalTag{background:#ef4444}
+    .body{margin-top:8px;white-space:pre-wrap;line-height:1.45}
+    .small{color:#64748b;font-size:12px;margin-top:8px}
+    .replies{margin-top:10px;border-left:3px solid #e2e8f0;padding-left:10px}
+    .reply{background:#f8fafc;border-radius:14px;padding:8px 10px;margin-top:8px}
+    .composer{display:flex;gap:8px;margin-top:10px}
+    .composer input{flex:1;border:1px solid #cbd5e1;border-radius:14px;padding:10px 12px}
+    .composer button{border:none;border-radius:14px;padding:10px 14px;background:#111827;color:#fff;font-weight:800}
+    .editBtn{background:#e2e8f0;color:#0f172a;border:none;border-radius:12px;padding:6px 10px;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="tabs">
+      <button class="pill general" id="generalTab">General messages<small id="generalCount">0</small></button>
+      <button class="pill group" id="groupTab">Group messages<small id="groupCount">0</small></button>
+      <button class="pill personal" id="personalTab">Personal messages<small id="personalCount">0</small></button>
+    </div>
+    <div class="actions">
+      <button id="refreshBtn">Refresh</button>
+      <button id="aboutBtn">About us</button>
+      <button id="howBtn">How app works</button>
+      <button id="ministryBtn">Ministry site</button>
+      <button id="closeBtn">Close</button>
+    </div>
+  </div>
+  <div class="feed" id="feed"></div>
+<script>
+const SERVER = "{{ server_url }}";
+const DEVICE_ID = "{{ device_id }}";
+const TOKEN = "{{ token }}";
+let allMessages = [];
+let filter = 'general';
+function bucketOf(m){return m.message_bucket || (m.target_type === 'single' ? 'personal' : (m.target_type === 'all' ? 'general' : 'group'));}
+function tagClassOf(m){const b=bucketOf(m); return b==='general'?'generalTag':b==='group'?'groupTag':'personalTag';}
+function fmtTime(ts){try{return ts ? new Date(ts).toLocaleString() : '';}catch(e){return ts||'';}}
+function escapeHtml(s){return String(s||'').replace(/[&<>"'`]/g, c => { if (c === '&') return '&amp;'; if (c === '<') return '&lt;'; if (c === '>') return '&gt;'; if (c === '"') return '&quot;'; if (c === "'") return '&#39;'; return '&#96;'; });}
+function setFilter(next){filter=next; render();}
+document.getElementById('generalTab').onclick=()=>setFilter('general');
+document.getElementById('groupTab').onclick=()=>setFilter('group');
+document.getElementById('personalTab').onclick=()=>setFilter('personal');
+document.getElementById('refreshBtn').onclick=refresh;
+document.getElementById('aboutBtn').onclick=()=>location.href=SERVER+'/about/mobile';
+document.getElementById('howBtn').onclick=()=>location.href=SERVER+'/how/mobile';
+document.getElementById('ministryBtn').onclick=()=>location.href='https://www.transport.go.ke/';
+document.getElementById('closeBtn').onclick=()=>{try{if(window.Android&&Android.closeComm)Android.closeComm();else window.close();}catch(e){window.close();}};
+async function refresh(){
+  if (!DEVICE_ID || !TOKEN) return;
+  try {
+    const res = await fetch(SERVER + '/device/messages', {method:'GET', headers:{'Authorization':'Token ' + TOKEN}, cache:'no-store'});
+    const j = await res.json();
+    allMessages = j.messages || [];
+    updateCounts();
+    await markSeen();
+    render();
+  } catch(e) {}
+}
+async function markSeen(){
+  const ids = allMessages.map(m=>m.id).filter(Boolean);
+  if (!ids.length) return;
+  try{ await fetch(SERVER + '/device/message/seen', {method:'POST', headers:{'Content-Type':'application/json','Authorization':'Token ' + TOKEN}, body: JSON.stringify({device_id: DEVICE_ID, token: TOKEN, message_ids: ids})}); } catch(e){}
+}
+function updateCounts(){
+  const c={general:0,group:0,personal:0};
+  for (const m of allMessages) c[bucketOf(m)]++;
+  document.getElementById('generalCount').innerText=c.general;
+  document.getElementById('groupCount').innerText=c.group;
+  document.getElementById('personalCount').innerText=c.personal;
+}
+function render(){
+  const list = allMessages.filter(m => bucketOf(m) === filter);
+  const feed = document.getElementById('feed');
+  if (!list.length){ feed.innerHTML = '<div style="color:#64748b">No messages in this section.</div>'; return; }
+  feed.innerHTML = list.map(m => {
+    const replies = Array.isArray(m.replies) ? m.replies : [];
+    return `<div class="card"><div class="meta"><div><strong>${escapeHtml(m.title)} <span class="tag ${tagClassOf(m)}">${bucketOf(m)}</span></strong><div class="small">${escapeHtml(fmtTime(m.created_at))}${m.edited_at ? ' • edited ' + escapeHtml(fmtTime(m.edited_at)) : ''}</div></div><div class="small">${(m.read_count||0)}/${(m.recipient_count||0)} seen</div></div><div class="body">${escapeHtml(m.body)}</div><div class="small">From ${escapeHtml(m.creator_role||'')}${m.creator_username ? ' • ' + escapeHtml(m.creator_username) : ''}</div><div class="small">Replies: ${replies.length}</div><div class="replies">${replies.map(r => `<div class="reply"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>You</strong>${r.can_edit ? `<button class="editBtn" onclick="editReply('${escapeHtml(r.id)}','${escapeHtml(r.body)}')">Edit</button>` : ''}</div><div>${escapeHtml(r.body)}</div><div class="small">${escapeHtml(fmtTime(r.created_at))}${r.edited_at ? ' • edited ' + escapeHtml(fmtTime(r.edited_at)) : ''}</div></div>`).join('')}</div><div class="composer"><input id="reply_${escapeHtml(m.id)}" placeholder="Reply..."><button onclick="sendReply('${escapeHtml(m.id)}')">Send</button></div></div>`;
+  }).join('');
+}
+async function sendReply(messageId){
+  const input = document.getElementById('reply_' + messageId);
+  const body = (input && input.value || '').trim();
+  if (!body) return;
+  try {
+    const res = await fetch(SERVER + '/device/message/reply', {method:'POST', headers:{'Content-Type':'application/json','Authorization':'Token ' + TOKEN}, body: JSON.stringify({device_id: DEVICE_ID, token: TOKEN, message_id: messageId, body})});
+    const j = await res.json();
+    if (j.ok) { input.value=''; refresh(); }
+  } catch(e){}
+}
+async function editReply(replyId, currentBody){
+  const next = prompt('Edit reply (available for 5 minutes)', currentBody || '');
+  if (next === null) return;
+  try {
+    const res = await fetch(SERVER + '/device/message/reply/edit', {method:'POST', headers:{'Content-Type':'application/json','Authorization':'Token ' + TOKEN}, body: JSON.stringify({device_id: DEVICE_ID, token: TOKEN, reply_id: replyId, body: next})});
+    const j = await res.json();
+    if (j.ok) refresh(); else alert(j.error || 'Edit failed');
+  } catch(e){}
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+def mobile_comm():
+    body = request.get_json(silent=True) or {}
+    device = find_or_restore_from_request(body)
+    if not device:
+        token = request.args.get('token') or request.headers.get('X-Device-Token')
+        device_id = request.args.get('device_id')
+        if not token or not device_id:
+            return _safe_render("<!doctype html><html><body style='margin:0;background:#fff'></body></html>")
+        device = Device.query.filter_by(id=device_id, token=token, revoked=False).first()
+        if not device:
+            return _safe_render("<!doctype html><html><body style='margin:0;background:#fff'></body></html>")
+    return render_template_string(MOBILE_COMM_HTML, server_url=SERVER_URL, device_id=device.id, token=device.token)
+
+@app.route('/device/comm')
+def device_comm():
+    return mobile_comm()
+
+
+@app.route('/about/mobile')
+def about_mobile():
+    return render_template_string('''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>About us</title><style>body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#f5f7fb;color:#111827}.card{max-width:780px;margin:0 auto;background:#fff;border-radius:20px;padding:18px;box-shadow:0 8px 24px rgba(0,0,0,.06)}a{display:inline-block;margin-top:14px;padding:10px 14px;border-radius:999px;background:#111827;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class="card"><h2>About us</h2><p>This app helps with driving awareness, live communication, map search, and safety prompts.</p><p>Ministry of Roads and Transport<br>• Roads: +254-020-2723232<br>• Roads email: ps@roads.go.ke / info@roads.go.ke / complaints@roads.go.ke<br>• Ministry phone: +254-020-2722216<br>• Ministry email: ps@transport.go.ke / info@transport.go.ke</p><a href="https://www.transport.go.ke/" target="_blank" rel="noopener">Open ministry site</a></div></body></html>''')
+
+
+@app.route('/how/mobile')
+def how_mobile():
+    return render_template_string('''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>How app works</title><style>body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#f5f7fb;color:#111827}.card{max-width:780px;margin:0 auto;background:#fff;border-radius:20px;padding:18px;box-shadow:0 8px 24px rgba(0,0,0,.06)}a{display:inline-block;margin-top:14px;padding:10px 14px;border-radius:999px;background:#111827;color:#fff;text-decoration:none;font-weight:700}</style></head><body><div class="card"><h2>How app works</h2><p>1. The map shows your route and nearby vehicles.</p><p>2. The assistant listens for safe driving and overtaking signals.</p><p>3. The comm screen displays messages from the server in a WhatsApp-like view.</p><p>4. You can reply to messages and edit replies within five minutes.</p><p>5. Settings change the UI, maps, and profile behavior.</p><a href="/device/comm" target="_blank" rel="noopener">Back to comm</a></div></body></html>''')
+
+
 @app.route('/admin/message/send', methods=['POST'])
 def admin_message_send():
     role = _current_role()
@@ -2936,6 +3259,35 @@ def admin_message_send():
     payload, err = _create_message_and_dispatch(body)
     if err:
         return jsonify({'error': err}), 400
+    return jsonify({'ok': True, 'message': payload})
+
+
+@app.route('/admin/message/edit', methods=['POST'])
+def admin_message_edit():
+    role = _current_role()
+    if role not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login'))
+    body = request.get_json(force=True, silent=True) or request.form.to_dict(flat=True)
+    message_id = (body.get('message_id') or '').strip()
+    new_title = (body.get('title') or '').strip()
+    new_body = (body.get('body') or '').strip()
+    if not message_id or not new_title or not new_body:
+        return jsonify({'error': 'message_id, title and body are required'}), 400
+    msg = BroadcastMessage.query.get(message_id)
+    if not msg:
+        return jsonify({'error': 'message not found'}), 404
+    if (datetime.utcnow() - msg.created_at).total_seconds() > 300:
+        return jsonify({'error': 'edit window expired'}), 403
+    msg.title = new_title
+    msg.body = new_body
+    msg.edited_at = datetime.utcnow()
+    db.session.commit()
+    payload = _serialize_message(msg, recipient_count=msg.recipient_count)
+    try:
+        for did in (body.get('device_ids') or []):
+            send_ws_to_device(did, 'admin_message_updated', payload)
+    except Exception:
+        pass
     return jsonify({'ok': True, 'message': payload})
 
 
