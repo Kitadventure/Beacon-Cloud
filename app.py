@@ -2981,6 +2981,146 @@ def device_messages():
     return jsonify({'ok': True, 'messages': messages})
 
 
+
+@app.route('/device/messages/view', methods=['GET'])
+def device_messages_view():
+    """Mobile-friendly inbox view for the APK WebView.
+    Loads directly with device_id + token query parameters and renders the
+    server messages in a WhatsApp-style layout.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        device = find_or_restore_from_request(body)
+        if not device:
+            device_id = (request.args.get('device_id') or '').strip()
+            token = (request.args.get('token') or '').strip()
+            if device_id and token:
+                device = restore_device_if_missing(device_id, token, payload={}) or find_device_by_token(token)
+        if not device:
+            return render_template_string("""
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Taifa Messages</title>
+<style>
+body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#f5f7fb;margin:0;padding:22px;color:#111827}
+.card{max-width:900px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:20px;padding:20px;box-shadow:0 10px 28px rgba(0,0,0,.06)}
+.muted{color:#6b7280}
+</style></head><body><div class='card'><h1>Taifa Messages</h1><p class='muted'>Open this page from inside the app so your device can be identified and linked to messages.</p></div></body></html>
+""")
+
+        messages = _pending_messages_for_device(device.id, mark_delivered=True)
+
+        def _msg_class(target_type):
+            t = (target_type or '').lower()
+            if t in {'single', 'personal'}:
+                return 'red', 'Personal'
+            if t in {'all', 'nationwide', 'all_users'}:
+                return 'green', 'General'
+            return 'blue', 'Regional / road / county'
+
+        cards = []
+        for m in messages:
+            badge_class, badge_label = _msg_class(m.get('target_type'))
+            m['badge_class'] = badge_class
+            m['badge_label'] = badge_label
+            cards.append(m)
+
+        return render_template_string("""
+<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>Taifa Messages</title>
+  <style>
+    :root { --bg:#f3f6fb; --card:#ffffff; --text:#0f172a; --muted:#64748b; --green:#16a34a; --blue:#2563eb; --red:#dc2626; }
+    body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,Arial;padding:18px;}
+    .wrap{max-width:920px;margin:0 auto;}
+    h1{font-size:28px;margin:6px 0 4px;}
+    .sub{color:var(--muted);margin-bottom:14px;}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 18px;}
+    .btn{border:0;border-radius:999px;padding:10px 14px;font-weight:800;color:#fff;cursor:pointer;}
+    .btn.all{background:#0f172a;}
+    .btn.green{background:var(--green);}
+    .btn.blue{background:var(--blue);}
+    .btn.red{background:var(--red);}
+    .search{width:100%;box-sizing:border-box;padding:14px 14px;border-radius:16px;border:1px solid #dbe3ef;background:#fff;font-size:16px;outline:none;}
+    .card{background:var(--card);border:1px solid #e5e7eb;border-radius:20px;padding:14px 16px;box-shadow:0 8px 22px rgba(15,23,42,.05);margin-bottom:12px;}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;}
+    .name{font-weight:900;font-size:16px;}
+    .meta{color:var(--muted);font-size:12px;margin-top:4px;}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;color:#fff;font-size:12px;font-weight:800;}
+    .pill.green{background:var(--green);}
+    .pill.blue{background:var(--blue);}
+    .pill.red{background:var(--red);}
+    .body{margin-top:10px;line-height:1.5;font-size:15px;white-space:pre-wrap;}
+    .empty{background:#fff;border:1px dashed #dbe3ef;border-radius:20px;padding:24px;text-align:center;color:var(--muted);}
+    .refresh{margin-top:8px;}
+    .refresh a{display:inline-block;text-decoration:none;background:#111827;color:#fff;padding:10px 14px;border-radius:999px;font-weight:800;}
+    .headerline{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;}
+  </style>
+</head>
+<body>
+  <div class='wrap'>
+    <div class='headerline'>
+      <div>
+        <h1>Taifa Messages</h1>
+        <div class='sub'>Cloud inbox loaded directly from the server.</div>
+      </div>
+      <div class='refresh'><a href='javascript:location.reload()'>Refresh</a></div>
+    </div>
+
+    <input id='q' class='search' placeholder='Search messages by title or body...'>
+    <div class='toolbar'>
+      <button class='btn all' onclick="filterCards('all')">All</button>
+      <button class='btn green' onclick="filterCards('green')">General</button>
+      <button class='btn blue' onclick="filterCards('blue')">Region / roads / county</button>
+      <button class='btn red' onclick="filterCards('red')">Personal</button>
+    </div>
+
+    <div id='list'>
+      {% if cards %}
+        {% for m in cards %}
+          <div class='card msg-card' data-cat='{{ m.badge_class }}' data-text='{{ (m.title ~ " " ~ m.body)|e }}'>
+            <div class='top'>
+              <div>
+                <div class='name'>{{ m.title }}</div>
+                <div class='meta'>{{ m.created_at or '' }} · {{ m.badge_label }}</div>
+              </div>
+              <span class='pill {{ m.badge_class }}'>{{ m.badge_label }}</span>
+            </div>
+            <div class='body'>{{ m.body }}</div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class='empty'>No messages yet.</div>
+      {% endif %}
+    </div>
+  </div>
+  <script>
+    const q = document.getElementById('q');
+    q.addEventListener('input', () => filterCards(currentCat, q.value));
+    let currentCat = 'all';
+    function filterCards(cat='all', text='') {
+      currentCat = cat;
+      text = (text || q.value || '').toLowerCase().trim();
+      document.querySelectorAll('.msg-card').forEach(el => {
+        const okCat = cat === 'all' || el.dataset.cat === cat;
+        const okText = !text || (el.dataset.text || '').toLowerCase().includes(text);
+        el.style.display = (okCat && okText) ? '' : 'none';
+      });
+    }
+  </script>
+</body>
+</html>
+""", cards=cards)
+    except Exception as exc:
+        app.logger.exception('device_messages_view failed')
+        return render_template_string("""
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Taifa Messages</title>
+<style>body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:24px}.card{max-width:800px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:20px}</style></head>
+<body><div class='card'><h1>Taifa Messages</h1><p>Messages could not load safely.</p><pre>{{ exc }}</pre></div></body></html>
+""", exc=str(exc))
 @app.route('/admin/message/send', methods=['POST'])
 def admin_message_send():
     role = _current_role()
