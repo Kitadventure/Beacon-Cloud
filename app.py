@@ -2379,479 +2379,339 @@ MESSAGES_HTML = """
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Messages Center</title>
+  <title>Taifa Messages Center</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:24px;color:#e5eefb;}
-    .wrap{max-width:1400px;margin:0 auto;}
-    .card{background:#fff;color:#0f172a;border:1px solid #e2e8f0;border-radius:18px;padding:18px;box-shadow:0 10px 24px rgba(0,0,0,.05);margin-bottom:14px;}
-    a,button{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:10px;border:0;background:#0b84ff;color:#fff;text-decoration:none;font-weight:700;cursor:pointer;}
-    input,textarea,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:8px;}
-    table{width:100%;border-collapse:collapse;}
-    td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top;}
-    .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;}
-    .mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
-    .muted{color:#64748b;font-size:14px;}
-    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-weight:700;margin-right:6px;margin-top:6px;}
-    .result{border:1px solid #e2e8f0;border-radius:12px;padding:10px;margin-top:10px;display:flex;justify-content:space-between;gap:10px;align-items:flex-start;}
-    .result small{color:#64748b;display:block;}
-    @media (max-width: 900px){ .grid,.mini-grid{grid-template-columns:1fr;} }
+    :root{
+      --bg:#f4f7fb; --card:#ffffff; --text:#0f172a; --muted:#64748b;
+      --green:#16a34a; --blue:#2563eb; --red:#dc2626; --orange:#f97316; --line:#dbe4f0;
+    }
+    body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#07111f 0%, #0b1220 100%);margin:0;padding:18px;color:#e5eefb;}
+    .wrap{max-width:1500px;margin:0 auto;}
+    .hero{background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.16);border-radius:24px;padding:18px 20px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;box-shadow:0 18px 50px rgba(0,0,0,.22)}
+    .hero h1{margin:0;font-size:22px}
+    .muted{color:#94a3b8;font-size:13px}
+    .pill{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:999px;background:#0b1324;border:1px solid rgba(148,163,184,.14);color:#e5eefb;font-size:12px;font-weight:700}
+    .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:14px}
+    .card{background:rgba(16,26,45,.96);border:1px solid rgba(148,163,184,.16);border-radius:22px;padding:16px;box-shadow:0 18px 50px rgba(0,0,0,.18)}
+    label{display:block;font-size:12px;margin-top:10px;margin-bottom:6px;color:#cbd5e1;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+    input,textarea,select{width:100%;box-sizing:border-box;padding:12px 13px;border:1px solid rgba(148,163,184,.2);border-radius:14px;background:#0b1324;color:#e5eefb}
+    textarea{min-height:120px;resize:vertical}
+    input::placeholder, textarea::placeholder{color:#64748b}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    a,button{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 15px;border-radius:999px;border:0;background:linear-gradient(135deg,#8b5cf6,#38bdf8);color:#fff;text-decoration:none;font-weight:800;cursor:pointer}
+    button.secondary,a.secondary{background:#0f172a;border:1px solid rgba(148,163,184,.2)}
+    button.green{background:linear-gradient(135deg,#16a34a,#22c55e)}
+    button.blue{background:linear-gradient(135deg,#2563eb,#60a5fa)}
+    button.red{background:linear-gradient(135deg,#dc2626,#ef4444)}
+    button.orange{background:linear-gradient(135deg,#f97316,#fb923c)}
+    .searchRow{display:grid;grid-template-columns:1fr auto;gap:10px}
+    .resultList{margin-top:12px;display:grid;gap:10px;max-height:420px;overflow:auto;padding-right:2px}
+    .result{border:1px solid rgba(148,163,184,.14);border-radius:18px;padding:12px;background:#0b1324}
+    .resultTop{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+    .name{font-weight:800}
+    .meta{font-size:12px;color:#94a3b8;margin-top:4px;line-height:1.45}
+    .chip{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:800}
+    .chip.green{background:rgba(22,163,74,.18);color:#86efac}
+    .chip.blue{background:rgba(37,99,235,.18);color:#93c5fd}
+    .chip.red{background:rgba(220,38,38,.18);color:#fca5a5}
+    .chip.orange{background:rgba(249,115,22,.18);color:#fdba74}
+    .preview{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
+    .stat{background:#0b1324;border:1px solid rgba(148,163,184,.14);border-radius:16px;padding:12px}
+    .stat .k{font-size:12px;color:#94a3b8}
+    .stat .v{font-size:22px;font-weight:800;margin-top:4px}
+    .msgCard{margin-top:12px;border:1px solid rgba(148,163,184,.14);border-radius:18px;padding:14px;background:#0b1324}
+    .msgHead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+    .msgTitle{font-weight:800}
+    .msgBody{white-space:pre-wrap;line-height:1.55;margin-top:8px}
+    .scroll{max-height:620px;overflow:auto;padding-right:2px}
+    .tiny{font-size:12px;color:#94a3b8}
+    .split{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    @media (max-width: 980px){ .grid,.preview,.split{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
-        <div>
-          <h1 style="margin:0;">Messages Center</h1>
-          <div class="muted">Send one message to one user, overspeeders, a zone, a road, a county, or everyone.</div>
-        </div>
-        <div>
-          <a href="{{ url_for('dashboard') }}">Dashboard</a>
-          <a href="{{ url_for('admin_admins') }}">Users</a>
-          <a href="{{ url_for('admin_traffic') }}">Traffic</a>
-          <a href="{{ url_for('admin_speeders') }}">Speeders</a>
-          <a href="{{ url_for('admin_logout') }}">Logout</a>
-        </div>
+    <div class="hero">
+      <div>
+        <h1>Taifa Messages Center</h1>
+        <div class="muted">Search users by name, phone, or plate. Send one, many, regional, county, road, overspeed, plate-range, or nationwide messages.</div>
       </div>
-      {% with messages = get_flashed_messages() %}
-        {% if messages %}<div class="pill">{{ messages[0] }}</div>{% endif %}
-      {% endwith %}
+      <div class="actions">
+        <a href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('all_vehicles') }}">Vehicles</a>
+        <a href="{{ url_for('admin_traffic') }}">Traffic</a>
+        <a href="{{ url_for('admin_admins') }}">Users</a>
+      </div>
     </div>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="card" style="margin-top:14px;border-color:rgba(34,197,94,.22);background:rgba(34,197,94,.08);">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
 
     <div class="grid">
       <div class="card">
-        <h2>Compose message</h2>
-        <form method="post" action="{{ url_for('admin_messages') }}">
-          <div class="mini-grid">
+        <div class="split">
+          <div>
+            <h2 style="margin:0 0 8px;">Recipient search</h2>
+            <div class="muted">Search by Fred, phone number, number plate, vehicle name, or internal ID.</div>
+          </div>
+          <div style="text-align:right">
+            <span class="pill">Green = nationwide</span>
+            <span class="pill">Blue = road / county / region</span>
+            <span class="pill">Red = personal</span>
+          </div>
+        </div>
+
+        <div class="searchRow" style="margin-top:14px;">
+          <input id="recipientSearch" placeholder="Search by name, phone, plate, vehicle..." />
+          <button type="button" class="blue" onclick="runSearch()">Search</button>
+        </div>
+
+        <div class="resultList" id="resultList"></div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 8px;">Compose message</h2>
+        <form method="post" action="{{ url_for('admin_message_send') }}" id="messageForm">
+          <label>Title</label>
+          <input name="title" placeholder="e.g. Roadside inspection notice" required>
+
+          <label>Message</label>
+          <textarea name="body" placeholder="Write the message here..." required></textarea>
+
+          <label>Send mode</label>
+          <select name="target_type" id="targetType">
+            <option value="single">One user</option>
+            <option value="search">Search result set</option>
+            <option value="overspeeders">Overspeeders</option>
+            <option value="road">Road</option>
+            <option value="zone">County / Region</option>
+            <option value="plate_range">Number plate range</option>
+            <option value="all">Nationwide</option>
+          </select>
+
+          <input type="hidden" name="target_device_id" id="targetDeviceId">
+          <input type="hidden" name="target_value" id="targetValue">
+          <input type="hidden" name="query" id="targetQuery">
+
+          <div class="split">
             <div>
-              <label>Title</label>
-              <input name="title" required placeholder="Enter title">
+              <label>Minimum speed (km/h)</label>
+              <input name="min_kmh" value="80" inputmode="decimal">
             </div>
             <div>
-              <label>Target type</label>
-              <select name="target_type" id="target_type" onchange="toggleTargetFields()">
-                <option value="single">One user</option>
-                <option value="all">All users</option>
-                <option value="overspeeders">Overspeeders</option>
-                <option value="zone">Zone / region</option>
-                <option value="road">Road</option>
-                <option value="county">County / text match</option>
-                <option value="search">Search text</option>
+              <label>County / region text</label>
+              <input name="county" placeholder="e.g. Nairobi">
+            </div>
+          </div>
+
+          <div class="split">
+            <div>
+              <label>Road</label>
+              <select name="road_id">
+                <option value="">-- choose road --</option>
+                {% for r in roads %}
+                  <option value="{{ r.id }}">{{ r.name }} · {{ '%.1f km/h'|format(r.speed_limit_kmh) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label>Zone</label>
+              <select name="zone_id">
+                <option value="">-- choose zone --</option>
+                {% for z in zones %}
+                  <option value="{{ z.id }}">{{ z.name }} · {{ z.scope }}</option>
+                {% endfor %}
               </select>
             </div>
           </div>
 
-          <label>Message</label>
-          <textarea name="body" rows="5" required placeholder="Type your message here"></textarea>
-
-          <div id="field_single" style="margin-top:10px;">
-            <label>Target device ID</label>
-            <input name="target_device_id" id="target_device_id" placeholder="Use the search results on the right">
-          </div>
-          <div id="field_overspeeders" style="margin-top:10px;display:none;">
-            <label>Overspeed threshold (km/h)</label>
-            <input name="min_kmh" value="80">
-          </div>
-          <div id="field_zone" style="margin-top:10px;display:none;">
-            <label>Zone</label>
-            <select name="zone_id">
-              <option value="">Select zone</option>
-              {% for z in zones %}
-                <option value="{{ z.id }}">{{ z.name }} ({{ z.scope }})</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div id="field_road" style="margin-top:10px;display:none;">
-            <label>Road</label>
-            <select name="road_id">
-              <option value="">Select road</option>
-              {% for r in roads %}
-                <option value="{{ r.id }}">{{ r.name }} — {{ r.speed_limit_kmh }} km/h</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div id="field_county" style="margin-top:10px;display:none;">
-            <label>County / text match</label>
-            <input name="county" placeholder="e.g. Nairobi">
-          </div>
-          <div id="field_search" style="margin-top:10px;display:none;">
-            <label>Search text</label>
-            <input name="query" placeholder="plate, owner, make, model">
+          <div class="split">
+            <div>
+              <label>Plate from</label>
+              <input name="plate_from" placeholder="KDA 001A">
+            </div>
+            <div>
+              <label>Plate to</label>
+              <input name="plate_to" placeholder="KDA 999Z">
+            </div>
           </div>
 
-          <button type="submit">Send message</button>
+          <div class="actions">
+            <button type="submit" class="green">Send message</button>
+            <button type="button" class="secondary" onclick="pickNationwide()">Nationwide</button>
+            <button type="button" class="secondary" onclick="pickOverspeed()">Overspeeders</button>
+          </div>
         </form>
-      </div>
 
-      <div class="card">
-        <h2>Search users</h2>
-        <input id="searchBox" placeholder="Search plate, owner, make, model..." oninput="searchDevices()">
-        <div class="muted" style="margin-top:8px;">Tap a result to copy its device ID into the message form.</div>
-        <div id="searchResults" style="margin-top:10px;max-height:520px;overflow:auto;"></div>
+        <div class="preview">
+          <div class="stat"><div class="k">Recipients</div><div class="v" id="statRecipients">0</div></div>
+          <div class="stat"><div class="k">Viewed</div><div class="v" id="statViewed">0</div></div>
+          <div class="stat"><div class="k">Unread</div><div class="v" id="statUnread">0</div></div>
+          <div class="stat"><div class="k">Deliveries</div><div class="v" id="statDelivered">0</div></div>
+        </div>
       </div>
     </div>
 
     <div class="grid">
       <div class="card">
-        <h2>Recent messages</h2>
-        <table>
-          <thead><tr><th>Title</th><th>Target</th><th>Recipients</th><th>Created</th></tr></thead>
-          <tbody>
-          {% for m in recent_messages %}
-            <tr>
-              <td>{{ m.title }}</td>
-              <td>{{ m.target_type }} {% if m.target_value %}({{ m.target_value }}){% endif %}</td>
-              <td>{{ m.recipient_count }}</td>
-              <td>{{ m.created_at.isoformat() if m.created_at else '' }}</td>
-            </tr>
-          {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <div class="card">
-        <h2>Quick targets</h2>
-        <div class="muted">One-click helper buttons</div>
-        <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;">
-          <button type="button" onclick="setTarget('all')">All users</button>
-          <button type="button" onclick="setTarget('overspeeders')">Overspeeders</button>
-          <button type="button" onclick="setTarget('zone')">Zone</button>
-          <button type="button" onclick="setTarget('road')">Road</button>
-          <button type="button" onclick="setTarget('county')">County</button>
-          <button type="button" onclick="setTarget('single')">One user</button>
+        <h2 style="margin:0 0 8px;">Recent messages</h2>
+        <div class="scroll">
+        {% for m in recent_messages %}
+          <div class="msgCard">
+            <div class="msgHead">
+              <div>
+                <div class="msgTitle">{{ m.title }}</div>
+                <div class="tiny">{{ m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else '' }} · {{ m.creator_username or 'Cloud' }}</div>
+              </div>
+              {% set c = m.target_type %}
+              {% if c in ['all','nationwide','national'] %}
+                <span class="chip green">Nationwide</span>
+              {% elif c in ['road','zone','county','region'] %}
+                <span class="chip blue">{{ c }}</span>
+              {% elif c in ['single','search'] %}
+                <span class="chip red">{{ c }}</span>
+              {% else %}
+                <span class="chip orange">{{ c }}</span>
+              {% endif %}
+            </div>
+            <div class="msgBody">{{ m.body }}</div>
+            <div class="tiny" style="margin-top:8px;">
+              Recipients: {{ m.recipient_count or 0 }}
+              <a href="javascript:void(0)" style="margin-left:10px" onclick="showStatus('{{ m.id }}')">View delivery</a>
+            </div>
+          </div>
+        {% else %}
+          <div class="muted">No messages have been sent yet.</div>
+        {% endfor %}
         </div>
-        <div class="muted" style="margin-top:12px;">The app can pop these up through the native message listener or the live socket event.</div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 8px;">Selected delivery report</h2>
+        <div class="muted" id="deliverySummary">Choose a message from the list.</div>
+        <div id="deliveryList" class="scroll" style="max-height:600px;margin-top:12px;"></div>
       </div>
     </div>
   </div>
 
 <script>
-function toggleTargetFields(){
-  const t = document.getElementById('target_type').value;
-  const ids = ['field_single','field_overspeeders','field_zone','field_road','field_county','field_search'];
-  ids.forEach(id => document.getElementById(id).style.display = 'none');
-  if (t === 'single') document.getElementById('field_single').style.display = 'block';
-  if (t === 'overspeeders') document.getElementById('field_overspeeders').style.display = 'block';
-  if (t === 'zone') document.getElementById('field_zone').style.display = 'block';
-  if (t === 'road') document.getElementById('field_road').style.display = 'block';
-  if (t === 'county') document.getElementById('field_county').style.display = 'block';
-  if (t === 'search') document.getElementById('field_search').style.display = 'block';
+let searchTimer = null;
+
+function setTarget(type, value='') {
+  document.getElementById('targetType').value = type;
+  document.getElementById('targetValue').value = value || '';
 }
-function setTarget(v){
-  document.getElementById('target_type').value = v;
-  toggleTargetFields();
+
+function pickNationwide(){
+  setTarget('all','');
+  document.getElementById('statRecipients').textContent = '—';
 }
-async function searchDevices(){
-  const q = document.getElementById('searchBox').value.trim();
-  const res = await fetch('/admin/message/search-devices?q=' + encodeURIComponent(q), {cache:'no-store'});
-  const j = await res.json();
-  const box = document.getElementById('searchResults');
-  const devices = j.devices || [];
-  if (!devices.length){ box.innerHTML = '<div class="muted" style="padding:10px;">No devices found.</div>'; return; }
-  box.innerHTML = devices.map(d => {
-    const line1 = [d.owner, d.car_name, d.car_model, d.plate].filter(Boolean).join(' • ');
-    const line2 = [d.speed_kmh ? d.speed_kmh + ' km/h' : '', d.ts || ''].filter(Boolean).join(' • ');
-    return `<div class="result"><div><strong>${line1 || d.id}</strong><small>${line2}</small><small>${d.id}</small></div><div><button type="button" onclick="pickDevice('${d.id}')">Use</button></div></div>`;
+function pickOverspeed(){
+  setTarget('overspeeders','');
+}
+
+function applySelection(item) {
+  if (!item) return;
+  document.getElementById('targetType').value = 'single';
+  document.getElementById('targetDeviceId').value = item.id || '';
+  document.getElementById('targetValue').value = item.id || '';
+  document.getElementById('targetQuery').value = item.owner || '';
+  document.getElementById('recipientSearch').value = item.owner || item.phone_number || item.plate || '';
+  updatePreviewCounts(1, item.phone_number ? 1 : 0, 0, 0);
+}
+
+function renderResults(items) {
+  const box = document.getElementById('resultList');
+  if (!box) return;
+  if (!items || !items.length) {
+    box.innerHTML = '<div class="muted">No matches found.</div>';
+    return;
+  }
+  box.innerHTML = items.map(item => {
+    const safeOwner = (item.owner || 'Unknown').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safePhone = (item.phone_number || '—').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safePlate = (item.plate || '—').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeId = (item.id || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const speed = item.speed_kmh != null ? `${item.speed_kmh} km/h` : '—';
+    return `
+      <div class="result">
+        <div class="resultTop">
+          <div>
+            <div class="name">${safeOwner}</div>
+            <div class="meta">Phone: ${safePhone}<br>Plate: ${safePlate}<br>ID: ${safeId}<br>Last speed: ${speed}</div>
+          </div>
+          <div class="actions" style="margin:0">
+            <button type="button" class="blue" onclick='selectRecipient(${JSON.stringify(item).replace(/'/g,"&#39;")})'>Select</button>
+          </div>
+        </div>
+      </div>
+    `;
   }).join('');
 }
-function pickDevice(id){
-  document.getElementById('target_type').value = 'single';
-  toggleTargetFields();
-  document.getElementById('target_device_id').value = id;
-  window.scrollTo({top:0, behavior:'smooth'});
+
+function updatePreviewCounts(recipients, viewed, unread, delivered) {
+  document.getElementById('statRecipients').textContent = recipients ?? '0';
+  document.getElementById('statViewed').textContent = viewed ?? '0';
+  document.getElementById('statUnread').textContent = unread ?? '0';
+  document.getElementById('statDelivered').textContent = delivered ?? '0';
 }
-toggleTargetFields();
-searchDevices();
+
+function runSearch() {
+  const q = document.getElementById('recipientSearch').value.trim();
+  document.getElementById('targetType').value = q ? 'search' : 'single';
+  document.getElementById('targetQuery').value = q;
+  fetch('{{ url_for("admin_message_search_devices") }}?q=' + encodeURIComponent(q))
+    .then(r => r.json())
+    .then(data => {
+      renderResults(data.devices || []);
+      updatePreviewCounts((data.devices || []).length, 0, 0, 0);
+    })
+    .catch(() => {
+      document.getElementById('resultList').innerHTML = '<div class="muted">Search failed.</div>';
+    });
+}
+
+function selectRecipient(item) {
+  applySelection(item);
+  renderResults([item]);
+}
+
+function showStatus(messageId) {
+  fetch('{{ url_for("admin_message_status", message_id="__ID__") }}'.replace('__ID__', messageId))
+    .then(r => r.json())
+    .then(data => {
+      const stats = data.stats || {};
+      const recipients = data.recipients || [];
+      document.getElementById('deliverySummary').innerHTML =
+        `<b>${data.message.title}</b><br>Recipients: ${stats.total || 0} · Delivered: ${stats.delivered || 0} · Viewed: ${stats.read || 0} · Unread: ${stats.unread || 0} · Viewed %: ${stats.read_pct || 0}%`;
+      document.getElementById('deliveryList').innerHTML = recipients.map(r => {
+        const viewed = r.read_at ? 'Viewed' : 'Not viewed';
+        return `<div class="result"><div><div class="name">${r.owner || 'Unknown'}</div><div class="meta">Phone: ${r.phone_number || '—'}<br>Plate: ${r.plate || '—'}<br>${viewed}</div></div></div>`;
+      }).join('');
+    })
+    .catch(() => {
+      document.getElementById('deliverySummary').textContent = 'Could not load delivery report.';
+    });
+}
+
+document.getElementById('recipientSearch').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 260);
+});
+
+document.getElementById('messageForm').addEventListener('submit', () => {
+  const q = document.getElementById('recipientSearch').value.trim();
+  document.getElementById('targetQuery').value = q;
+});
+runSearch();
 </script>
 </body>
 </html>
 """
-@app.route('/admin/devices')
-def admin_devices():
-    if _current_role() != 'admin':
-        return redirect(url_for('admin_login'))
-    devices = Device.query.all()
-    out = []
-    prune_active_devices()
-    for d in devices:
-        snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
-        last = None
-        if snap:
-            parsed_raw = None
-            if snap.raw:
-                try:
-                    parsed_raw = json.loads(snap.raw)
-                except Exception:
-                    parsed_raw = snap.raw
-            last = {
-                "ts": snap.ts.isoformat(),
-                "lat": snap.lat,
-                "lon": snap.lon,
-                "speed_mps": round(snap.speed_mps, 3),
-                "bearing_deg": round(snap.bearing_deg, 1),
-                "raw": parsed_raw
-            }
-        else:
-            with active_devices_lock:
-                entry = active_devices.get(d.id)
-            if entry:
-                parsed_raw = entry.get("raw")
-                last = {
-                    "ts": entry.get("ts").isoformat() if entry.get("ts") else None,
-                    "lat": entry.get("lat"),
-                    "lon": entry.get("lon"),
-                    "speed_mps": round(entry.get("speed_mps") or 0.0, 3),
-                    "bearing_deg": round(entry.get("bearing_deg") or 0.0, 1),
-                    "raw": parsed_raw
-                }
-
-        out.append({
-            "id": d.id,
-            "owner": d.owner,
-            "car_name": d.car_name,
-            "car_model": d.car_model,
-            "plate": d.plate,
-            "extra": d.extra,
-            "created_at": d.created_at.isoformat() if d.created_at else None,
-            "revoked": bool(d.revoked),
-            "last_snapshot": last,
-            "connected": bool(connected_sockets.get(d.id))
-        })
-    return jsonify({"devices": out})
-
-@app.route('/admin/device/<device_id>/json')
-def admin_device_json(device_id):
-    d = Device.query.get_or_404(device_id)
-    snaps = _recent_snapshots_for_device(device_id, limit=20)
-    snaps_out = []
-    for s in snaps:
-        parsed_raw = None
-        if s.raw:
-            try:
-                parsed_raw = json.loads(s.raw)
-            except Exception:
-                parsed_raw = s.raw
-        snaps_out.append({
-            "ts": s.ts.isoformat(),
-            "lat": s.lat,
-            "lon": s.lon,
-            "speed_mps": s.speed_mps,
-            "bearing_deg": s.bearing_deg,
-            "source": s.source,
-            "raw": parsed_raw
-        })
-
-    if not snaps_out:
-        with active_devices_lock:
-            entry = active_devices.get(device_id)
-        if entry:
-            snaps_out.append({
-                "ts": entry.get("ts").isoformat() if entry.get("ts") else None,
-                "lat": entry.get("lat"),
-                "lon": entry.get("lon"),
-                "speed_mps": entry.get("speed_mps"),
-                "bearing_deg": entry.get("bearing_deg"),
-                "source": entry.get("source", "app"),
-                "raw": entry.get("raw")
-            })
-
-    last = snaps_out[0] if snaps_out else None
-    return jsonify({
-        "device": {
-            "id": d.id,
-            "owner": d.owner,
-            "car_name": d.car_name,
-            "car_model": d.car_model,
-            "plate": d.plate,
-            "extra": d.extra,
-            "created_at": d.created_at.isoformat() if d.created_at else None,
-            "revoked": bool(d.revoked)
-        },
-        "last_snapshot": last,
-        "snapshots": snaps_out,
-        "connected": bool(connected_sockets.get(d.id))
-    })
-
-@app.route('/admin/device/<device_id>/revoke', methods=['POST'])
-def admin_device_revoke(device_id):
-    d = Device.query.get_or_404(device_id)
-    d.revoked = True
-    db.session.commit()
-    sids = connected_sockets.pop(device_id, None)
-    with active_devices_lock:
-        active_devices.pop(device_id, None)
-    return jsonify({"ok": True, "revoked": True})
-
-# -------------------------
-# Messaging helpers / routes
-# -------------------------
-
-def _latest_snapshots_map():
-    latest = {}
-    for snap in Snapshot.query.order_by(Snapshot.ts.desc()).all():
-        if snap.device_id not in latest:
-            latest[snap.device_id] = snap
-    return latest
-
-
-def _device_blob(device):
-    extra_obj = None
-    if device.extra:
-        try:
-            extra_obj = json.loads(device.extra)
-        except Exception:
-            extra_obj = device.extra
-    return {
-        'id': device.id,
-        'token': device.token,
-        'owner': device.owner,
-        'car_name': device.car_name,
-        'car_model': device.car_model,
-        'plate': device.plate,
-        'extra': extra_obj,
-    }
-
-
-def _device_text_match(device, q):
-    if not q:
-        return True
-    q = q.lower().strip()
-    hay = ' '.join([
-        str(device.id or ''), str(device.owner or ''), str(device.car_name or ''),
-        str(device.car_model or ''), str(device.plate or ''), str(device.extra or '')
-    ]).lower()
-    return q in hay
-
-
-def _target_devices_for_message(body):
-    latest = _latest_snapshots_map()
-    target_type = (body.get('target_type') or 'single').strip().lower()
-    target_value = (body.get('target_value') or '').strip()
-    recipients = []
-
-    devices = Device.query.filter_by(revoked=False).all()
-    if target_type == 'all':
-        recipients = devices
-    elif target_type == 'single':
-        did = (body.get('target_device_id') or target_value or '').strip()
-        if did:
-            d = Device.query.filter_by(id=did, revoked=False).first()
-            recipients = [d] if d else []
-    elif target_type == 'overspeeders':
-        min_kmh = float(body.get('min_kmh') or 80.0)
-        recipients = []
-        for d in devices:
-            snap = latest.get(d.id)
-            if snap and (float(snap.speed_mps or 0.0) * 3.6) >= min_kmh:
-                recipients.append(d)
-    elif target_type == 'road':
-        road_id = (body.get('road_id') or target_value or '').strip()
-        road = Road.query.get(road_id) if road_id else None
-        if road and road.center_lat is not None and road.center_lon is not None and road.radius_m is not None:
-            for d in devices:
-                snap = latest.get(d.id)
-                if snap and haversine_m(snap.lat, snap.lon, road.center_lat, road.center_lon) <= float(road.radius_m):
-                    recipients.append(d)
-    elif target_type == 'zone':
-        zone_id = (body.get('zone_id') or target_value or '').strip()
-        zone = TrafficZone.query.get(zone_id) if zone_id else None
-        if zone:
-            for d in devices:
-                snap = latest.get(d.id)
-                if snap and _zone_matches(zone, snap.lat, snap.lon):
-                    recipients.append(d)
-    elif target_type == 'county':
-        county = (body.get('county') or target_value or '').strip().lower()
-        if county:
-            for d in devices:
-                if county in ' '.join([str(d.owner or ''), str(d.car_name or ''), str(d.car_model or ''), str(d.plate or ''), str(d.extra or '')]).lower():
-                    recipients.append(d)
-    elif target_type == 'search':
-        q = (body.get('query') or target_value or '').strip()
-        recipients = [d for d in devices if _device_text_match(d, q)]
-    else:
-        recipients = []
-
-    seen = set()
-    out = []
-    for d in recipients:
-        if not d or d.id in seen:
-            continue
-        seen.add(d.id)
-        out.append(d)
-    return out
-
-
-def _serialize_message(msg, recipient_count=None):
-    return {
-        'id': msg.id,
-        'title': msg.title,
-        'body': msg.body,
-        'target_type': msg.target_type,
-        'target_value': msg.target_value,
-        'creator_role': msg.creator_role,
-        'creator_username': msg.creator_username,
-        'recipient_count': recipient_count if recipient_count is not None else msg.recipient_count,
-        'created_at': msg.created_at.isoformat() if msg.created_at else None,
-    }
-
-
-def _pending_messages_for_device(device_id, mark_delivered=True):
-    rows = (
-        db.session.query(BroadcastDelivery, BroadcastMessage)
-        .join(BroadcastMessage, BroadcastMessage.id == BroadcastDelivery.message_id)
-        .filter(BroadcastDelivery.device_id == device_id)
-        .filter(BroadcastDelivery.delivered_at.is_(None))
-        .order_by(BroadcastMessage.created_at.asc())
-        .all()
-    )
-    messages = []
-    now = datetime.utcnow()
-    for delivery, msg in rows:
-        messages.append(_serialize_message(msg))
-        if mark_delivered:
-            delivery.delivered_at = now
-    if mark_delivered and rows:
-        db.session.commit()
-    return messages
-
-
-def _create_message_and_dispatch(body):
-    title = (body.get('title') or '').strip()
-    message_body = (body.get('body') or body.get('message') or '').strip()
-    if not title or not message_body:
-        return None, 'title and body are required'
-
-    recipients = _target_devices_for_message(body)
-    msg = BroadcastMessage(
-        title=title,
-        body=message_body,
-        target_type=(body.get('target_type') or 'single').strip().lower(),
-        target_value=(body.get('target_value') or body.get('target_device_id') or body.get('zone_id') or body.get('road_id') or body.get('county') or body.get('query') or ''),
-        creator_role=_current_role() or 'admin',
-        creator_username=session.get('username') or session.get('admin_user') or '' ,
-        recipient_count=len(recipients),
-    )
-    db.session.add(msg)
-    db.session.commit()
-
-    now = datetime.utcnow()
-    for d in recipients:
-        db.session.add(BroadcastDelivery(message_id=msg.id, device_id=d.id, delivered_at=None, read_at=None))
-    db.session.commit()
-
-    payload = _serialize_message(msg, recipient_count=len(recipients))
-    payload['device_ids'] = [d.id for d in recipients]
-    payload['app_action'] = 'popup'
-
-    for d in recipients:
-        try:
-            send_ws_to_device(d.id, 'admin_message', payload)
-        except Exception:
-            pass
-    return payload, None
-
-
 @app.route('/admin/messages', methods=['GET', 'POST'])
 def admin_messages():
     role = _current_role()
@@ -2896,20 +2756,32 @@ def admin_message_search_devices():
     latest = _latest_snapshots_map()
     out = []
     for d in devices:
-        if q and q not in ' '.join([str(d.id or ''), str(d.owner or ''), str(d.car_name or ''), str(d.car_model or ''), str(d.plate or ''), str(d.extra or '')]).lower():
+        phone = _device_phone_number(d)
+        hay = ' '.join([
+            str(d.id or ''),
+            str(d.owner or ''),
+            str(d.car_name or ''),
+            str(d.car_model or ''),
+            str(d.plate or ''),
+            str(phone or ''),
+            str(d.extra or '')
+        ]).lower()
+        if q and q not in hay:
             continue
         snap = latest.get(d.id)
         out.append({
             'id': d.id,
             'owner': d.owner,
+            'phone_number': phone,
             'car_name': d.car_name,
             'car_model': d.car_model,
             'plate': d.plate,
-            'extra': d.extra,
+            'search_text': hay,
+            'extra': _device_extra_object(d),
             'speed_kmh': round(float(snap.speed_mps or 0.0) * 3.6, 1) if snap else None,
             'ts': snap.ts.isoformat() if snap and snap.ts else None,
         })
-        if len(out) >= 50:
+        if len(out) >= 60:
             break
     return jsonify({'devices': out})
 
@@ -2925,6 +2797,120 @@ def device_messages():
             return jsonify({'error': 'Missing or invalid token'}), 401
     messages = _pending_messages_for_device(device.id, mark_delivered=True)
     return jsonify({'ok': True, 'messages': messages})
+
+
+@app.route('/device/messages/view', methods=['GET'])
+def device_messages_view():
+    device_id = (request.args.get('device_id') or '').strip()
+    token = (request.args.get('token') or '').strip()
+    device = find_device_by_token(token)
+    if not device and device_id and token:
+        device = restore_device_if_missing(device_id, token)
+    if not device:
+        return _safe_render("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Taifa Messages</title>
+  <style>
+    body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1220;color:#e5eefb;margin:0;padding:24px}
+    .card{max-width:760px;margin:0 auto;background:#101a2d;border:1px solid rgba(148,163,184,.15);border-radius:20px;padding:20px}
+  </style>
+</head>
+<body><div class="card"><h1>Taifa Messages</h1><p>Open this view from the app with a valid device token.</p></div></body></html>
+""")
+
+    deliveries = (
+        db.session.query(BroadcastDelivery, BroadcastMessage)
+        .join(BroadcastMessage, BroadcastMessage.id == BroadcastDelivery.message_id)
+        .filter(BroadcastDelivery.device_id == device.id)
+        .order_by(BroadcastMessage.created_at.asc())
+        .all()
+    )
+    now = datetime.utcnow()
+    items = []
+    for delivery, msg in deliveries:
+        if delivery.delivered_at is None:
+            delivery.delivered_at = now
+        if delivery.read_at is None:
+            delivery.read_at = now
+        items.append({
+            "id": msg.id,
+            "title": msg.title,
+            "body": msg.body,
+            "target_type": msg.target_type,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            "creator_username": msg.creator_username,
+        })
+    if deliveries:
+        db.session.commit()
+
+    def bubble_class(target_type):
+        t = (target_type or '').lower()
+        if t in {'all','nationwide','national'}: return 'green'
+        if t in {'road','zone','county','region'}: return 'blue'
+        if t in {'single','search'}: return 'red'
+        if t in {'overspeeders','plate_range'}: return 'orange'
+        return 'blue'
+
+    return _safe_render("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Taifa Messages</title>
+  <style>
+    :root{--bg:#eef2f7;--card:#ffffff;--muted:#64748b;--green:#16a34a;--blue:#2563eb;--red:#dc2626;--orange:#f97316;}
+    body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#e7eef7 0%, #f8fafc 100%);color:#0f172a}
+    .wrap{max-width:860px;margin:0 auto;padding:16px}
+    .head{position:sticky;top:0;background:rgba(248,250,252,.92);backdrop-filter:blur(10px);border:1px solid #e2e8f0;border-radius:18px;padding:14px 16px;margin-bottom:12px;display:flex;justify-content:space-between;gap:12px;align-items:center}
+    .title{font-weight:800;font-size:20px}
+    .subtitle{font-size:13px;color:var(--muted)}
+    .chip{display:inline-block;padding:6px 10px;border-radius:999px;color:#fff;font-size:12px;font-weight:700}
+    .green{background:var(--green)} .blue{background:var(--blue)} .red{background:var(--red)} .orange{background:var(--orange)}
+    .msg{background:var(--card);border:1px solid #e2e8f0;border-radius:20px;padding:14px 14px 12px;margin:12px 0;box-shadow:0 10px 24px rgba(15,23,42,.06)}
+    .msghead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:8px}
+    .msgtitle{font-weight:800;font-size:16px}
+    .meta{font-size:12px;color:var(--muted);margin-top:4px}
+    .body{font-size:14px;line-height:1.55;white-space:pre-wrap}
+    .empty{padding:24px;text-align:center;color:var(--muted)}
+    .foot{padding:10px 4px 18px;color:var(--muted);font-size:12px;text-align:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div>
+        <div class="title">Taifa Messages</div>
+        <div class="subtitle">{{ device.owner or device.plate or device.id[:8] }} · {{ device.plate or 'no plate' }}</div>
+      </div>
+      <div class="chip green">Live inbox</div>
+    </div>
+    {% if items %}
+      {% for item in items %}
+        <div class="msg">
+          <div class="msghead">
+            <div>
+              <div class="msgtitle">{{ item.title }}</div>
+              <div class="meta">{{ item.created_at[:16].replace('T', ' ') if item.created_at else '' }} · {{ item.creator_username or 'Cloud' }}</div>
+            </div>
+            <div class="chip {{ bubble_class(item.target_type) }}">
+              {{ item.target_type.replace('_',' ').title() }}
+            </div>
+          </div>
+          <div class="body">{{ item.body }}</div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty">No messages yet.</div>
+    {% endif %}
+    <div class="foot">Green = nationwide · Blue = county/road/region · Red = personal · Orange = overspeed or watchlist</div>
+  </div>
+</body>
+</html>
+""", device=device, items=items, bubble_class=bubble_class)
 
 
 @app.route('/admin/message/send', methods=['POST'])
@@ -2945,6 +2931,19 @@ def admin_messages_html_snippet():
     if role not in {'admin', 'gk'}:
         return redirect(url_for('admin_login'))
     return _safe_render(MESSAGES_HTML, devices=[], speeders=[], roads=[], zones=[], recent_messages=[])
+
+
+@app.route('/admin/messages/<message_id>/status')
+def admin_message_status(message_id):
+    role = _current_role()
+    if role not in {'admin', 'gk'}:
+        return redirect(url_for('admin_login'))
+    msg = BroadcastMessage.query.get_or_404(message_id)
+    return jsonify({
+        "message": _serialize_message(msg),
+        "stats": _message_delivery_stats(message_id),
+        "recipients": _message_recipient_rows(message_id),
+    })
 
 
 @app.route('/admin/roads', methods=['GET', 'POST'])
