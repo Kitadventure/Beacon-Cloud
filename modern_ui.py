@@ -22,6 +22,7 @@ BroadcastMessage = legacy.BroadcastMessage
 BroadcastDelivery = legacy.BroadcastDelivery
 PoliceUser = legacy.PoliceUser
 GKUser = legacy.GKUser
+Admin = legacy.Admin
 SystemError = globals().get("SystemError")
 LiveVehicleState = globals().get("LiveVehicleState")
 AuthorityInboxMessage = globals().get("AuthorityInboxMessage")
@@ -53,7 +54,7 @@ SHELL = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light"><meta name="beacon-ui-version" content="2026.09.25-map2">
 <title>{{ title }} · Beacon Cloud</title>
 <style>
 *{box-sizing:border-box}html,body{margin:0;padding:0;background:{{ bg }};color:{{ text }};font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}a{color:inherit;text-decoration:none}
@@ -112,7 +113,7 @@ def _esc(v):
 
 def _sidebar(role: str, active: str):
     groups = [
-        ("Overview", [("dashboard", "Dashboard", "▦")]),
+        ("Overview", [("dashboard", "Dashboard", "▦"), ("modern_vehicle_map", "Live vehicle map", "⌖")]),
         ("Operations", [
             ("modern_devices_page", "Vehicles & devices", "◉"),
             ("modern_messages_page", "Messages", "✉"),
@@ -250,7 +251,7 @@ DASHBOARD_BODY = """
 <div class="card"><div class="row-between"><h2>Recent vehicle activity</h2><a class="btn" href="__DEV__">Open all</a></div><div id="recent" class="list"><div class="small-muted">Loading…</div></div></div>
 <div class="card"><div class="row-between"><h2>System health</h2><a class="btn" href="__HEALTH__">Details</a></div><div class="stack" id="health"></div></div>
 </div>
-<div class="hero" style="margin-top:14px"><div class="row-between"><div><h2 style="margin:0 0 4px">Live map is available when needed</h2><p class="page-sub">The dashboard stays light by not loading thousands of map/history objects on every refresh.</p></div><a class="btn btn-soft" href="__TRAFFIC__">Open traffic operations</a></div></div>
+<div class="hero" style="margin-top:14px"><div class="row-between"><div><h2 style="margin:0 0 4px">Live vehicle map</h2><p class="page-sub">Open the dedicated map when geographic visibility is needed; the dashboard stays fast.</p></div><a class="btn btn-soft" href="__MAP__">Open live map</a></div></div>
 """
 
 
@@ -273,7 +274,7 @@ def modern_dashboard():
         return resp
     body = DASHBOARD_BODY.replace("__MSG__", url_for("admin_messages")).replace("__REP__", url_for("authority_reports"))\
         .replace("__DEV__", url_for("admin_devices")).replace("__HEALTH__", url_for("modern_settings_page"))\
-        .replace("__TRAFFIC__", url_for("modern_traffic_hub"))
+        .replace("__MAP__", url_for("modern_vehicle_map"))
     return _render("Dashboard", body, "dashboard", _dashboard_script(), role)
 
 
@@ -559,6 +560,111 @@ def modern_create_authority():
     return redirect(url_for("modern_users_page"))
 
 
+
+def modern_vehicle_map():
+    role, resp = _require_roles("admin", "police", "gk")
+    if resp:
+        return resp
+    data_url = url_for("modern_map_data")
+    body = """
+<div class="page-head"><div><div class="eyebrow">Geographic operations</div><h1 class="page-title">Live vehicle map</h1><p class="page-sub">Every live vehicle is represented. Dense areas are aggregated into counted dots/clusters so the map remains usable at very large fleet sizes.</p></div><div class="toolbar"><span class="pill" id="mapStatus">Loading map…</span><button class="btn" id="mapRefresh">Refresh</button></div></div>
+<div class="card"><div id="vehicleMap" style="height:calc(100vh - 190px);min-height:520px;border-radius:14px;overflow:hidden;background:#e9eef3"></div><div class="row-between" style="margin-top:9px"><span class="small-muted" id="mapSummary">Preparing live fleet view…</span><span class="small-muted">Click a vehicle/cluster for details. Coordinates are hidden until a detail is opened.</span></div></div>
+"""
+    js = f"""
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function(){{
+  const host=document.getElementById('vehicleMap');
+  const status=document.getElementById('mapStatus');
+  const summary=document.getElementById('mapSummary');
+  const map=L.map(host,{{preferCanvas:true,worldCopyJump:true}}).setView([-1.286,36.817],6);
+  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'© OpenStreetMap contributors'}}).addTo(map);
+  const layer=L.layerGroup().addTo(map);
+  const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+  function boundsParams(){{
+    const b=map.getBounds();
+    return new URLSearchParams({{min_lat:b.getSouth(),max_lat:b.getNorth(),min_lon:b.getWest(),max_lon:b.getEast(),zoom:map.getZoom()}}).toString();
+  }}
+  function dot(lat,lon,count,place,deviceId,detailsUrl,statusText){{
+    const single=count===1;
+    const size=single?7:Math.min(28,8+Math.log2(Math.max(2,count))*4);
+    const m=L.circleMarker([lat,lon],{{radius:size,weight:2,fillOpacity:.78}}).addTo(layer);
+    if(single){{
+      m.bindPopup('<strong>Vehicle</strong><br>'+esc(place||'Place locating…')+'<br>'+esc(statusText||'Live')+'<br><a href="'+esc(detailsUrl)+'">Open details</a>');
+    }} else {{
+      m.bindPopup('<strong>'+esc(count.toLocaleString())+' vehicles</strong><br>'+esc(place||'Multiple vehicles in this area')+'<br><span>Zoom in to separate vehicles.</span>');
+    }}
+  }}
+  async function load(){{
+    try{{
+      status.textContent='Updating…';
+      const r=await fetch('{data_url}?'+boundsParams(),{{cache:'no-store'}});
+      const d=await r.json();
+      if(!d.ok) throw new Error(d.error||'Map data unavailable');
+      layer.clearLayers();
+      for(const c of (d.clusters||[])) dot(c.lat,c.lon,c.count,c.place_name,c.device_id,c.details_url,c.connection_state);
+      for(const v of (d.vehicles||[])) dot(v.lat,v.lon,1,v.place_name,v.device_id,v.details_url,v.connection_state);
+      summary.textContent=`${{Number(d.total||0).toLocaleString()}} live vehicle(s) represented · ${{Number(d.clusters||0).toLocaleString()}} clusters · ${{Number(d.vehicles?.length||0).toLocaleString()}} individual dots`;
+      status.textContent=d.total?'LIVE MAP':'No live vehicles';
+    }}catch(e){{
+      status.textContent='Map unavailable'; summary.textContent=String(e.message||e); beaconReportError(e,'vehicle-map');
+    }}
+  }}
+  map.on('moveend zoomend',()=>{{clearTimeout(window.__mapTimer);window.__mapTimer=setTimeout(load,180)}});
+  document.getElementById('mapRefresh').addEventListener('click',load);
+  load(); setInterval(load,15000);
+}})();
+</script>
+"""
+    return _render("Live vehicle map", body, "modern_vehicle_map", js, role)
+
+
+def modern_map_data():
+    role, resp = _require_roles("admin", "police", "gk")
+    if resp:
+        return resp
+    try:
+        min_lat=float(request.args.get("min_lat",-90)); max_lat=float(request.args.get("max_lat",90))
+        min_lon=float(request.args.get("min_lon",-180)); max_lon=float(request.args.get("max_lon",180))
+        zoom=max(0,min(19,int(request.args.get("zoom",6))))
+        if min_lat>=max_lat or min_lon>=max_lon: raise ValueError("Invalid map bounds")
+    except Exception as exc:
+        return jsonify({"ok":False,"error":"Invalid map viewport","request_id":str(uuid.uuid4())}),400
+    try:
+        q=LiveVehicleState.query.filter(LiveVehicleState.lat>=min_lat,LiveVehicleState.lat<=max_lat,LiveVehicleState.lon>=min_lon,LiveVehicleState.lon<=max_lon)
+        total=q.count()
+        # Dense view: server-side grid aggregation. No million-point browser payloads.
+        if total>2200 or zoom<11:
+            span=max(max_lat-min_lat,max_lon-min_lon)
+            cell=max(span/24.0,0.0002)
+            sql=db.text("""
+                SELECT CAST((lat-:min_lat)/:cell AS INTEGER) AS gx,
+                       CAST((lon-:min_lon)/:cell AS INTEGER) AS gy,
+                       COUNT(*) AS n, AVG(lat) AS lat, AVG(lon) AS lon,
+                       MAX(updated_at) AS newest
+                FROM live_vehicle_state
+                WHERE lat BETWEEN :min_lat AND :max_lat
+                  AND lon BETWEEN :min_lon AND :max_lon
+                GROUP BY gx, gy
+                ORDER BY n DESC
+                LIMIT 5000
+            """)
+            rows=db.session.execute(sql,{{"min_lat":min_lat,"max_lat":max_lat,"min_lon":min_lon,"max_lon":max_lon,"cell":cell,"cutoff":cutoff}}).mappings().all()
+            clusters=[{{"lat":float(r["lat"]),"lon":float(r["lon"]),"count":int(r["n"]),"place_name":None}} for r in rows]
+            return jsonify({"ok":True,"total":total,"clusters":clusters,"vehicles":[],"clustered":True})
+        rows=q.order_by(LiveVehicleState.updated_at.desc()).limit(5000).all()
+        out=[]
+        for st in rows:
+            age=(datetime.utcnow()-st.updated_at).total_seconds() if st.updated_at else 10**9
+            state_name="REAL-TIME" if age<30 else ("TELEMETRY ONLINE" if age<180 else "OFFLINE")
+            out.append({"device_id":st.device_id,"lat":float(st.lat),"lon":float(st.lon),"place_name":st.place_name,"connection_state":state_name,"details_url":url_for("modern_device_detail",device_id=st.device_id)})
+        return jsonify({"ok":True,"total":total,"clusters":[],"vehicles":out,"clustered":False})
+    except Exception as exc:
+        if _core: _core.record_system_error(exc,source="ui:vehicle-map",severity="ERROR")
+        return jsonify({"ok":False,"error":"Vehicle map data unavailable","request_id":_core._request_id() if _core else str(uuid.uuid4())}),200
+
+
 def modern_traffic_hub():
     role, resp = _require_roles("admin", "police", "gk")
     if resp:
@@ -566,44 +672,12 @@ def modern_traffic_hub():
     data_url = url_for("modern_device_data")
     roads_url = url_for("admin_roads")
     speeders_url = url_for("admin_speeders")
-    zones_url = url_for("admin_traffic_zones")
+    zones_url = url_for("admin_traffic")
     body = f"""
 <div class="page-head"><div><div class="eyebrow">Intelligence</div><h1 class="page-title">Traffic operations</h1><p class="page-sub">Live traffic is plotted internally from telemetry, while operators see place names and operational state first.</p></div></div>
-<div class="card"><div class="row-between"><h2>Live traffic map</h2><button class="btn" id="refreshMap">Refresh</button></div><div id="trafficMap" style="height:520px;border-radius:14px;overflow:hidden;background:#e8eef3;margin-top:12px"></div><div class="small-muted" style="margin-top:9px">Open a marker for technical coordinates when required.</div></div>
 <div class="grid grid-2" style="margin-top:14px"><a class="list-item" href="{roads_url}"><strong>Roads</strong><div class="small-muted">Manage road safety profiles.</div></a><a class="list-item" href="{speeders_url}"><strong>Speeders</strong><div class="small-muted">Review speed events.</div></a><a class="list-item" href="{zones_url}"><strong>Traffic zones</strong><div class="small-muted">Manage operational zones.</div></a></div>
 """
-    js = f"""
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-(function(){{
-const mapEl=document.getElementById('trafficMap');
-function esc(v){{return String(v??'').replace(/[&<>\"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}}[c]));}}
-async function loadMap(){{
- try{{
-   if(!window.L){{mapEl.innerHTML='<div class="empty" style="padding:80px">Map library unavailable. Vehicle operations remain available.</div>';return;}}
-   const r=await fetch('{data_url}?limit=200',{{cache:'no-store'}});
-   const d=await r.json();
-   if(window._beaconMap) window._beaconMap.remove();
-   window._beaconMap=L.map(mapEl).setView([-1.286,36.817],11);
-   L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'© OpenStreetMap contributors'}}).addTo(window._beaconMap);
-   const points=[];
-   (d.items||[]).forEach(v=>{{
-      if(v.lat==null||v.lon==null)return;
-      points.push([v.lat,v.lon]);
-      const m=L.marker([v.lat,v.lon]).addTo(window._beaconMap);
-      m.bindPopup('<strong>'+esc(v.owner||v.id)+'</strong><br>'+esc(v.place_name||'Place pending')+'<br>'+esc(v.connection_state||'OFFLINE')+'<br><details><summary>Technical details</summary>Lat: '+esc(v.lat)+'<br>Lon: '+esc(v.lon)+'</details>');
-   }});
-   if(points.length===1) window._beaconMap.setView(points[0],16);
-   if(points.length>1) window._beaconMap.fitBounds(points,{{padding:[28,28],maxZoom:16}});
- }}catch(e){{beaconReportError(e,'traffic.map');mapEl.innerHTML='<div class="empty" style="padding:80px">Traffic map could not be loaded.</div>';}}
-}}
-document.getElementById('refreshMap').addEventListener('click',loadMap);
-loadMap();
-setInterval(loadMap,20000);
-}})();
-</script>
-"""
+    js = ""
     return _render("Traffic operations", body, "modern_traffic_hub", js, role)
 
 def modern_reports_page():
@@ -669,13 +743,23 @@ def modern_settings_page():
     return _render("System health",body,"modern_settings_page",role=role)
 
 
+_client_error_last = {}
+_client_error_lock = threading.RLock()
 def modern_client_error():
     role, resp = _require_roles("admin", "police", "gk")
     if resp: return resp
     body=request.get_json(silent=True) or {}
     try:
-        exc=RuntimeError((body.get("message") or "Authority client error")[:4000])
-        if _core: _core.record_system_error(exc,source=f"ui:{str(body.get('context') or 'authority')[:100]}",severity="WARNING")
+        msg=(body.get("message") or "Authority client error")[:4000]
+        source=str(body.get('context') or 'authority')[:100]
+        key=f"{source}|{msg}"
+        now=time.time()
+        with _client_error_lock:
+            if now-_client_error_last.get(key,0)<15:
+                return jsonify({"ok":True,"deduplicated":True})
+            _client_error_last[key]=now
+        exc=RuntimeError(msg)
+        if _core: _core.record_system_error(exc,source=f"ui:{source}",severity="WARNING")
     except Exception: pass
     return jsonify({"ok":True})
 
@@ -817,6 +901,8 @@ def install_modern_ui(core):
     app.add_url_rule("/admin/messages/send", endpoint="modern_message_send", view_func=modern_message_send, methods=["POST"])
     app.add_url_rule("/admin/users/create-authority", endpoint="modern_create_authority", view_func=modern_create_authority, methods=["POST"])
     app.add_url_rule("/admin/traffic-hub", endpoint="modern_traffic_hub", view_func=modern_traffic_hub, methods=["GET"])
+    app.add_url_rule("/admin/map", endpoint="modern_vehicle_map", view_func=modern_vehicle_map, methods=["GET"])
+    app.add_url_rule("/modern/api/map", endpoint="modern_map_data", view_func=modern_map_data, methods=["GET"])
     app.add_url_rule("/authority/inbox/view", endpoint="modern_inbox_page", view_func=modern_inbox_page, methods=["GET"])
     app.add_url_rule("/admin/incidents/view", endpoint="modern_incidents_page", view_func=modern_incidents_page, methods=["GET"])
     app.add_url_rule("/admin/users/view", endpoint="modern_users_page", view_func=modern_users_page, methods=["GET"])

@@ -229,6 +229,9 @@ def _ensure_schema_extensions():
                 db.session.execute(db.text("ALTER TABLE device ADD COLUMN phone_number VARCHAR(32)"))
                 db.session.commit()
             db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_device_phone_number ON device(phone_number)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_live_vehicle_updated_lat_lon ON live_vehicle_state(updated_at, lat, lon)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_live_vehicle_lat_lon ON live_vehicle_state(lat, lon)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_snapshot_device_ts ON snapshot(device_id, ts)"))
             for table, column, sql_type in (("live_vehicle_state", "place_name", "VARCHAR(255)"), ("operational_incident", "place_name", "VARCHAR(255)"), ("road", "one_way", "BOOLEAN"), ("road", "lane_count", "INTEGER")):
                 cols = {row[1] for row in db.session.execute(db.text(f"PRAGMA table_info({table})")).fetchall()}
                 if column not in cols:
@@ -243,6 +246,9 @@ def _ensure_schema_extensions():
             db.session.execute(db.text("ALTER TABLE road ADD COLUMN IF NOT EXISTS lane_count INTEGER"))
             db.session.execute(db.text("UPDATE road SET one_way = COALESCE(one_way, FALSE), lane_count = COALESCE(lane_count, 2)"))
             db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_device_phone_number ON device(phone_number)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_live_vehicle_updated_lat_lon ON live_vehicle_state(updated_at, lat, lon)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_live_vehicle_lat_lon ON live_vehicle_state(lat, lon)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_snapshot_device_ts ON snapshot(device_id, ts)"))
             db.session.commit()
     except Exception as exc:
         db.session.rollback()
@@ -1411,6 +1417,30 @@ def _safe_zip_members(zf: zipfile.ZipFile) -> dict[str, str]:
     return selected
 
 
+
+def _rebuild_live_vehicle_state_from_snapshots():
+    """Reconstruct the live map/state table from the newest snapshot for each device after restore."""
+    try:
+        latest = db.session.query(Snapshot.device_id, db.func.max(Snapshot.id).label("max_id")).group_by(Snapshot.device_id).subquery()
+        rows = (Snapshot.query.join(latest, (Snapshot.device_id == latest.c.device_id) & (Snapshot.id == latest.c.max_id)).all())
+        for snap in rows:
+            state=LiveVehicleState.query.filter_by(device_id=snap.device_id).first()
+            if state is None:
+                state=LiveVehicleState(device_id=snap.device_id)
+                db.session.add(state)
+            state.snapshot_id=snap.id; state.ts=snap.ts; state.lat=snap.lat; state.lon=snap.lon
+            state.speed_mps=snap.speed_mps or 0.0; state.bearing_deg=snap.bearing_deg or 0.0
+            state.heading_deg=snap.heading_deg or state.bearing_deg or 0.0; state.source=snap.source or "restored"
+            state.updated_at=snap.ts or datetime.utcnow()
+            if not state.place_name:
+                state.place_name=None
+        db.session.commit()
+        return len(rows)
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="backup:rebuild-live-state", severity="WARNING")
+        return 0
+
 def _restore_sqlite_file(source: Path) -> dict[str, Any]:
     target = _sqlite_path()
     if not target:
@@ -1455,7 +1485,8 @@ def _restore_sqlite_file(source: Path) -> dict[str, Any]:
         _clear_runtime_caches()
         with app.app_context():
             db.create_all()
-        return {"restored": True, "target": str(target), "pre_restore_backup": str(pre) if pre else None}
+            live_rebuilt = _rebuild_live_vehicle_state_from_snapshots()
+        return {"restored": True, "target": str(target), "pre_restore_backup": str(pre) if pre else None, "live_state_rebuilt": live_rebuilt}
     except Exception:
         if tmp.exists():
             try: tmp.unlink()
@@ -2475,6 +2506,9 @@ def _beacon_headers(response):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Permissions-Policy", "geolocation=(self), microphone=(), camera=()")
+    if request.path.startswith(("/admin", "/authority")) and request.method == "GET":
+        response.headers.setdefault("Cache-Control", "no-store, max-age=0")
+        response.headers.setdefault("Pragma", "no-cache")
     if request.is_secure or app.config.get("SESSION_COOKIE_SECURE"):
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
