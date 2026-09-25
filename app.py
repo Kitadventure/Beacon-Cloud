@@ -545,17 +545,29 @@ legacy.send_ws_to_device = _send_ws
 # The deployment may keep these in Render Environment Variables rather than in the database.
 # Supporting both naming conventions keeps older deployments working while avoiding public registration.
 def _render_admin_credentials():
-    username = (
-        os.environ.get("ADMIN_USER")
-        or os.environ.get("ADMIN_USERNAME")
-        or os.environ.get("BOOTSTRAP_ADMIN_USERNAME")
+    """Read the chief-admin credentials from Render as complete name/password pairs.
+
+    Pairing the variables avoids accidentally mixing a username from one convention
+    with a password from another when an older variable is still present in Render.
+    The simple ADMIN_NAME + ADMIN_PASSWORD pair is supported first because it is the
+    clearest chief-admin configuration.
+    """
+    pairs = (
+        ("ADMIN_NAME", "ADMIN_PASSWORD"),
+        ("ADMIN_USER", "ADMIN_PASS"),
+        ("ADMIN_USERNAME", "ADMIN_PASSWORD"),
+        ("BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD"),
     )
-    password = (
-        os.environ.get("ADMIN_PASS")
-        or os.environ.get("ADMIN_PASSWORD")
-        or os.environ.get("BOOTSTRAP_ADMIN_PASSWORD")
-    )
-    return (username.strip() if username else None), (password if password else None)
+    for user_key, pass_key in pairs:
+        raw_user = os.environ.get(user_key)
+        raw_pass = os.environ.get(pass_key)
+        # Only accept a complete pair. Do not combine values from unrelated aliases.
+        if raw_user is not None and raw_pass is not None:
+            username = raw_user.strip()
+            password = raw_pass
+            if username and password != "":
+                return username, password
+    return None, None
 
 
 def _sync_render_chief_admin():
@@ -599,7 +611,11 @@ SECURE_LOGIN_HTML = """
 
 
 with app.app_context():
-    _sync_render_chief_admin()
+    _render_admin = _sync_render_chief_admin()
+    if _render_admin is not None:
+        app.logger.info("Chief administrator credentials loaded from environment.")
+    else:
+        app.logger.warning("Chief administrator environment credentials are not configured; database authority accounts remain available.")
 
 def _pick_user(username: str):
     for model, role in ((Admin, "admin"), (PoliceUser, "police"), (GKUser, "gk")):
@@ -632,8 +648,10 @@ def secure_admin_login():
     # Render environment variables are authoritative for the chief administrator.
     # This works even when a persistent SQLite database contains an older password hash.
     if env_username and env_password and username == env_username and password == env_password:
-        with db.session.no_autoflush:
-            _sync_render_chief_admin()
+        # The Render-configured chief administrator is authoritative. A persistent
+        # SQLite record is synchronized, but database credentials are never required
+        # for this login path. This keeps a changed Render password immediately usable.
+        _sync_render_chief_admin()
         _set_session(env_username, "admin")
         next_path = request.form.get("next") or request.args.get("next")
         if next_path and next_path.startswith("/") and not next_path.startswith("//"):
