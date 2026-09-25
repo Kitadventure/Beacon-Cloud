@@ -540,12 +540,66 @@ legacy.send_ws_to_device = _send_ws
 # ---------------------------------------------------------------------------
 # Authentication / provisioning compatibility overrides
 # ---------------------------------------------------------------------------
+
+# Render/production chief administrator credentials.
+# The deployment may keep these in Render Environment Variables rather than in the database.
+# Supporting both naming conventions keeps older deployments working while avoiding public registration.
+def _render_admin_credentials():
+    username = (
+        os.environ.get("ADMIN_USER")
+        or os.environ.get("ADMIN_USERNAME")
+        or os.environ.get("BOOTSTRAP_ADMIN_USERNAME")
+    )
+    password = (
+        os.environ.get("ADMIN_PASS")
+        or os.environ.get("ADMIN_PASSWORD")
+        or os.environ.get("BOOTSTRAP_ADMIN_PASSWORD")
+    )
+    return (username.strip() if username else None), (password if password else None)
+
+
+def _sync_render_chief_admin():
+    """Make Render's chief-admin variables authoritative for the first admin account.
+
+    This intentionally does not create a public registration flow. On a persistent database,
+    it updates the hash for the configured chief-admin username so changing the Render secret
+    is immediately reflected without requiring a manual database reset.
+    """
+    username, password = _render_admin_credentials()
+    if not username or not password:
+        return None
+    try:
+        existing = Admin.query.filter_by(username=username).first()
+        if existing is None:
+            existing = Admin(username=username, password_hash=legacy.generate_password_hash(password))
+            db.session.add(existing)
+        else:
+            # Always resync the stored hash when the deployment explicitly supplies the secret.
+            if not legacy.check_password_hash(existing.password_hash, password):
+                existing.password_hash = legacy.generate_password_hash(password)
+        db.session.commit()
+        try:
+            row = getattr(legacy, "_bootstrap_state_row", lambda **_: None)(create_if_missing=True)
+            if row is not None:
+                row.value = "0"
+                db.session.commit()
+        except Exception:
+            db.session.rollback()
+        return existing
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="auth:render-admin-sync", severity="ERROR")
+        return None
+
 SECURE_LOGIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Beacon Authority Login</title>
 <style>body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:radial-gradient(circle at top,#14324b,#071522 60%);color:#e5eefb;margin:0;min-height:100vh;display:grid;place-items:center}.card{width:min(560px,calc(100% - 36px));background:#0d1d2e;border:1px solid #29435a;border-radius:22px;padding:28px;box-shadow:0 20px 60px #0007}.eyebrow{font-size:12px;letter-spacing:.12em;color:#7dd3fc;text-transform:uppercase}.muted{color:#94a3b8;line-height:1.5}label{display:block;margin-top:14px;font-weight:700}input{width:100%;box-sizing:border-box;margin-top:7px;padding:13px;border:1px solid #29435a;background:#081525;color:#fff;border-radius:12px}button,a{display:inline-block;margin-top:18px;padding:12px 16px;border-radius:12px;border:0;background:#0e86ad;color:#fff;text-decoration:none;font-weight:800;cursor:pointer}.flash{margin-top:14px;background:#3b1e24;color:#fecaca;border:1px solid #7f1d1d;padding:12px;border-radius:12px}</style></head>
-<body><div class="card"><div class="eyebrow">Beacon Cloud</div><h1>Authority access</h1><p class="muted">Use your assigned administrator, police or GK account. No shared bootstrap password is built into the application.</p>{% with messages=get_flashed_messages() %}{% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}{% endwith %}<form method="post"><label>Username</label><input name="username" autocomplete="username" required><label>Password</label><input name="password" type="password" autocomplete="current-password" required><input type="hidden" name="next" value="{{ next_path or '' }}"><button type="submit">Sign in</button></form>{% if allow_register %}<p class="muted">This installation has no administrator yet.</p><a href="{{ url_for('admin_register') }}">Create first administrator</a>{% endif %}</div></body></html>
+<body><div class="card"><div class="eyebrow">Beacon Cloud</div><h1>Authority access</h1><p class="muted">Use the chief administrator credentials configured in Render, or an authority account created by an administrator. Public registration is disabled.</p>{% with messages=get_flashed_messages() %}{% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}{% endwith %}<form method="post"><label>Username</label><input name="username" autocomplete="username" required><label>Password</label><input name="password" type="password" autocomplete="current-password" required><input type="hidden" name="next" value="{{ next_path or '' }}"><button type="submit">Sign in</button></form>{% if allow_register %}<p class="muted">This installation has no administrator yet.</p><a href="{{ url_for('admin_register') }}">Create first administrator</a>{% endif %}</div></body></html>
 """
 
+
+with app.app_context():
+    _sync_render_chief_admin()
 
 def _pick_user(username: str):
     for model, role in ((Admin, "admin"), (PoliceUser, "police"), (GKUser, "gk")):
@@ -564,13 +618,33 @@ def _set_session(username: str, role: str):
 
 def secure_admin_login():
     if request.method == "GET":
-        return render_template_string(SECURE_LOGIN_HTML, allow_register=(Admin.query.count() == 0), next_path=request.args.get("next", ""))
+        # Public registration is never exposed. The configured Render credentials are the
+        # deployment's chief-admin login and are synchronized during startup/login.
+        return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.args.get("next", ""))
+
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
+    if not username or not password:
+        flash("Enter the administrator username and password.")
+        return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.form.get("next", "")), 400
+
+    env_username, env_password = _render_admin_credentials()
+    # Render environment variables are authoritative for the chief administrator.
+    # This works even when a persistent SQLite database contains an older password hash.
+    if env_username and env_password and username == env_username and password == env_password:
+        with db.session.no_autoflush:
+            _sync_render_chief_admin()
+        _set_session(env_username, "admin")
+        next_path = request.form.get("next") or request.args.get("next")
+        if next_path and next_path.startswith("/") and not next_path.startswith("//"):
+            return redirect(next_path)
+        return redirect(url_for("dashboard"))
+
     user, role = _pick_user(username)
-    if not user or not password or not legacy.check_password_hash(user.password_hash, password):
+    if not user or not legacy.check_password_hash(user.password_hash, password):
         flash("Invalid credentials")
-        return render_template_string(SECURE_LOGIN_HTML, allow_register=(Admin.query.count() == 0), next_path=request.form.get("next", "")), 401
+        return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.form.get("next", "")), 401
+
     _set_session(user.username, role)
     next_path = request.form.get("next") or request.args.get("next")
     if next_path and next_path.startswith("/") and not next_path.startswith("//"):
@@ -819,7 +893,10 @@ def secure_heartbeat():
     device = None
     try:
         auth = request.headers.get("Authorization", "")
-        token = auth.split(" ", 1)[1].strip() if auth.lower().startswith("token ") else body.get("token")
+        if auth.lower().startswith(("token ", "bearer ")):
+            token = auth.split(" ", 1)[1].strip()
+        else:
+            token = (request.headers.get("X-Device-Token") or body.get("token"))
         device_id = body.get("device_id")
         if token:
             device = legacy.find_device_by_token(token)
@@ -1379,11 +1456,19 @@ def secure_pulse_receiver():
     configured = os.environ.get("PULSE_TOKEN") or os.environ.get("ADMIN_API_TOKEN")
     body = request.get_json(silent=True) or {}
     auth_header = request.headers.get("Authorization", "")
-    token = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("token ") else None
+    token = None
+    if auth_header.lower().startswith(("token ", "bearer ")):
+        token = auth_header.split(" ", 1)[1].strip()
     presented = request.headers.get("X-Pulse-Token") or request.args.get("pulse_token") or token or body.get("pulse_token") or body.get("integration_token")
     if not body:
         return jsonify({"ok": True, "service": "pulse_receiver", "authenticated": False, "probe": True})
-    if configured:
+    # A normal mobile heartbeat can authenticate with its own device token in the JSON body.
+    # Only integration-style pulse callers are required to present PULSE_TOKEN/ADMIN_API_TOKEN.
+    body_device_token = body.get("token")
+    device_auth_present = bool(body.get("device_id") and body_device_token)
+    if not device_auth_present and body.get("device_id") and auth_header.lower().startswith("bearer "):
+        device_auth_present = True
+    if configured and not device_auth_present:
         try:
             valid = bool(presented) and secrets.compare_digest(str(presented), str(configured))
         except Exception:

@@ -22,11 +22,18 @@ For durable SQLite data/backups on Render, attach a persistent disk and mount it
 
 1. Deploy.
 2. Open `/healthz` and verify `ok: true`.
-3. Open `/admin/login` and create the first administrator if the database has no admin.
+3. Open `/admin/login` and sign in with the chief administrator username/password stored in Render Environment Variables. Public registration is disabled.
 4. Create Police/GK users from Access Management.
 5. Create or enroll a test vehicle from the Android app.
 6. Open Reports & Backups and create a full backup before demonstrations.
 
-## 401 pulse logs
+## Pulse receiver compatibility
 
-Requests to `/pulse_receiver` with no `X-Pulse-Token` are intentionally rejected. Existing external jobs that still call this legacy endpoint must be updated to send the configured `PULSE_TOKEN`; the Android app does not use this endpoint.
+Empty health probes to `/pulse_receiver` return a successful probe response. Real mobile telemetry can authenticate with its device token in the JSON body, `Authorization: Token ...`, `Authorization: Bearer ...`, or `X-Device-Token`. Integration-style callers can continue using `PULSE_TOKEN` or `ADMIN_API_TOKEN`.
+
+
+## Chief administrator login
+
+Set the chief administrator credentials in Render Environment Variables. Supported names are `ADMIN_USER` + `ADMIN_PASS` (preferred), or `ADMIN_USERNAME` + `ADMIN_PASSWORD`; the legacy `BOOTSTRAP_ADMIN_USERNAME` + `BOOTSTRAP_ADMIN_PASSWORD` names are also accepted. Public registration remains disabled. On boot and on login, the configured chief-admin username/password is synchronized to the persistent SQLite database, so a password changed in Render does not remain blocked by an older stored hash.
+
+The application also accepts a device token in `Authorization: Token ...`, `Authorization: Bearer ...`, `X-Device-Token`, or the JSON `token` field for mobile telemetry. Integration pulse callers can continue using `PULSE_TOKEN` or `ADMIN_API_TOKEN`.
