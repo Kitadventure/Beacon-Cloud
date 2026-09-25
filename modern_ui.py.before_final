@@ -63,7 +63,7 @@ body{min-height:100vh}.topbar{height:66px;background:{{ maroon }};color:#fff;dis
 .main{flex:1;min-width:0;padding:18px 20px 28px}.page-head{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;margin-bottom:16px}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:{{ maroon }};font-weight:900}.page-title{font-size:26px;line-height:1.15;margin:4px 0 5px}.page-sub{color:{{ muted }};margin:0;line-height:1.45}.grid{display:grid;gap:14px}.grid-4{grid-template-columns:repeat(4,minmax(0,1fr))}.grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}.grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}.card{background:{{ card }};border:1px solid {{ border }};border-radius:16px;padding:16px;box-shadow:0 4px 16px rgba(16,24,40,.035)}.card h2,.card h3{margin:0 0 10px}.metric{font-size:30px;font-weight:900;letter-spacing:-.02em}.metric-label{font-size:12px;color:{{ muted }};margin-top:3px}.tiny{font-size:12px;color:{{ muted }}}.badge{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:900}.badge-green{color:{{ green }};background:#ecfdf3}.badge-amber{color:{{ amber }};background:#fff7d6}.badge-red{color:{{ red }};background:#fef3f2}.badge-gray{color:#475467;background:#f2f4f7}.row{display:flex;gap:10px;align-items:center}.row-between{display:flex;gap:12px;align-items:center;justify-content:space-between}.stack{display:grid;gap:10px}.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid {{ border }};background:#fff;color:#344054;border-radius:10px;padding:9px 12px;font-weight:800;font-size:13px;cursor:pointer}.btn:hover{background:#fafafa}.btn-primary{background:{{ maroon }};border-color:{{ maroon }};color:#fff}.btn-danger{background:#fff4f3;border-color:#fecdca;color:{{ red }}}.btn-soft{background:#f8f2f4;border-color:#ead1d8;color:{{ maroon }}}
 input,select,textarea{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:10px;padding:11px 12px;color:#101828;font:inherit;outline:none}input:focus,select:focus,textarea:focus{border-color:#b4234d;box-shadow:0 0 0 3px rgba(179,35,77,.10)}label{display:block;font-size:12px;font-weight:800;color:#344054;margin:2px 0 6px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field-full{grid-column:1/-1}
 .table-wrap{overflow:auto;border:1px solid {{ border }};border-radius:13px}.table{width:100%;border-collapse:collapse;min-width:760px}.table th,.table td{padding:11px 12px;border-bottom:1px solid {{ border }};text-align:left;vertical-align:top;font-size:13px}.table th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#667085;background:#fafafa;position:sticky;top:0}.table tr:last-child td{border-bottom:0}.empty{padding:28px;text-align:center;color:{{ muted }}}
-.searchbox{position:relative}.searchbox input{padding-left:38px;font-size:16px;min-height:56px}.searchbox .icon{position:absolute;left:13px;top:13px;color:#98a2b3}.list{display:grid;gap:8px}.list-item{border:1px solid {{ border }};border-radius:12px;padding:11px 12px;background:#fff}.list-item:hover{border-color:#ceb7be}.small-muted{color:{{ muted }};font-size:12px}.hero{padding:20px;background:linear-gradient(135deg,#fff,#fbf2f5);border:1px solid #eed6dc;border-radius:17px}.footer{background:{{ maroon }};color:#fff;padding:18px 24px;text-align:center;font-size:12px;margin-top:24px}.footer strong{font-weight:900}.footer-sub{opacity:.85;margin-top:4px}
+.searchbox{position:relative}.searchbox input{padding-left:38px;font-size:15px;min-height:46px}.searchbox .icon{position:absolute;left:13px;top:13px;color:#98a2b3}.list{display:grid;gap:8px}.list-item{border:1px solid {{ border }};border-radius:12px;padding:11px 12px;background:#fff}.list-item:hover{border-color:#ceb7be}.small-muted{color:{{ muted }};font-size:12px}.hero{padding:20px;background:linear-gradient(135deg,#fff,#fbf2f5);border:1px solid #eed6dc;border-radius:17px}.footer{background:{{ maroon }};color:#fff;padding:18px 24px;text-align:center;font-size:12px;margin-top:24px}.footer strong{font-weight:900}.footer-sub{opacity:.85;margin-top:4px}
 .notice{padding:11px 13px;border-radius:10px;margin-bottom:10px;border:1px solid #d0d5dd;background:#fff}.notice-danger{border-color:#fecdca;background:#fff6f5}.notice-ok{border-color:#b7ebcb;background:#f0fff6}.notice-warn{border-color:#f5d07b;background:#fffbeb}.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;background:#101828;color:#eaecf0;border-radius:10px;padding:12px;overflow:auto;max-height:340px}.split{display:grid;grid-template-columns:1.2fr .8fr;gap:14px}.pillbar{display:flex;flex-wrap:wrap;gap:8px}.pill{border:1px solid {{ border }};border-radius:999px;padding:7px 10px;background:#fff;font-size:12px;font-weight:800}.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.toolbar .grow{flex:1;min-width:220px}
 @media(max-width:1050px){.grid-4{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-3{grid-template-columns:1fr 1fr}.split{grid-template-columns:1fr}}@media(max-width:780px){.sidebar{position:fixed;left:-286px;top:66px;transition:.2s;z-index:60;box-shadow:8px 0 28px rgba(0,0,0,.12)}.sidebar.open{left:0}.main{padding:15px 12px}.grid-2,.grid-3,.grid-4,.form-grid{grid-template-columns:1fr}.page-head{flex-direction:column}.mobile-menu{display:inline-flex!important}}
 .mobile-menu{display:none}.hidden{display:none!important}
@@ -209,7 +209,6 @@ def _device_rows(q="", limit=100, offset=0):
             "lat": state.lat if state else None, "lon": state.lon if state else None,
             "ts": state.ts.isoformat() if state and state.ts else None,
             "socket_online": socket_online, "telemetry_online": telemetry_online, "connection_state": state_name,
-            "place_name": state.place_name if state else None,
         })
     return out, total
 
@@ -260,7 +259,7 @@ def _dashboard_script():
 const urls={status:'__STATUS__'};
 function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}
 function badge(state){if(state==='REAL-TIME')return '<span class="badge badge-green">● REAL-TIME</span>';if(state==='TELEMETRY ONLINE')return '<span class="badge badge-amber">● TELEMETRY ONLINE</span>';return '<span class="badge badge-gray">● OFFLINE</span>';}
-async function refresh(){try{const r=await fetch(urls.status,{cache:'no-store'});const d=await r.json();document.getElementById('metrics').innerHTML=[['Registered vehicles',d.registered,''],['Telemetry online',d.telemetry_online,''],['Active incidents',d.active_incidents,''],['Open system errors',d.open_errors,'']].map(x=>`<div class="card"><div class="metric">${esc(x[1])}</div><div class="metric-label">${x[0]}</div></div>`).join('');document.getElementById('recent').innerHTML=(d.recent||[]).map(v=>`<div class="list-item"><div class="row-between"><strong>${esc(v.owner||v.id)}</strong>${badge(v.connection_state)}</div><div class="small-muted">${esc(v.car_name||'Vehicle')} · ${esc(v.plate||'No plate')} · ${esc(v.phone_number||'No phone captured')}</div><div class="small-muted">${esc(v.place_name||'Place locating…')}</div></div>`).join('')||'<div class="small-muted">No registered vehicles yet.</div>';document.getElementById('health').innerHTML=`<div class="row-between"><span>Real-time sockets</span><strong>${esc(d.realtime)}</strong></div><div class="row-between"><span>Unread authority inbox</span><strong>${esc(d.unread_inbox)}</strong></div><div class="row-between"><span>Service</span><span class="badge badge-green">● ONLINE</span></div>`;}catch(e){beaconReportError(e,'dashboard.refresh');document.getElementById('health').innerHTML='<div class="notice notice-danger">Health data could not be loaded.</div>';}}
+async function refresh(){try{const r=await fetch(urls.status,{cache:'no-store'});const d=await r.json();document.getElementById('metrics').innerHTML=[['Registered vehicles',d.registered,''],['Telemetry online',d.telemetry_online,''],['Active incidents',d.active_incidents,''],['Open system errors',d.open_errors,'']].map(x=>`<div class="card"><div class="metric">${esc(x[1])}</div><div class="metric-label">${x[0]}</div></div>`).join('');document.getElementById('recent').innerHTML=(d.recent||[]).map(v=>`<div class="list-item"><div class="row-between"><strong>${esc(v.owner||v.id)}</strong>${badge(v.connection_state)}</div><div class="small-muted">${esc(v.car_name||'Vehicle')} · ${esc(v.plate||'No plate')} · ${esc(v.phone_number||'No phone captured')}</div></div>`).join('')||'<div class="small-muted">No registered vehicles yet.</div>';document.getElementById('health').innerHTML=`<div class="row-between"><span>Real-time sockets</span><strong>${esc(d.realtime)}</strong></div><div class="row-between"><span>Unread authority inbox</span><strong>${esc(d.unread_inbox)}</strong></div><div class="row-between"><span>Service</span><span class="badge badge-green">● ONLINE</span></div>`;}catch(e){beaconReportError(e,'dashboard.refresh');document.getElementById('health').innerHTML='<div class="notice notice-danger">Health data could not be loaded.</div>';}}
 refresh();setInterval(refresh,15000);
 </script>
 """
@@ -325,12 +324,12 @@ def modern_device_detail(device_id):
     _, tel, state_name = _state_for_device(d.id, state.ts if state else (snaps[0].ts if snaps else None))
     recent = []
     for s in snaps:
-        recent.append({"ts":s.ts.isoformat() if s.ts else None,"lat":s.lat,"lon":s.lon,"speed_kmh":round(float(s.speed_mps or 0)*3.6,1),"source":s.source or "","bearing_deg":s.bearing_deg,"place_name":state.place_name if state else None})
-    rows = ''.join(f'<tr><td>{_esc(x["ts"])}</td><td>{_esc(x.get("place_name") or "Place pending")}</td><td>{_esc(x["speed_kmh"])} km/h</td><td>{_esc(x["source"])}</td><td><details><summary>Open</summary><div class="small-muted">Latitude: {_esc(x["lat"])} · Longitude: {_esc(x["lon"])} · Bearing: {_esc(x.get("bearing_deg"))}</div></details></td></tr>' for x in recent) or '<tr><td colspan="5"><div class="empty">No snapshots.</div></td></tr>'
+        recent.append({"ts":s.ts.isoformat() if s.ts else None,"lat":s.lat,"lon":s.lon,"speed_kmh":round(float(s.speed_mps or 0)*3.6,1),"source":s.source or ""})
+    rows = ''.join(f'<tr><td>{_esc(x["ts"])}</td><td>{_esc(x["lat"])}</td><td>{_esc(x["lon"])}</td><td>{_esc(x["speed_kmh"])} km/h</td><td>{_esc(x["source"])}</td></tr>' for x in recent) or '<tr><td colspan="5"><div class="empty">No snapshots.</div></td></tr>'
     body = f"""
 <div class="page-head"><div><div class="eyebrow">Vehicle detail</div><h1 class="page-title">{_esc(d.owner or d.car_name or d.id)}</h1><p class="page-sub">Device ID: {_esc(d.id)}</p></div><div class="pillbar"><span class="pill">{_esc(state_name)}</span><span class="pill">Telemetry {'online' if tel else 'offline'}</span></div></div>
-<div class="grid grid-4"><div class="card"><div class="metric-label">Owner</div><strong>{_esc(d.owner or '—')}</strong></div><div class="card"><div class="metric-label">Phone</div><strong>{_esc(legacy._device_phone_number(d) or d.phone_number or 'Not captured')}</strong></div><div class="card"><div class="metric-label">Vehicle / plate</div><strong>{_esc(' '.join([d.car_name or '', d.car_model or '']).strip() or '—')} · {_esc(d.plate or '—')}</strong></div><div class="card"><div class="metric-label">Current place</div><strong>{_esc(state.place_name if state else 'Place locating…')}</strong></div></div>
-<div class="card" style="margin-top:14px"><div class="row-between"><h2>Recent telemetry</h2><a class="btn btn-primary" href="{url_for('admin_messages')}?device_id={_esc(d.id)}">Send message</a></div><div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>Place</th><th>Speed</th><th>Source</th><th>Technical details</th></tr></thead><tbody>{rows}</tbody></table></div></div>
+<div class="grid grid-3"><div class="card"><div class="metric-label">Owner</div><strong>{_esc(d.owner or '—')}</strong></div><div class="card"><div class="metric-label">Phone</div><strong>{_esc(legacy._device_phone_number(d) or d.phone_number or 'Not captured')}</strong></div><div class="card"><div class="metric-label">Vehicle / plate</div><strong>{_esc(' '.join([d.car_name or '', d.car_model or '']).strip() or '—')} · {_esc(d.plate or '—')}</strong></div></div>
+<div class="card" style="margin-top:14px"><div class="row-between"><h2>Recent telemetry</h2><a class="btn btn-primary" href="{url_for('admin_messages')}?device_id={_esc(d.id)}">Send message</a></div><div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>Latitude</th><th>Longitude</th><th>Speed</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div></div>
 """
     return _render("Vehicle detail", body, "modern_devices_page", role=role)
 
@@ -438,7 +437,7 @@ def modern_messages_page():
     recent_html = ''.join(f'<div class="list-item"><div class="row-between"><strong>{_esc(m.title)}</strong><span class="badge badge-gray">{_esc(m.target_type)}</span></div><div class="small-muted">{_esc(m.created_at.isoformat() if m.created_at else "")} · {_esc(m.recipient_count or 0)} recipient(s)</div><div style="margin-top:5px">{_esc(m.body)}</div></div>' for m in recent) or '<div class="small-muted">No messages yet.</div>'
     body = f"""
 <div class="page-head"><div><div class="eyebrow">Communications</div><h1 class="page-title">Messages</h1><p class="page-sub">Search every registered user, see the phone number captured at enrollment, then send a persistent message with live delivery fallback.</p></div></div>
-<div class="split"><div class="card" style="min-width:0"><h2 style="font-size:20px">Find a recipient</h2><div class="searchbox"><span class="icon">⌕</span><input id="userq" value="{_esc(request.args.get('q') or '')}" placeholder="Search owner, phone, plate, vehicle or device ID…"></div><div id="results" class="list" style="margin-top:10px;max-height:500px;overflow:auto"></div></div>
+<div class="split"><div class="card"><h2>Find a recipient</h2><div class="searchbox"><span class="icon">⌕</span><input id="userq" value="{_esc(request.args.get('q') or '')}" placeholder="Search owner, phone, plate, vehicle or device ID…"></div><div id="results" class="list" style="margin-top:10px;max-height:500px;overflow:auto"></div></div>
 <div class="card"><h2>Compose message</h2><form id="sendForm" class="stack"><div><label>Title</label><input name="title" required maxlength="255" placeholder="Road safety notice"></div><div><label>Message</label><textarea name="body" rows="8" required maxlength="5000" placeholder="Write the message…"></textarea></div><div><label>Audience</label><select name="target_type" id="targetType"><option value="single">Selected vehicle</option><option value="all">All registered vehicles</option><option value="overspeeders">Vehicles currently above speed threshold</option></select></div><div id="thresholdWrap" class="hidden"><label>Minimum speed (km/h)</label><input name="min_kmh" value="80"></div><input type="hidden" name="target_device_id" id="targetDevice" value="{_esc(selected)}"><div class="notice notice-warn" id="selectedInfo">{('Selected device: '+_esc(selected)) if selected else 'Select a user or choose a broader audience.'}</div><button class="btn btn-primary" type="submit">Send to phone</button><div id="sendResult"></div></form></div></div>
 <div class="card" style="margin-top:14px"><div class="row-between"><h2>Recent authority messages</h2><a class="btn" href="{url_for('authority_reports')}">Reports</a></div><div class="list">{recent_html}</div></div>
 """
@@ -448,7 +447,7 @@ const usersUrl='__USERS__',sendUrl='__SEND__';let timer;
 function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}
 function choose(v){document.getElementById('targetType').value='single';document.getElementById('targetDevice').value=v.id;document.getElementById('selectedInfo').textContent=`Selected: ${v.owner||v.id} · ${v.phone_number||'No phone captured'} · ${v.plate||'No plate'}`;toggleAudience();}
 function toggleAudience(){const t=document.getElementById('targetType').value;document.getElementById('targetDevice').disabled=(t!=='single');document.getElementById('thresholdWrap').classList.toggle('hidden',t!=='overspeeders');if(t==='all')document.getElementById('selectedInfo').textContent='Audience: all registered vehicles.';else if(t==='overspeeders')document.getElementById('selectedInfo').textContent='Audience: vehicles currently above the selected speed threshold.';else if(!document.getElementById('targetDevice').value)document.getElementById('selectedInfo').textContent='Select a user from the search results.';}
-async function users(){const q=document.getElementById('userq').value.trim();const r=await fetch(usersUrl+'?q='+encodeURIComponent(q)+'&limit=120',{cache:'no-store'});const d=await r.json();document.getElementById('results').innerHTML=(d.items||[]).map(v=>`<button type="button" class="list-item" style="text-align:left;width:100%;cursor:pointer" onclick='choose(${JSON.stringify(v).replace(/'/g,"&#39;")})'><div class="row-between"><strong>${esc(v.owner||v.id)}</strong>${v.connection_state==='REAL-TIME'?'<span class="badge badge-green">REAL-TIME</span>':v.connection_state==='TELEMETRY ONLINE'?'<span class="badge badge-amber">TELEMETRY ONLINE</span>':'<span class="badge badge-gray">OFFLINE</span>'}</div><div class="small-muted">Phone: ${esc(v.phone_number||'Not captured')} · Plate: ${esc(v.plate||'—')}</div><div class="small-muted">${esc([v.car_name,v.car_model].filter(Boolean).join(' ')||'Vehicle')} · ${esc(v.id)}</div><div class="small-muted">${esc(v.place_name||'Place locating…')}</div></button>`).join('')||'<div class="empty">No registered users match that search.</div>';}
+async function users(){const q=document.getElementById('userq').value.trim();const r=await fetch(usersUrl+'?q='+encodeURIComponent(q)+'&limit=120',{cache:'no-store'});const d=await r.json();document.getElementById('results').innerHTML=(d.items||[]).map(v=>`<button type="button" class="list-item" style="text-align:left;width:100%;cursor:pointer" onclick='choose(${JSON.stringify(v).replace(/'/g,"&#39;")})'><div class="row-between"><strong>${esc(v.owner||v.id)}</strong>${v.connection_state==='REAL-TIME'?'<span class="badge badge-green">REAL-TIME</span>':v.connection_state==='TELEMETRY ONLINE'?'<span class="badge badge-amber">TELEMETRY ONLINE</span>':'<span class="badge badge-gray">OFFLINE</span>'}</div><div class="small-muted">Phone: ${esc(v.phone_number||'Not captured')} · Plate: ${esc(v.plate||'—')}</div><div class="small-muted">${esc([v.car_name,v.car_model].filter(Boolean).join(' ')||'Vehicle')} · ${esc(v.id)}</div></button>`).join('')||'<div class="empty">No registered users match that search.</div>';}
 document.getElementById('userq').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(users,250)});document.getElementById('targetType').addEventListener('change',toggleAudience);toggleAudience();users();
 document.getElementById('sendForm').addEventListener('submit',async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.target).entries());if(!d.target_device_id){document.getElementById('sendResult').innerHTML='<div class="notice notice-danger">Select a recipient first.</div>';return;}const r=await fetch(sendUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});const x=await r.json();document.getElementById('sendResult').innerHTML=x.ok?`<div class="notice notice-ok">Message stored and queued for delivery to ${x.message.recipient_count||0} device(s).</div>`:`<div class="notice notice-danger">${esc(x.error||'Message failed')}</div>`;if(x.ok)e.target.reset();});
 </script>
@@ -521,8 +520,8 @@ def modern_incidents_page():
     except Exception as exc:
         rows=[]
         if _core: _core.record_system_error(exc, source="ui:incidents", severity="ERROR")
-    trs=''.join(f'<tr><td><strong>{_esc(r.type)}</strong><div class="small-muted">{_esc(r.id)}</div></td><td>{_esc(r.severity)}</td><td>{_esc(round(float(r.confidence or 0),2))}</td><td>{_esc(r.place_name or "Place pending")}</td><td>{_esc(r.device_id or "—")}</td><td>{_esc(r.status)}</td><td>{_esc(r.created_at.isoformat() if r.created_at else "")}</td></tr>' for r in rows) or '<tr><td colspan="6"><div class="empty">No incidents recorded.</div></td></tr>'
-    body=f'''<div class="page-head"><div><div class="eyebrow">Safety operations</div><h1 class="page-title">Incidents & alerts</h1><p class="page-sub">Persistent operational incidents with status and confidence rather than transient popups only.</p></div></div><div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Type</th><th>Severity</th><th>Confidence</th><th>Place</th><th>Device</th><th>Status</th><th>Created</th></tr></thead><tbody>{trs}</tbody></table></div></div>'''
+    trs=''.join(f'<tr><td><strong>{_esc(r.type)}</strong><div class="small-muted">{_esc(r.id)}</div></td><td>{_esc(r.severity)}</td><td>{_esc(round(float(r.confidence or 0),2))}</td><td>{_esc(r.device_id or "—")}</td><td>{_esc(r.status)}</td><td>{_esc(r.created_at.isoformat() if r.created_at else "")}</td></tr>' for r in rows) or '<tr><td colspan="6"><div class="empty">No incidents recorded.</div></td></tr>'
+    body=f'''<div class="page-head"><div><div class="eyebrow">Safety operations</div><h1 class="page-title">Incidents & alerts</h1><p class="page-sub">Persistent operational incidents with status and confidence rather than transient popups only.</p></div></div><div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Type</th><th>Severity</th><th>Confidence</th><th>Device</th><th>Status</th><th>Created</th></tr></thead><tbody>{trs}</tbody></table></div></div>'''
     return _render("Incidents",body,"modern_incidents_page",role=role)
 
 
@@ -561,50 +560,16 @@ def modern_create_authority():
 
 def modern_traffic_hub():
     role, resp = _require_roles("admin", "police", "gk")
-    if resp:
-        return resp
-    data_url = url_for("modern_device_data")
-    roads_url = url_for("admin_roads")
-    speeders_url = url_for("admin_speeders")
-    zones_url = url_for("admin_traffic_zones")
-    body = f"""
-<div class="page-head"><div><div class="eyebrow">Intelligence</div><h1 class="page-title">Traffic operations</h1><p class="page-sub">Live traffic is plotted internally from telemetry, while operators see place names and operational state first.</p></div></div>
-<div class="card"><div class="row-between"><h2>Live traffic map</h2><button class="btn" id="refreshMap">Refresh</button></div><div id="trafficMap" style="height:520px;border-radius:14px;overflow:hidden;background:#e8eef3;margin-top:12px"></div><div class="small-muted" style="margin-top:9px">Open a marker for technical coordinates when required.</div></div>
-<div class="grid grid-2" style="margin-top:14px"><a class="list-item" href="{roads_url}"><strong>Roads</strong><div class="small-muted">Manage road safety profiles.</div></a><a class="list-item" href="{speeders_url}"><strong>Speeders</strong><div class="small-muted">Review speed events.</div></a><a class="list-item" href="{zones_url}"><strong>Traffic zones</strong><div class="small-muted">Manage operational zones.</div></a></div>
-"""
-    js = f"""
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-(function(){{
-const mapEl=document.getElementById('trafficMap');
-function esc(v){{return String(v??'').replace(/[&<>\"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}}[c]));}}
-async function loadMap(){{
- try{{
-   if(!window.L){{mapEl.innerHTML='<div class="empty" style="padding:80px">Map library unavailable. Vehicle operations remain available.</div>';return;}}
-   const r=await fetch('{data_url}?limit=200',{{cache:'no-store'}});
-   const d=await r.json();
-   if(window._beaconMap) window._beaconMap.remove();
-   window._beaconMap=L.map(mapEl).setView([-1.286,36.817],11);
-   L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'© OpenStreetMap contributors'}}).addTo(window._beaconMap);
-   const points=[];
-   (d.items||[]).forEach(v=>{{
-      if(v.lat==null||v.lon==null)return;
-      points.push([v.lat,v.lon]);
-      const m=L.marker([v.lat,v.lon]).addTo(window._beaconMap);
-      m.bindPopup('<strong>'+esc(v.owner||v.id)+'</strong><br>'+esc(v.place_name||'Place pending')+'<br>'+esc(v.connection_state||'OFFLINE')+'<br><details><summary>Technical details</summary>Lat: '+esc(v.lat)+'<br>Lon: '+esc(v.lon)+'</details>');
-   }});
-   if(points.length===1) window._beaconMap.setView(points[0],16);
-   if(points.length>1) window._beaconMap.fitBounds(points,{{padding:[28,28],maxZoom:16}});
- }}catch(e){{beaconReportError(e,'traffic.map');mapEl.innerHTML='<div class="empty" style="padding:80px">Traffic map could not be loaded.</div>';}}
-}}
-document.getElementById('refreshMap').addEventListener('click',loadMap);
-loadMap();
-setInterval(loadMap,20000);
-}})();
-</script>
-"""
-    return _render("Traffic operations", body, "modern_traffic_hub", js, role)
+    if resp: return resp
+    links=[("admin_traffic","Live traffic"),("admin_roads","Roads"),("admin_speeders","Speeders"),("admin_traffic_zones","Traffic zones")]
+    cards=[]
+    for ep,label in links:
+        try: href=url_for(ep)
+        except Exception: continue
+        cards.append(f'<a class="list-item" href="{_esc(href)}"><div class="row-between"><strong>{_esc(label)}</strong><span>→</span></div><div class="small-muted">Open operational tool</div></a>')
+    body=f'''<div class="page-head"><div><div class="eyebrow">Intelligence</div><h1 class="page-title">Traffic operations</h1><p class="page-sub">Map, roads, speed and traffic-zone tools remain available without loading everything into the main dashboard.</p></div></div><div class="grid grid-2">{''.join(cards)}</div>'''
+    return _render("Traffic operations",body,"modern_traffic_hub",role=role)
+
 
 def modern_reports_page():
     role, resp = _require_roles("admin", "police", "gk")
@@ -758,7 +723,7 @@ def _wrap_heartbeat(original):
                 # Overspeed events are persisted by the core risk engine. Queue only the latest
                 # event for fallback delivery so a lost Socket.IO connection cannot lose the warning.
                 if _core.OverspeedEvent:
-                    evt=(_core.OverspeedEvent.query.filter_by(snapshot_id=state.snapshot_id).order_by(_core.OverspeedEvent.ts.desc()).first())
+                    evt=(_core.OverspeedEvent.query.filter_by(snapshot_id=state.snapshot_id).order_by(core.OverspeedEvent.ts.desc()).first())
                     if evt:
                         data={"type":"overspeed","event_id":evt.id,"device_id":device.id,"road_id":evt.road_id,"speed_kmh":evt.speed_kmh,"lat":evt.lat,"lon":evt.lon,"ts":evt.ts.isoformat() if evt.ts else None}
                         key=f"overspeed:{device.id}:{evt.id}"
@@ -802,7 +767,20 @@ def install_modern_ui(core):
     global _core, SystemError, LiveVehicleState, AuthorityInboxMessage, OperationalIncident, DeviceAlert
     _core=core
     SystemError=core.SystemError; LiveVehicleState=core.LiveVehicleState; AuthorityInboxMessage=core.AuthorityInboxMessage; OperationalIncident=core.OperationalIncident
-    DeviceAlert=core.DeviceAlert
+    class DeviceAlert(db.Model):
+        __tablename__="device_alert"
+        id=db.Column(db.Integer,primary_key=True)
+        device_id=db.Column(db.String(36),index=True,nullable=False)
+        kind=db.Column(db.String(64),index=True,nullable=False)
+        severity=db.Column(db.String(16),default="info",index=True)
+        title=db.Column(db.String(255),nullable=False)
+        body=db.Column(db.Text,nullable=False)
+        incident_id=db.Column(db.String(36),index=True,nullable=True)
+        unique_key=db.Column(db.String(255),index=True,nullable=True)
+        created_at=db.Column(db.DateTime,default=datetime.utcnow,index=True,nullable=False)
+        read_at=db.Column(db.DateTime,nullable=True)
+        delivered_at=db.Column(db.DateTime,nullable=True)
+    globals()["DeviceAlert"]=DeviceAlert
     with app.app_context():
         db.create_all()
 

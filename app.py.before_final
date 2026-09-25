@@ -31,8 +31,6 @@ import sys
 import time
 import traceback
 import uuid
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -146,31 +144,6 @@ class SystemError(db.Model):
     traceback_text = db.Column(db.Text)
 
 
-class DeviceAlert(db.Model):
-    __tablename__ = "device_alert"
-    id = db.Column(db.Integer, primary_key=True)
-    device_id = db.Column(db.String(36), index=True, nullable=False)
-    kind = db.Column(db.String(64), index=True, nullable=False)
-    severity = db.Column(db.String(16), default="info", index=True)
-    title = db.Column(db.String(255), nullable=False)
-    body = db.Column(db.Text, nullable=False)
-    incident_id = db.Column(db.String(36), index=True, nullable=True)
-    unique_key = db.Column(db.String(255), index=True, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True, nullable=False)
-    read_at = db.Column(db.DateTime, nullable=True)
-    delivered_at = db.Column(db.DateTime, nullable=True)
-
-
-class PlaceCache(db.Model):
-    __tablename__ = "place_cache"
-    key = db.Column(db.String(96), primary_key=True)
-    lat = db.Column(db.Float, nullable=False)
-    lon = db.Column(db.Float, nullable=False)
-    place_name = db.Column(db.String(255), nullable=False)
-    provider = db.Column(db.String(64), default="nominatim")
-    fetched_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-
-
 class LiveVehicleState(db.Model):
     __tablename__ = "live_vehicle_state"
     device_id = db.Column(db.String(36), primary_key=True)
@@ -186,7 +159,6 @@ class LiveVehicleState(db.Model):
     session_id = db.Column(db.String(96), nullable=True)
     source = db.Column(db.String(32), nullable=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    place_name = db.Column(db.String(255), nullable=True, index=True)
 
 
 class AuthorityInboxMessage(db.Model):
@@ -213,7 +185,6 @@ class OperationalIncident(db.Model):
     plate = db.Column(db.String(64))
     lat = db.Column(db.Float)
     lon = db.Column(db.Float)
-    place_name = db.Column(db.String(255), nullable=True, index=True)
     reason = db.Column(db.Text)
     status = db.Column(db.String(24), default="active", index=True)
     evidence = db.Column(db.Text)
@@ -229,19 +200,9 @@ def _ensure_schema_extensions():
                 db.session.execute(db.text("ALTER TABLE device ADD COLUMN phone_number VARCHAR(32)"))
                 db.session.commit()
             db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_device_phone_number ON device(phone_number)"))
-            for table, column, sql_type in (("live_vehicle_state", "place_name", "VARCHAR(255)"), ("operational_incident", "place_name", "VARCHAR(255)"), ("road", "one_way", "BOOLEAN"), ("road", "lane_count", "INTEGER")):
-                cols = {row[1] for row in db.session.execute(db.text(f"PRAGMA table_info({table})")).fetchall()}
-                if column not in cols:
-                    db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
-            db.session.execute(db.text("UPDATE road SET one_way = COALESCE(one_way, 0), lane_count = COALESCE(lane_count, 2)"))
             db.session.commit()
         elif backend == "postgresql":
             db.session.execute(db.text("ALTER TABLE device ADD COLUMN IF NOT EXISTS phone_number VARCHAR(32)"))
-            db.session.execute(db.text("ALTER TABLE live_vehicle_state ADD COLUMN IF NOT EXISTS place_name VARCHAR(255)"))
-            db.session.execute(db.text("ALTER TABLE operational_incident ADD COLUMN IF NOT EXISTS place_name VARCHAR(255)"))
-            db.session.execute(db.text("ALTER TABLE road ADD COLUMN IF NOT EXISTS one_way BOOLEAN"))
-            db.session.execute(db.text("ALTER TABLE road ADD COLUMN IF NOT EXISTS lane_count INTEGER"))
-            db.session.execute(db.text("UPDATE road SET one_way = COALESCE(one_way, FALSE), lane_count = COALESCE(lane_count, 2)"))
             db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_device_phone_number ON device(phone_number)"))
             db.session.commit()
     except Exception as exc:
@@ -249,93 +210,6 @@ def _ensure_schema_extensions():
         if "record_system_error" in globals():
             record_system_error(exc, source="database:schema-migration", severity="ERROR")
         raise
-
-
-_place_executor = None
-_place_executor_lock = threading.RLock()
-_place_last_requested: dict[str, float] = {}
-_place_ttl_s = float(os.environ.get("PLACE_CACHE_TTL_S", "900"))
-_place_min_move_m = float(os.environ.get("PLACE_MIN_MOVE_M", "100"))
-_place_last_http_at = 0.0
-_place_http_lock = threading.RLock()
-_place_http_min_interval_s = 1.15
-
-def _place_key(lat: float, lon: float) -> str:
-    return f"{round(float(lat), 4):.4f},{round(float(lon), 4):.4f}"
-
-def _human_place(address: dict[str, Any], fallback: str = "") -> str:
-    order = ("road", "neighbourhood", "suburb", "town", "village", "city", "county", "state", "country")
-    vals=[]
-    for key in order:
-        value=str(address.get(key) or "").strip()
-        if value and value not in vals: vals.append(value)
-        if len(vals)>=4: break
-    return ", ".join(vals) or fallback
-
-def _reverse_geocode(lat: float, lon: float) -> str:
-    key=_place_key(lat,lon)
-    try:
-        cached=PlaceCache.query.filter_by(key=key).first()
-        if cached and cached.fetched_at and (datetime.utcnow()-cached.fetched_at).total_seconds() < _place_ttl_s:
-            return cached.place_name
-    except Exception:
-        db.session.rollback()
-    # Reverse geocoding is rate-limited globally and sends rounded coordinates.
-    global _place_last_http_at
-    with _place_http_lock:
-        wait = _place_http_min_interval_s - (time.monotonic() - _place_last_http_at)
-        if wait > 0:
-            time.sleep(wait)
-        _place_last_http_at = time.monotonic()
-    geocode_lat = round(float(lat), 4)
-    geocode_lon = round(float(lon), 4)
-    q=urllib.parse.urlencode({"lat":geocode_lat,"lon":geocode_lon,"format":"jsonv2","zoom":18,"addressdetails":1})
-    req=urllib.request.Request("https://nominatim.openstreetmap.org/reverse?"+q, headers={"User-Agent":"BeaconCloud/2026.09 road-safety-platform"})
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        payload=json.loads(resp.read().decode("utf-8"))
-    name=_human_place(payload.get("address") or {}, payload.get("display_name") or f"Near {lat:.5f}, {lon:.5f}")[:255]
-    try:
-        row=PlaceCache.query.filter_by(key=key).first()
-        if row is None: row=PlaceCache(key=key,lat=float(lat),lon=float(lon),place_name=name,provider="nominatim")
-        else: row.lat=float(lat); row.lon=float(lon); row.place_name=name; row.provider="nominatim"
-        row.fetched_at=datetime.utcnow(); db.session.add(row); db.session.commit()
-    except Exception:
-        db.session.rollback()
-    return name
-
-def _schedule_place_lookup(device_id: str, lat: float, lon: float):
-    global _place_executor
-    now=time.time()
-    with _place_executor_lock:
-        if now-_place_last_requested.get(device_id,0) < 20: return
-        _place_last_requested[device_id]=now
-        if _place_executor is None:
-            from concurrent.futures import ThreadPoolExecutor
-            _place_executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="beacon-place")
-        executor=_place_executor
-    def work():
-        try:
-            with app.app_context():
-                state=LiveVehicleState.query.filter_by(device_id=device_id).first()
-                if state and state.place_name:
-                    try:
-                        if _haversine_m(state.lat,state.lon,lat,lon) < _place_min_move_m:
-                            with _live_cache_lock:
-                                ent=_live_cache.get(device_id)
-                                if ent: ent["place_name"]=state.place_name
-                            return
-                    except Exception: pass
-                name=_reverse_geocode(lat,lon)
-                state=LiveVehicleState.query.filter_by(device_id=device_id).first()
-                if state: state.place_name=name; db.session.commit()
-                with _live_cache_lock:
-                    ent=_live_cache.get(device_id)
-                    if ent: ent["place_name"]=name
-        except Exception as exc:
-            try:
-                with app.app_context(): record_system_error(exc,source="place:reverse-geocode",severity="WARNING")
-            except Exception: pass
-    executor.submit(work)
 
 
 def _backfill_device_phones():
@@ -526,7 +400,7 @@ def _latest_live_entries(exclude: str | None = None) -> list[tuple[str, dict[str
                     "lat": row.lat, "lon": row.lon, "speed_mps": row.speed_mps,
                     "bearing_deg": row.bearing_deg, "heading_deg": row.heading_deg,
                     "ts": row.ts, "raw": None, "accuracy_m": row.accuracy_m,
-                    "sequence": row.sequence, "session_id": row.session_id, "source": row.source, "place_name": row.place_name
+                    "sequence": row.sequence, "session_id": row.session_id, "source": row.source
                 }
     except Exception as exc:
         record_system_error(exc, source="cache:live-state", severity="WARNING")
@@ -588,23 +462,6 @@ def _classify_risk(self_snap, other_snap):
     return {"decision": "caution", "confidence": round(confidence, 2), "reason": "crossing_trajectory"}
 
 
-def _road_profile_for_point(lat: float, lon: float):
-    """Return the nearest configured road profile inside its monitoring radius."""
-    try:
-        roads = Road.query.filter(Road.center_lat.isnot(None), Road.center_lon.isnot(None)).all()
-        best = None; best_d = float("inf")
-        for road in roads:
-            d = _haversine_m(lat, lon, road.center_lat, road.center_lon)
-            radius = float(road.radius_m or 50.0)
-            if d <= radius and d < best_d:
-                best, best_d = road, d
-        if best is not None:
-            return {"id": best.id, "name": best.name, "one_way": bool(getattr(best, "one_way", False)), "lane_count": int(getattr(best, "lane_count", 2) or 2)}
-    except Exception as exc:
-        record_system_error(exc, source="risk:road-profile", severity="WARNING")
-    return None
-
-
 def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M) -> dict[str, Any]:
     self_snap = None
     with _live_cache_lock:
@@ -619,7 +476,6 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
         self_snap.bearing_deg = entry.get("bearing_deg") or 0.0
         self_snap.ts = entry["ts"]
         self_snap.raw = entry.get("raw")
-        self_snap.place_name = entry.get("place_name")
     if not self_snap:
         state = LiveVehicleState.query.filter_by(device_id=device_id).first()
         if state and state.updated_at and state.updated_at >= datetime.utcnow() - timedelta(seconds=LIVE_CACHE_TTL_S):
@@ -627,7 +483,7 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
             self_snap = Tmp()
             self_snap.device_id = device_id; self_snap.lat = state.lat; self_snap.lon = state.lon
             self_snap.speed_mps = state.speed_mps or 0.0; self_snap.bearing_deg = state.bearing_deg or 0.0
-            self_snap.ts = state.ts; self_snap.raw = None; self_snap.place_name = state.place_name
+            self_snap.ts = state.ts; self_snap.raw = None
     if not self_snap:
         self_snap = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).first()
     if not self_snap:
@@ -638,7 +494,7 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
         class Tmp: pass
         self_snap = Tmp(); self_snap.device_id = device_id; self_snap.lat = entry["lat"]; self_snap.lon = entry["lon"]
         self_snap.speed_mps = entry.get("speed_mps") or 0.0; self_snap.bearing_deg = entry.get("bearing_deg") or 0.0
-        self_snap.ts = entry["ts"]; self_snap.raw = entry.get("raw"); self_snap.place_name = entry.get("place_name")
+        self_snap.ts = entry["ts"]; self_snap.raw = entry.get("raw")
 
     results = []
     device_rows: dict[str, Device] = {}
@@ -664,7 +520,6 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
         other.bearing_deg = entry.get("bearing_deg") or 0.0
         other.ts = entry["ts"]
         other.raw = entry.get("raw")
-        other.place_name = entry.get("place_name")
         direction = legacy.classify_direction(self_snap.bearing_deg or 0.0, other.bearing_deg or 0.0)
         closing = legacy.closing_speed_mps(
             self_snap.lat, self_snap.lon, self_snap.speed_mps or 0.0, self_snap.bearing_deg or 0.0,
@@ -686,22 +541,10 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
             "confidence": risk["confidence"],
             "reason": risk["reason"],
             "owner": row.owner if row else None,
-            "place_name": entry.get("place_name") or getattr(other,"place_name",None),
             "car_name": row.car_name if row else None,
             "car_model": row.car_model if row else None,
             "plate": row.plate if row else None,
         })
-    # Multiple same-direction passing candidates require a conservative overlap decision.
-    passing = [x for x in results if x.get("direction") == "same" and float(self_snap.speed_mps or 0.0) > float(x.get("speed_mps") or 0.0) + 0.01 and float(x.get("distance_m") or 99999) <= 160]
-    road_profile = _road_profile_for_point(self_snap.lat, self_snap.lon)
-    if len(passing) >= 2:
-        wide_one_way = bool(road_profile and road_profile.get("one_way") and int(road_profile.get("lane_count") or 2) >= 3)
-        for item in passing:
-            if item.get("decision") == "clear":
-                item["decision"] = "caution"
-                item["reason"] = "multiple_passing_candidates_overlap_risk" if not wide_one_way else "multiple_passing_candidates_wide_one_way_caution"
-                item["confidence"] = round(min(float(item.get("confidence") or 0.0), 0.85), 2)
-            item["overtake_candidate"] = True
     results.sort(key=lambda x: x["distance_m"])
 
     own = Device.query.get(device_id)
@@ -710,7 +553,6 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
             "device_id": device_id,
             "lat": self_snap.lat,
             "lon": self_snap.lon,
-            "place_name": getattr(self_snap, "place_name", None),
             "speed_mps": round(self_snap.speed_mps or 0.0, 2),
             "bearing_deg": round(self_snap.bearing_deg or 0.0, 1),
             "ts": self_snap.ts.isoformat(),
@@ -721,7 +563,6 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
                 "plate": own.plate if own else None,
             },
         },
-        "road_profile": road_profile,
         "nearby": results,
     }
     return payload
@@ -763,16 +604,29 @@ legacy.send_ws_to_device = _send_ws
 # The deployment may keep these in Render Environment Variables rather than in the database.
 # Supporting both naming conventions keeps older deployments working while avoiding public registration.
 def _render_admin_credentials():
-    """Read the sole chief-admin credential pair from Render.
+    """Read the chief-admin credentials from Render as complete name/password pairs.
 
-    This deployment intentionally uses only ADMIN_NAME + ADMIN_PASSWORD for
-    the chief administrator. Public registration remains disabled.
+    Pairing the variables avoids accidentally mixing a username from one convention
+    with a password from another when an older variable is still present in Render.
+    The simple ADMIN_NAME + ADMIN_PASSWORD pair is supported first because it is the
+    clearest chief-admin configuration.
     """
-    username = (os.environ.get("ADMIN_NAME") or "").strip()
-    password = os.environ.get("ADMIN_PASSWORD") or ""
-    if not username or not password:
-        return None, None
-    return username, password
+    pairs = (
+        ("ADMIN_NAME", "ADMIN_PASSWORD"),
+        ("ADMIN_USER", "ADMIN_PASS"),
+        ("ADMIN_USERNAME", "ADMIN_PASSWORD"),
+        ("BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD"),
+    )
+    for user_key, pass_key in pairs:
+        raw_user = os.environ.get(user_key)
+        raw_pass = os.environ.get(pass_key)
+        # Only accept a complete pair. Do not combine values from unrelated aliases.
+        if raw_user is not None and raw_pass is not None:
+            username = raw_user.strip()
+            password = raw_pass
+            if username and password != "":
+                return username, password
+    return None, None
 
 
 def _sync_render_chief_admin():
@@ -1062,23 +916,14 @@ def _record_incident(kind: str, *, device_id=None, plate=None, lat=None, lon=Non
         OperationalIncident.status == "active",
         OperationalIncident.created_at >= cutoff,
     ).order_by(OperationalIncident.created_at.desc()).first()
-    place_name = None
-    if lat is not None and lon is not None:
-        try:
-            cached = PlaceCache.query.filter_by(key=_place_key(float(lat), float(lon))).first()
-            place_name = cached.place_name if cached else None
-        except Exception:
-            db.session.rollback()
     if existing:
         existing.confidence = max(existing.confidence or 0.0, confidence)
         existing.reason = reason or existing.reason
         existing.evidence = json.dumps(evidence or {})
-        if place_name:
-            existing.place_name = place_name
         db.session.commit()
         return existing
     incident = OperationalIncident(type=kind, device_id=device_id, plate=plate, lat=lat, lon=lon,
-                                   place_name=place_name, severity=severity, confidence=confidence, reason=reason,
+                                   severity=severity, confidence=confidence, reason=reason,
                                    evidence=json.dumps(evidence or {}), status="active")
     db.session.add(incident)
     db.session.commit()
@@ -1107,8 +952,7 @@ def _cache_live_state(snap: Snapshot, *, accuracy_m=None, sequence=None, session
             "lat": snap.lat, "lon": snap.lon, "speed_mps": snap.speed_mps or 0.0,
             "bearing_deg": snap.bearing_deg or 0.0, "heading_deg": snap.heading_deg or 0.0,
             "ts": snap.ts, "raw": None, "accuracy_m": accuracy_m,
-            "sequence": sequence, "session_id": session_id, "source": source,
-            "place_name": state.place_name if state else None
+            "sequence": sequence, "session_id": session_id, "source": source
         }
 
 
@@ -1220,7 +1064,6 @@ def secure_heartbeat():
         db.session.flush()
         _cache_live_state(snap, accuracy_m=accuracy_m, sequence=sequence, session_id=session_id, source=body.get("source") or "android")
         db.session.commit()
-        _schedule_place_lookup(device_id, lat, lon)
     except Exception as exc:
         db.session.rollback()
         record_system_error(exc, source="database:heartbeat", severity="ERROR")
@@ -2588,65 +2431,6 @@ def device_message_mark_read(message_id):
     db.session.commit()
     return jsonify({"ok": True, "message_id": message_id, "read_at": delivery.read_at.isoformat()})
 
-@app.route("/device/bridge", methods=["GET"])
-def device_bridge():
-    auth = request.headers.get("Authorization", "")
-    header_token = auth.split(" ", 1)[1].strip() if auth.lower().startswith(("token ", "bearer ")) else ""
-    device_id=(request.args.get("device_id") or "").strip()
-    token=(request.args.get("token") or header_token).strip()
-    device=Device.query.filter_by(id=device_id, token=token, revoked=False).first() if device_id and token else None
-    if not device:
-        return "<html><body>Beacon bridge authorization required.</body></html>", 401
-    page = (
-        "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Beacon bridge</title><script>"
-        "async function tick(){try{const r=await fetch('/device/bridge/data',{cache:'no-store',credentials:'same-origin'});"
-        "const d=await r.json();if(window.BeaconBridge&&window.BeaconBridge.onPacket)window.BeaconBridge.onPacket(JSON.stringify(d));}"
-        "catch(e){if(window.BeaconBridge&&window.BeaconBridge.onError)window.BeaconBridge.onError(String(e));}}"
-        "tick();setInterval(tick,5000);</script><body></body>"
-    )
-    response=Response(page,mimetype="text/html")
-    response.set_cookie("beacon_device_id",device.id,httponly=True,secure=request.is_secure,samesite="Lax",max_age=86400)
-    response.set_cookie("beacon_device_token",device.token,httponly=True,secure=request.is_secure,samesite="Lax",max_age=86400)
-    return response
-
-@app.route("/device/bridge/data", methods=["GET"])
-def device_bridge_data():
-    auth = request.headers.get("Authorization", "")
-    header_token = auth.split(" ", 1)[1].strip() if auth.lower().startswith(("token ", "bearer ")) else ""
-    device_id=request.cookies.get("beacon_device_id") or request.args.get("device_id") or ""
-    token=request.cookies.get("beacon_device_token") or request.args.get("token") or header_token
-    device=Device.query.filter_by(id=device_id, token=token, revoked=False).first() if device_id and token else None
-    if not device:
-        return _api_error("Device bridge authentication required",401,"DEVICE_AUTH_REQUIRED")
-    try:
-        state=LiveVehicleState.query.filter_by(device_id=device.id).first() if LiveVehicleState else None
-        payload={"ok":True,"device":{"id":device.id,"owner":device.owner,"plate":device.plate,"phone_number":legacy._device_phone_number(device),"place_name":state.place_name if state else None,"updated_at":state.updated_at.isoformat() if state and state.updated_at else None},"nearby":{},"messages":[],"alerts":[]}
-        try: payload["nearby"]=compute_nearby_v2(device.id)
-        except Exception as exc: record_system_error(exc,source="bridge:nearby",severity="WARNING")
-        try:
-            rows=(db.session.query(BroadcastDelivery,BroadcastMessage).join(BroadcastMessage,BroadcastMessage.id==BroadcastDelivery.message_id).filter(BroadcastDelivery.device_id==device.id).order_by(BroadcastMessage.created_at.desc()).limit(10).all())
-            payload["messages"]=[{**legacy._serialize_message(m),"read_at":d.read_at.isoformat() if d.read_at else None} for d,m in rows if d.read_at is None]
-        except Exception as exc: record_system_error(exc,source="bridge:messages",severity="WARNING")
-        try:
-            alerts=DeviceAlert.query.filter(DeviceAlert.device_id==device.id, DeviceAlert.read_at.is_(None), DeviceAlert.kind != "authority_message").order_by(DeviceAlert.created_at.asc()).limit(20).all()
-            payload["alerts"]=[{"alert_id":a.id,"type":a.kind,"severity":a.severity,"title":a.title,"body":a.body,"message":a.body,"incident_id":a.incident_id,"created_at":a.created_at.isoformat() if a.created_at else None} for a in alerts]
-        except Exception as exc: record_system_error(exc,source="bridge:alerts",severity="WARNING")
-        return jsonify(payload)
-    except Exception as exc:
-        record_system_error(exc,source="bridge:data",severity="ERROR")
-        return _api_error("Bridge data unavailable",500,"BRIDGE_DATA_FAILED")
-
-@app.route("/device/alerts/<int:alert_id>/ack", methods=["POST"])
-def device_alert_ack_compat(alert_id):
-    device=_strict_device_from_request()
-    if not device: return _api_error("Missing or invalid device token",401,"DEVICE_AUTH_REQUIRED")
-    row=DeviceAlert.query.filter_by(id=alert_id,device_id=device.id).first()
-    if not row: return _api_error("Alert not found",404,"ALERT_NOT_FOUND")
-    now=datetime.utcnow(); row.read_at=now; row.delivered_at=row.delivered_at or now
-    db.session.commit()
-    return jsonify({"ok":True,"alert_id":alert_id})
-
 # ---------------------------------------------------------------------------
 # Final initialization and metadata
 # ---------------------------------------------------------------------------
@@ -2665,7 +2449,7 @@ with app.app_context():
         record_system_error(exc, source="database:sqlite-pragmas", severity="WARNING")
 
 # Store a small version marker for status/reporting.
-BEACON_VERSION = "2026.09.25-integrated-road-safety-v7"
+BEACON_VERSION = "2026.09.25-live-communications-v3"
 
 # Final authority UI / performance integration. Loaded only after every legacy route/model
 # and the chief-admin environment synchronization above are initialized.

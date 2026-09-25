@@ -145,11 +145,12 @@ class Snapshot(db.Model):
 class Road(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
     name = db.Column(db.String(256), nullable=False, index=True)
-    speed_limit_kmh = db.Column(db.Float, nullable=False)  # stored in km/h for user-friendliness
-    # Simple circular area for road monitoring (center + radius)
+    speed_limit_kmh = db.Column(db.Float, nullable=False)
     center_lat = db.Column(db.Float, nullable=True)
     center_lon = db.Column(db.Float, nullable=True)
     radius_m = db.Column(db.Float, nullable=True, default=50.0)
+    one_way = db.Column(db.Boolean, nullable=False, default=False)
+    lane_count = db.Column(db.Integer, nullable=False, default=2)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class OverspeedEvent(db.Model):
@@ -3208,6 +3209,8 @@ def admin_roads():
                 "center_lat": float(r.center_lat) if r.center_lat is not None else None,
                 "center_lon": float(r.center_lon) if r.center_lon is not None else None,
                 "radius_m": float(r.radius_m) if r.radius_m is not None else None,
+                "one_way": bool(getattr(r, "one_way", False)),
+                "lane_count": int(getattr(r, "lane_count", 2) or 2),
                 "created_at": r.created_at.isoformat() if r.created_at else None
             })
         return jsonify({"roads": out})
@@ -3220,6 +3223,9 @@ def admin_roads():
     center_lat = body.get("center_lat")
     center_lon = body.get("center_lon")
     radius_m = body.get("radius_m", 50.0)
+    one_way = bool(body.get("one_way", False))
+    try: lane_count = max(1, min(12, int(body.get("lane_count", 2))))
+    except Exception: lane_count = 2
     if not name or speed_limit_kmh is None:
         return jsonify({"error": "name and speed_limit_kmh required"}), 400
     try:
@@ -3228,11 +3234,14 @@ def admin_roads():
             r.center_lat = float(center_lat)
             r.center_lon = float(center_lon)
         r.radius_m = float(radius_m)
+        r.one_way = one_way
+        r.lane_count = lane_count
         db.session.add(r)
         db.session.commit()
         return jsonify({"ok": True, "road": {
             "id": r.id, "name": r.name, "speed_limit_kmh": r.speed_limit_kmh,
-            "center_lat": r.center_lat, "center_lon": r.center_lon, "radius_m": r.radius_m
+            "center_lat": r.center_lat, "center_lon": r.center_lon, "radius_m": r.radius_m,
+            "one_way": bool(getattr(r, "one_way", False)), "lane_count": int(getattr(r, "lane_count", 2) or 2)
         }})
     except Exception as e:
         db.session.rollback()
@@ -3248,6 +3257,7 @@ def admin_road_detail(road_id):
             "center_lat": float(r.center_lat) if r.center_lat is not None else None,
             "center_lon": float(r.center_lon) if r.center_lon is not None else None,
             "radius_m": float(r.radius_m) if r.radius_m is not None else None,
+            "one_way": bool(getattr(r, "one_way", False)), "lane_count": int(getattr(r, "lane_count", 2) or 2),
             "created_at": r.created_at.isoformat() if r.created_at else None
         })
     # DELETE
