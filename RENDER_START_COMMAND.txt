@@ -1,0 +1,5 @@
+Use this Render Start Command:
+
+gunicorn --workers 1 --worker-class gthread --threads 24 --bind 0.0.0.0:$PORT app:app
+
+Keep the service at one worker for Socket.IO session affinity. The lower thread count is intentional to reduce memory pressure.

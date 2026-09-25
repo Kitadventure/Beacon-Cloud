@@ -21,12 +21,13 @@ Beacon is a real-time road-safety, vehicle-intelligence and incident-coordinatio
 
 ## First-time setup
 
-1. Set `ADMIN_NAME` and `ADMIN_PASSWORD` in Render Environment Variables.
-2. Install dependencies with Python 3.13+ and use the supplied Render/Python configuration.
-3. Start the service with the Procfile command or `python app.py` for local development.
-4. Open `/admin/login` and sign in with the Render chief-admin credentials. Administrator registration is disabled.
-5. From Access Management, create Police and GK/Command accounts.
-6. For demos, public device enrollment/recovery is enabled by default; for a controlled deployment set `PUBLIC_ENROLLMENT=0` and provide `ENROLLMENT_KEY`. Keep every returned device token private.
+1. Copy `.env.example` to your deployment environment.
+2. Set a strong `FLASK_SECRET` for stable sessions. When it is omitted, Beacon generates a durable random secret under its data directory; a persistent Render disk is therefore important.
+3. Install dependencies with Python 3.13+ and use the supplied Render/Python configuration.
+4. Start the service with the Procfile command or `python app.py` for local development.
+5. Visit `/register` once to create the first administrator. Public registration closes after the first admin exists.
+6. From Access Management, create Police and GK/Command accounts.
+7. For demos, public device enrollment/recovery is enabled by default; for a controlled deployment set `PUBLIC_ENROLLMENT=0` and provide `ENROLLMENT_KEY`. Keep every returned device token private.
 
 ## Authority screens
 

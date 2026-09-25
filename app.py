@@ -27,6 +27,7 @@ import shutil
 import zipfile
 import hashlib
 import secrets
+import sys
 import time
 import traceback
 import uuid
@@ -189,30 +190,6 @@ class OperationalIncident(db.Model):
     evidence = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     resolved_at = db.Column(db.DateTime, nullable=True)
-
-
-class DeviceAlert(db.Model):
-    __tablename__ = "device_alert"
-    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
-    device_id = db.Column(db.String(36), index=True, nullable=False)
-    alert_type = db.Column(db.String(64), index=True, nullable=False)
-    severity = db.Column(db.String(16), default="info", index=True)
-    title = db.Column(db.String(255), nullable=False)
-    body = db.Column(db.Text, nullable=False)
-    payload = db.Column(db.Text)
-    fingerprint = db.Column(db.String(255), index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    delivered_at = db.Column(db.DateTime, nullable=True)
-    acknowledged_at = db.Column(db.DateTime, nullable=True)
-    expires_at = db.Column(db.DateTime, nullable=True, index=True)
-
-
-class RoadSafetyProfile(db.Model):
-    __tablename__ = "road_safety_profile"
-    road_id = db.Column(db.String(36), primary_key=True)
-    one_way = db.Column(db.Boolean, default=False, nullable=False)
-    lane_count = db.Column(db.Integer, default=2, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 def _ensure_schema_extensions():
     backend = db.engine.url.get_backend_name()
@@ -570,22 +547,6 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
         })
     results.sort(key=lambda x: x["distance_m"])
 
-    road_context = _road_safety_context(self_snap.lat, self_snap.lon)
-    multi_overtake = _multi_overtake_context(self_snap, live_entries, radius_m=min(radius_m, 180.0))
-    if multi_overtake["count"] >= 2 and results:
-        # Two or more plausible same-direction passing candidates create an overlap concern.
-        # A wider one-way corridor is represented as lower uncertainty, not as a guarantee of safety.
-        if road_context["one_way"] and road_context["lane_count"] >= 3:
-            for r in results:
-                if r.get("direction") == "same" and r.get("decision") == "clear":
-                    r["decision"] = "caution"
-                    r["reason"] = "multiple_overtake_candidates_wide_one_way_corridor"
-        else:
-            for r in results:
-                if r.get("direction") == "same" and r.get("decision") in {"clear", "caution"}:
-                    r["decision"] = "caution"
-                    r["reason"] = "multiple_overtake_candidates_overlap_risk"
-
     own = Device.query.get(device_id)
     payload = {
         "self": {
@@ -603,8 +564,6 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
             },
         },
         "nearby": results,
-        "road_context": road_context,
-        "overtake_context": {"candidate_count": multi_overtake["count"]},
     }
     return payload
 
@@ -645,20 +604,29 @@ legacy.send_ws_to_device = _send_ws
 # The deployment may keep these in Render Environment Variables rather than in the database.
 # Supporting both naming conventions keeps older deployments working while avoiding public registration.
 def _render_admin_credentials():
-    """Return the only supported chief-admin credential pair from Render.
+    """Read the chief-admin credentials from Render as complete name/password pairs.
 
-    ADMIN_NAME is the chief-admin username and ADMIN_PASSWORD is its password.
-    The pair is intentionally independent of database state and no other
-    environment-variable aliases are considered.
+    Pairing the variables avoids accidentally mixing a username from one convention
+    with a password from another when an older variable is still present in Render.
+    The simple ADMIN_NAME + ADMIN_PASSWORD pair is supported first because it is the
+    clearest chief-admin configuration.
     """
-    raw_user = os.environ.get("ADMIN_NAME")
-    raw_pass = os.environ.get("ADMIN_PASSWORD")
-    if raw_user is None or raw_pass is None:
-        return None, None
-    username = raw_user.strip()
-    if not username or raw_pass == "":
-        return None, None
-    return username, raw_pass
+    pairs = (
+        ("ADMIN_NAME", "ADMIN_PASSWORD"),
+        ("ADMIN_USER", "ADMIN_PASS"),
+        ("ADMIN_USERNAME", "ADMIN_PASSWORD"),
+        ("BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD"),
+    )
+    for user_key, pass_key in pairs:
+        raw_user = os.environ.get(user_key)
+        raw_pass = os.environ.get(pass_key)
+        # Only accept a complete pair. Do not combine values from unrelated aliases.
+        if raw_user is not None and raw_pass is not None:
+            username = raw_user.strip()
+            password = raw_pass
+            if username and password != "":
+                return username, password
+    return None, None
 
 
 def _sync_render_chief_admin():
@@ -725,6 +693,8 @@ def _set_session(username: str, role: str):
 
 def secure_admin_login():
     if request.method == "GET":
+        # Public registration is never exposed. The configured Render credentials are the
+        # deployment's chief-admin login and are synchronized during startup/login.
         return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.args.get("next", ""))
 
     username = (request.form.get("username") or "").strip()
@@ -734,12 +704,12 @@ def secure_admin_login():
         return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.form.get("next", "")), 400
 
     env_username, env_password = _render_admin_credentials()
-    # The Render pair is the canonical chief-admin login. Username matching is
-    # case-insensitive for convenience; password matching remains exact.
-    if env_username and env_password and username.casefold() == env_username.casefold():
-        if password != env_password:
-            flash("Invalid credentials")
-            return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.form.get("next", "")), 401
+    # Render environment variables are authoritative for the chief administrator.
+    # This works even when a persistent SQLite database contains an older password hash.
+    if env_username and env_password and username == env_username and password == env_password:
+        # The Render-configured chief administrator is authoritative. A persistent
+        # SQLite record is synchronized, but database credentials are never required
+        # for this login path. This keeps a changed Render password immediately usable.
         _sync_render_chief_admin()
         _set_session(env_username, "admin")
         next_path = request.form.get("next") or request.args.get("next")
@@ -764,8 +734,35 @@ def secure_admin_login():
 
 
 def secure_admin_register():
-    flash("Public administrator registration is disabled. Use the configured chief administrator credentials.")
-    return redirect(url_for("admin_login"))
+    if Admin.query.count() > 0:
+        flash("Administrator registration is closed. An existing admin must create additional accounts.")
+        return redirect(url_for("admin_login"))
+    if request.method == "GET":
+        return render_template_string("""
+        <!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>First Administrator</title><style>body{font-family:Inter,system-ui;background:#071522;color:#e5eefb;margin:0;padding:30px}.card{max-width:580px;margin:auto;background:#0d1d2e;border:1px solid #29435a;border-radius:18px;padding:24px}input{width:100%;box-sizing:border-box;margin:7px 0 14px;padding:12px;border-radius:10px;border:1px solid #29435a;background:#081525;color:#fff}button{padding:12px 16px;border:0;border-radius:10px;background:#1188ae;color:#fff;font-weight:800}</style></head><body><div class='card'><h1>First administrator</h1><p>This one-time setup closes as soon as an administrator exists.</p><form method='post'><label>Username</label><input name='username' minlength='3' required><label>Password</label><input name='password' type='password' minlength='10' required><label>Confirm password</label><input name='password2' type='password' minlength='10' required><button>Create administrator</button></form></div></body></html>
+        """)
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    password2 = request.form.get("password2") or ""
+    if len(username) < 3 or len(password) < 10:
+        flash("Use at least 3 characters for the username and 10 for the password.")
+        return redirect(url_for("admin_register"))
+    if password != password2:
+        flash("Passwords do not match.")
+        return redirect(url_for("admin_register"))
+    if Admin.query.count() > 0:
+        return redirect(url_for("admin_login"))
+    try:
+        obj = Admin(username=username, password_hash=legacy.generate_password_hash(password))
+        db.session.add(obj)
+        db.session.commit()
+        _set_session(username, "admin")
+        return redirect(url_for("dashboard"))
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="auth:registration")
+        flash("Administrator creation failed. See System Errors.")
+        return redirect(url_for("admin_register"))
 
 
 app.view_functions["admin_login"] = secure_admin_login
@@ -906,330 +903,6 @@ def vehicle_recover():
         record_system_error(exc, source="vehicle:recover", severity="ERROR")
         return _api_error("Vehicle credential recovery failed", 500, "RECOVERY_FAILED")
 
-
-# ---------------------------------------------------------------------------
-# Road context and multi-overtake conflict helpers
-# ---------------------------------------------------------------------------
-def _road_safety_context(lat: float, lon: float) -> dict[str, Any]:
-    try:
-        roads = Road.query.filter(Road.center_lat.isnot(None), Road.center_lon.isnot(None), Road.radius_m.isnot(None)).all()
-        best = None
-        best_d = None
-        for road in roads:
-            d = _haversine_m(lat, lon, float(road.center_lat), float(road.center_lon))
-            if d <= float(road.radius_m or 0) and (best_d is None or d < best_d):
-                best, best_d = road, d
-        if not best:
-            return {"road_id": None, "road_name": None, "one_way": False, "lane_count": 2, "distance_to_center_m": None}
-        profile = RoadSafetyProfile.query.filter_by(road_id=best.id).first()
-        return {
-            "road_id": best.id,
-            "road_name": best.name,
-            "one_way": bool(profile.one_way) if profile else False,
-            "lane_count": int(profile.lane_count) if profile else 2,
-            "distance_to_center_m": round(best_d or 0.0, 1),
-        }
-    except Exception as exc:
-        record_system_error(exc, source="road:safety-context", severity="WARNING")
-        return {"road_id": None, "road_name": None, "one_way": False, "lane_count": 2, "distance_to_center_m": None}
-
-
-def _multi_overtake_context(self_snap, live_entries: list[tuple[str, dict[str, Any]]], radius_m: float = 180.0) -> dict[str, Any]:
-    """Identify clustered same-direction overtaking candidates conservatively.
-
-    An 'interest' candidate is inferred only when another same-direction vehicle
-    is close enough, materially slower than the subject, and therefore creates a
-    plausible passing interaction. Explicit lane position/indicator data, when
-    available in the payload, can be layered on later; this function does not
-    pretend GPS alone proves a lane change.
-    """
-    candidates = []
-    for other_id, entry in live_entries:
-        try:
-            if legacy.classify_direction(self_snap.bearing_deg or 0.0, entry.get("bearing_deg") or 0.0) != "same":
-                continue
-            d = _haversine_m(self_snap.lat, self_snap.lon, entry["lat"], entry["lon"])
-            if d > radius_m or d < 8:
-                continue
-            if (self_snap.speed_mps or 0.0) > (entry.get("speed_mps") or 0.0) + 1.2:
-                candidates.append({"device_id": other_id, "distance_m": d, "speed_mps": entry.get("speed_mps") or 0.0})
-        except Exception:
-            continue
-    return {"count": len(candidates), "candidates": candidates}
-
-# ---------------------------------------------------------------------------
-# Conservative server accident inference override
-# ---------------------------------------------------------------------------
-def _snapshot_payload_value(snap, key, default=None):
-    try:
-        raw = json.loads(snap.raw) if isinstance(snap.raw, str) else (snap.raw or {})
-        if key in raw:
-            return raw.get(key)
-        integ = raw.get("_server_integrity") or {}
-        return integ.get(key, default)
-    except Exception:
-        return default
-
-
-def detect_accident_v2(device_id: str):
-    snaps = legacy._recent_snapshots_for_device(device_id, limit=10)
-    if not snaps or len(snaps) < 3:
-        return None
-    snaps = list(reversed(snaps))
-    now = datetime.utcnow()
-    snaps = [s for s in snaps if s.ts and s.ts >= now - timedelta(seconds=6)]
-    if len(snaps) < 3:
-        return None
-
-    independent = set()
-    best_decel = 0.0
-    best_drop = 0.0
-    best_heading_jump = 0.0
-    best_shock = 0.0
-    source_speed = 0.0
-    latest = snaps[-1]
-    for prev, cur in zip(snaps, snaps[1:]):
-        dt = (cur.ts - prev.ts).total_seconds()
-        if dt <= 0 or dt > 3.0:
-            continue
-        dv = float(cur.speed_mps or 0.0) - float(prev.speed_mps or 0.0)
-        decel = dv / dt
-        best_decel = min(best_decel, decel)
-        best_drop = max(best_drop, max(0.0, -dv))
-        best_heading_jump = max(best_heading_jump, legacy.angle_diff(float(prev.bearing_deg or 0), float(cur.bearing_deg or 0)))
-        shock = _snapshot_payload_value(cur, "accel_mag", 0.0)
-        try:
-            shock = max(0.0, float(shock or 0.0))
-        except Exception:
-            shock = 0.0
-        best_shock = max(best_shock, shock)
-        source_speed = max(source_speed, float(prev.speed_mps or 0.0))
-
-    # Require a meaningful pre-event speed; this prevents ordinary low-speed stops
-    # from being classified as collisions.
-    if source_speed < 8.0:
-        return None
-
-    reason = []
-    confidence = 0.0
-    if best_decel <= -8.0 and best_drop >= 5.0:
-        independent.add("hard_braking")
-        confidence += 0.55
-        reason.append(f"hard_decel_{abs(best_decel):.1f}mps2")
-    elif best_decel <= -6.0 and best_drop >= 3.0:
-        independent.add("strong_braking")
-        confidence += 0.35
-        reason.append(f"strong_decel_{abs(best_decel):.1f}mps2")
-
-    if best_heading_jump >= 75.0 and best_drop >= 3.0:
-        independent.add("trajectory_change")
-        confidence += 0.30
-        reason.append(f"heading_jump_{best_heading_jump:.0f}deg")
-
-    # Linear acceleration magnitude is useful corroboration, not a standalone collision claim.
-    if best_shock >= 20.0 and best_drop >= 3.0:
-        independent.add("impact_shock")
-        confidence += 0.25
-        reason.append(f"accel_shock_{best_shock:.1f}mps2")
-
-    # Nearby corroboration: another vehicle showing a sharp stop at the same place/time.
-    corroboration = 0
-    try:
-        supporters = legacy._devices_near_point(latest.lat, latest.lon, CONFIRMATION_RADIUS_M)
-        for did, _ in supporters.items():
-            if did == device_id:
-                continue
-            other = legacy._recent_snapshots_for_device(did, limit=5)
-            if len(other) >= 2:
-                a, b = other[1], other[0]
-                dt = (b.ts - a.ts).total_seconds() if a.ts and b.ts else 0
-                if 0 < dt <= 3.0 and a.speed_mps >= 8.0 and (a.speed_mps - b.speed_mps) / dt >= 4.0:
-                    corroboration += 1
-        if corroboration:
-            confidence += min(0.2, 0.1 * corroboration)
-            reason.append(f"vehicle_corroboration_{corroboration}")
-    except Exception:
-        pass
-
-    # No accident signal from a single weak condition.
-    if len(independent) < 1 or confidence < 0.55:
-        return None
-    if len(independent) < 2 and corroboration == 0 and not (best_decel <= -8.0 and best_drop >= 5.0):
-        return None
-
-    severity = "high" if confidence >= 0.85 or (best_decel <= -8.0 and best_drop >= 8.0) else "medium"
-    return {
-        "accident": True,
-        "severity": severity,
-        "confidence": round(min(1.0, confidence), 2),
-        "reason": ",".join(reason),
-        "ts": latest.ts.isoformat() if latest.ts else None,
-        "lat": latest.lat,
-        "lon": latest.lon,
-        "device_id": device_id,
-    }
-
-legacy.detect_accident_for_device = detect_accident_v2
-
-# ---------------------------------------------------------------------------
-# Durable device warning queue
-# ---------------------------------------------------------------------------
-def _serialize_device_alert(row: DeviceAlert) -> dict[str, Any]:
-    data = {}
-    try:
-        data = json.loads(row.payload) if row.payload else {}
-    except Exception:
-        data = {}
-    out = {
-        "alert_id": row.id,
-        "type": row.alert_type,
-        "severity": row.severity,
-        "title": row.title,
-        "body": row.body,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-    }
-    if isinstance(data, dict):
-        out.update(data)
-    return out
-
-
-def _queue_device_alert(device_id: str, *, alert_type: str, severity: str,
-                        title: str, body: str, payload: dict[str, Any] | None = None,
-                        fingerprint: str | None = None, ttl_s: int = 180) -> DeviceAlert | None:
-    """Persist a warning before attempting WebSocket delivery.
-
-    A fingerprint prevents the same physical condition from generating a new
-    notification on every heartbeat. Socket delivery is an acceleration path;
-    the persisted row is the reliability path.
-    """
-    now = datetime.utcnow()
-    fp = (fingerprint or f"{device_id}:{alert_type}:{title}:{body}")[:255]
-    try:
-        recent = DeviceAlert.query.filter(
-            DeviceAlert.device_id == device_id,
-            DeviceAlert.fingerprint == fp,
-            DeviceAlert.created_at >= now - timedelta(seconds=min(ttl_s, 180)),
-            DeviceAlert.acknowledged_at.is_(None),
-        ).order_by(DeviceAlert.created_at.desc()).first()
-        if recent:
-            return recent
-        row = DeviceAlert(
-            device_id=device_id, alert_type=alert_type[:64], severity=severity[:16],
-            title=title[:255], body=body[:10000], payload=json.dumps(payload or {}, default=str),
-            fingerprint=fp, expires_at=now + timedelta(seconds=max(30, ttl_s)),
-        )
-        db.session.add(row)
-        db.session.commit()
-        event = _serialize_device_alert(row)
-        _send_ws(device_id, "server_alert", event)
-        return row
-    except Exception as exc:
-        db.session.rollback()
-        record_system_error(exc, source="alerts:queue", severity="WARNING")
-        return None
-
-
-def _queue_risk_alerts(device_id: str, nearby_payload: dict[str, Any]):
-    rows = nearby_payload.get("nearby") or []
-    if not rows:
-        return
-    priority = {"red": 3, "caution": 2, "orange": 2}
-    candidates = [r for r in rows if str(r.get("decision", "")).lower() in priority]
-    if not candidates:
-        return
-    candidates.sort(key=lambda r: priority.get(str(r.get("decision", "")).lower(), 0), reverse=True)
-    top = candidates[0]
-    decision = str(top.get("decision", "caution")).lower()
-    severity = "critical" if decision == "red" else "warning"
-    title = "Unsafe overtake risk" if decision == "red" else "Overtaking caution"
-    direction = top.get("direction") or "traffic"
-    reason = top.get("reason") or "Vehicle trajectory requires caution"
-    body = f"{reason}. Nearby vehicle is {round(float(top.get('distance_m') or 0))} m away; direction: {direction}."
-    fp = f"risk:{device_id}:{top.get('device_id')}:{decision}:{reason}"
-    _queue_device_alert(device_id, alert_type="overtake_risk", severity=severity,
-                        title=title, body=body,
-                        payload={"decision": decision, "confidence": top.get("confidence"),
-                                 "reason": reason, "direction": direction,
-                                 "distance_m": top.get("distance_m"), "remote_device_id": top.get("device_id")},
-                        fingerprint=fp, ttl_s=20)
-
-
-def _active_accident_zone_alerts(device_id: str, lat: float, lon: float, speed_mps: float, bearing_deg: float):
-    """Warn a moving vehicle approaching an active accident zone.
-
-    Requires a recent active incident, a relatively close zone, and a heading
-    that points toward the incident with an ETA under two minutes. This keeps
-    unrelated nearby vehicles from being alerted merely because they are close.
-    """
-    try:
-        incidents = OperationalIncident.query.filter(
-            OperationalIncident.type == "possible_accident",
-            OperationalIncident.status == "active",
-            OperationalIncident.created_at >= datetime.utcnow() - timedelta(minutes=10),
-            OperationalIncident.lat.isnot(None),
-            OperationalIncident.lon.isnot(None),
-        ).order_by(OperationalIncident.created_at.desc()).limit(50).all()
-        for inc in incidents:
-            if inc.device_id == device_id:
-                continue
-            d = _haversine_m(lat, lon, inc.lat, inc.lon)
-            if d > 600.0 or speed_mps < 1.4:
-                continue
-            needed_bearing = legacy.bearing_between(lat, lon, inc.lat, inc.lon)
-            diff = legacy.angle_diff(bearing_deg or 0.0, needed_bearing)
-            if diff > 55.0:
-                continue
-            eta = d / max(speed_mps, 0.1)
-            if eta > 120.0:
-                continue
-            _queue_device_alert(
-                device_id, alert_type="hazard_nearby", severity="critical" if d < 220 else "warning",
-                title="Accident ahead", body=f"An active accident zone is approximately {round(d)} m ahead. Slow down and approach with caution.",
-                payload={"incident_id": inc.id, "lat": inc.lat, "lon": inc.lon, "distance_m": round(d, 1),
-                         "eta_s": round(eta, 1), "incident_severity": inc.severity, "incident_confidence": inc.confidence},
-                fingerprint=f"hazard:{device_id}:{inc.id}", ttl_s=60,
-            )
-    except Exception as exc:
-        record_system_error(exc, source="alerts:accident-zone", severity="WARNING")
-
-
-@app.route("/device/alerts", methods=["GET"])
-def device_alerts():
-    device = _strict_device_from_request()
-    if not device:
-        return _api_error("Missing or invalid device token", 401, "DEVICE_AUTH_REQUIRED")
-    now = datetime.utcnow()
-    try:
-        rows = DeviceAlert.query.filter(
-            DeviceAlert.device_id == device.id,
-            DeviceAlert.acknowledged_at.is_(None),
-            db.or_(DeviceAlert.expires_at.is_(None), DeviceAlert.expires_at >= now),
-        ).order_by(DeviceAlert.created_at.asc()).limit(50).all()
-        for row in rows:
-            if row.delivered_at is None:
-                row.delivered_at = now
-        if rows:
-            db.session.commit()
-        return jsonify({"ok": True, "alerts": [_serialize_device_alert(r) for r in rows]})
-    except Exception as exc:
-        db.session.rollback()
-        record_system_error(exc, source="alerts:fetch", severity="WARNING")
-        return _api_error("Alerts unavailable", 503, "ALERTS_UNAVAILABLE")
-
-
-@app.route("/device/alerts/<alert_id>/ack", methods=["POST"])
-def device_alert_ack(alert_id):
-    device = _strict_device_from_request()
-    if not device:
-        return _api_error("Missing or invalid device token", 401, "DEVICE_AUTH_REQUIRED")
-    row = DeviceAlert.query.filter_by(id=alert_id, device_id=device.id).first()
-    if not row:
-        return _api_error("Alert not found", 404, "ALERT_NOT_FOUND")
-    row.acknowledged_at = datetime.utcnow()
-    if row.delivered_at is None:
-        row.delivered_at = row.acknowledged_at
-    db.session.commit()
-    return jsonify({"ok": True, "alert_id": row.id, "acknowledged_at": row.acknowledged_at.isoformat()})
 
 # ---------------------------------------------------------------------------
 # Heartbeat / device channel
@@ -1414,7 +1087,6 @@ def secure_heartbeat():
     try:
         payload = compute_nearby_v2(device_id)
         _send_ws(device_id, "nearby_update", payload)
-        _queue_risk_alerts(device_id, payload)
     except Exception as exc:
         record_system_error(exc, source="risk-engine", severity="WARNING")
 
@@ -1427,10 +1099,6 @@ def secure_heartbeat():
                     "road_id": event.road_id, "speed_kmh": event.speed_kmh, "lat": event.lat,
                     "lon": event.lon, "ts": event.ts.isoformat()}
             _send_ws(device_id, "overspeed_alert", data)
-            _queue_device_alert(device_id, alert_type="overspeed", severity="warning",
-                                title="Overspeed warning",
-                                body=f"{data.get('road_id') or 'Road'}: {data.get('speed_kmh')} km/h.",
-                                payload=data, fingerprint=f"overspeed:{event.road_id}:{int(float(event.speed_kmh or 0))}", ttl_s=45)
             legacy.socketio.emit("overspeed_alert", data, room="police")
             legacy.socketio.emit("overspeed_alert", data, room="gk")
     except Exception as exc:
@@ -1445,19 +1113,10 @@ def secure_heartbeat():
                                         reason=acc.get("reason", ""), evidence=acc)
             acc = dict(acc, incident_id=incident.id, device_id=device_id)
             _send_ws(device_id, "accident_alert", acc)
-            _queue_device_alert(device_id, alert_type="accident", severity=acc.get("severity", "high"),
-                                title="Accident detected",
-                                body="A possible accident was detected from vehicle telemetry. Drive carefully and check the incident area.",
-                                payload=acc, fingerprint=f"accident:{incident.id}", ttl_s=300)
             legacy.socketio.emit("accident_alert", acc, room="police")
             legacy.socketio.emit("accident_alert", acc, room="gk")
     except Exception as exc:
         record_system_error(exc, source="risk:accident", severity="WARNING")
-
-    try:
-        _active_accident_zone_alerts(device_id, lat, lon, speed_mps, bearing)
-    except Exception as exc:
-        record_system_error(exc, source="risk:accident-zone", severity="WARNING")
 
     return jsonify({"ok": True, "accepted": True, "saved_at": snap.ts.isoformat() + "Z", "request_id": _request_id(), "nearby": payload or {}})
 
@@ -2593,33 +2252,6 @@ def get_nearby_v2(data):
         legacy.emit("error", {"error": "nearby calculation failed", "request_id": _request_id()})
 
 # ---------------------------------------------------------------------------
-# Road safety profile administration
-# ---------------------------------------------------------------------------
-@app.route("/admin/road/<road_id>/safety", methods=["GET", "POST"])
-def admin_road_safety_profile(road_id):
-    if _role() not in {"admin", "gk"}:
-        return _api_error("Authorized authority login required", 401, "AUTH_REQUIRED")
-    road = Road.query.get_or_404(road_id)
-    profile = RoadSafetyProfile.query.filter_by(road_id=road_id).first()
-    if profile is None:
-        profile = RoadSafetyProfile(road_id=road_id, one_way=False, lane_count=2)
-        db.session.add(profile)
-    if request.method == "POST":
-        try:
-            body = _parse_json_body()
-        except ValueError as exc:
-            return _api_error(str(exc), 400, "INVALID_JSON")
-        profile.one_way = bool(body.get("one_way", profile.one_way))
-        try:
-            profile.lane_count = max(1, min(12, int(body.get("lane_count", profile.lane_count))))
-        except (TypeError, ValueError):
-            return _api_error("lane_count must be an integer", 400, "INVALID_LANE_COUNT")
-        profile.updated_at = datetime.utcnow()
-        db.session.commit()
-    return jsonify({"ok": True, "road_id": road.id, "road_name": road.name,
-                    "one_way": bool(profile.one_way), "lane_count": int(profile.lane_count)})
-
-# ---------------------------------------------------------------------------
 # LPR ingestion security override
 # ---------------------------------------------------------------------------
 def secure_ingest_plate():
@@ -2817,7 +2449,21 @@ with app.app_context():
         record_system_error(exc, source="database:sqlite-pragmas", severity="WARNING")
 
 # Store a small version marker for status/reporting.
-BEACON_VERSION = "2026.09.25-integrated-release-v4"
+BEACON_VERSION = "2026.09.25-live-communications-v3"
+
+# Final authority UI / performance integration. Loaded only after every legacy route/model
+# and the chief-admin environment synchronization above are initialized.
+try:
+    from modern_ui import install_modern_ui
+    install_modern_ui(sys.modules[__name__])
+    app.logger.info("Modern authority UI and live-warning integration installed.")
+except Exception as exc:
+    app.logger.exception("Modern authority UI failed to install")
+    try:
+        record_system_error(exc, source="startup:modern-ui", severity="ERROR")
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     legacy.socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG", "0") == "1")
