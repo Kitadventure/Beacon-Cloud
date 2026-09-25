@@ -123,6 +123,7 @@ class Device(db.Model):
     car_name = db.Column(db.String(128))
     car_model = db.Column(db.String(128))
     plate = db.Column(db.String(64))
+    phone_number = db.Column(db.String(32), index=True)
     extra = db.Column(db.Text)
     revoked = db.Column(db.Boolean, default=False)
 
@@ -1107,6 +1108,9 @@ def _device_extra_object(device):
 
 
 def _device_phone_number(device):
+    direct = getattr(device, "phone_number", None)
+    if direct:
+        return str(direct)
     extra_obj = _device_extra_object(device)
     if isinstance(extra_obj, dict):
         phone = extra_obj.get("phone_number") or extra_obj.get("phone") or extra_obj.get("mobile")
@@ -2026,7 +2030,7 @@ DASHBOARD_HTML = """
         <div><strong>Owner:</strong> ${escapeHtml(dev.owner || '')}</div>
         <div><strong>Plate:</strong> ${escapeHtml(dev.plate || '')}</div>
         <div><strong>Created:</strong> ${escapeHtml(dev.created_at || '')}</div>
-        <div><strong>Connected:</strong> ${j.connected ? 'yes' : 'no'}</div>
+        <div><strong>Live socket:</strong> ${j.connected ? 'yes' : 'no'}</div><div><strong>Telemetry:</strong> ${j.telemetry_online ? 'online' : 'offline'}</div><div><strong>State:</strong> ${escapeHtml(j.connection_state || 'unknown')}</div><div><strong>Phone:</strong> ${escapeHtml(dev.phone_number || 'not captured')}</div>
       `;
       modalSnapshots.innerText = JSON.stringify(j.snapshots || [], null, 2);
     } catch (err) {
@@ -2516,10 +2520,10 @@ MESSAGES_HTML = """
       </div>
 
       <div class="card">
-        <h2>Search users</h2>
-        <input id="searchBox" placeholder="Search plate, owner, make, model..." oninput="searchDevices()">
-        <div class="muted" style="margin-top:8px;">Tap a result to copy its device ID into the message form.</div>
-        <div id="searchResults" style="margin-top:10px;max-height:520px;overflow:auto;"></div>
+        <div class="directory-head"><h2 style="margin:0;">Users / vehicles</h2><span class="count-badge" id="userCount">Loading…</span></div>
+        <input id="searchBox" class="search" placeholder="Search name, phone, plate, vehicle or device ID…" autocomplete="off" oninput="searchDevices()">
+        <div class="muted" style="margin-top:8px;">All registered users appear automatically. Search narrows the directory without hiding the control.</div>
+        <div id="searchResults" class="user-list" style="max-height:520px;overflow:auto;"></div>
       </div>
     </div>
 
@@ -2572,33 +2576,36 @@ function setTarget(v){
   document.getElementById('target_type').value = v;
   toggleTargetFields();
 }
+let searchTimer = null;
 async function searchDevices(){
-  const q = document.getElementById('searchBox').value.trim();
-  const box = document.getElementById('searchResults');
-  try {
-    const res = await fetch('/admin/message/search-devices?q=' + encodeURIComponent(q), {cache:'no-store'});
-    if (!res.ok) {
-      box.innerHTML = '<div class="muted" style="padding:10px;">Search unavailable right now.</div>';
-      return;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const q = document.getElementById('searchBox').value.trim();
+    const box = document.getElementById('searchResults');
+    try {
+      const res = await fetch('/admin/message/search-devices?q=' + encodeURIComponent(q), {cache:'no-store'});
+      if (!res.ok) {
+        box.innerHTML = '<div class="muted" style="padding:14px;">User directory is temporarily unavailable.</div>';
+        return;
+      }
+      const j = await res.json();
+      const devices = j.devices || [];
+      document.getElementById('userCount').textContent = (j.total ?? devices.length) + ' registered';
+      if (!devices.length){ box.innerHTML = '<div class="muted" style="padding:14px;">No matching users.</div>'; return; }
+      box.innerHTML = devices.map(d => {
+        const primary = [d.owner, d.car_name || d.car_model, d.plate].filter(Boolean).join(' • ') || d.id;
+        const meta = [d.phone_number ? '☎ ' + d.phone_number : '☎ phone not captured', d.speed_kmh != null ? d.speed_kmh + ' km/h' : '', d.connection_state || 'Offline'].filter(Boolean).join(' • ');
+        const secondary = [d.id, d.ts ? new Date(d.ts).toLocaleString() : 'No telemetry yet'].join(' • ');
+        return `<div class="result"><div><strong>${escapeHtml(primary)}</strong><small>${escapeHtml(meta)}</small><small>${escapeHtml(secondary)}</small></div><div><button type="button" onclick="pickDevice('${encodeURIComponent(d.id)}')">Use</button></div></div>`;
+      }).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="muted" style="padding:14px;">User directory could not be loaded.</div>';
     }
-    const txt = await res.text();
-    let j = {};
-    try { j = JSON.parse(txt); } catch (e) {
-      box.innerHTML = '<div class="muted" style="padding:10px;">Search returned an unexpected response.</div>';
-      return;
-    }
-    const devices = j.devices || [];
-    if (!devices.length){ box.innerHTML = '<div class="muted" style="padding:10px;">No devices found.</div>'; return; }
-    box.innerHTML = devices.map(d => {
-      const line1 = [d.owner, d.car_name, d.car_model, d.plate].filter(Boolean).join(' • ');
-      const line2 = [d.speed_kmh ? d.speed_kmh + ' km/h' : '', d.ts || ''].filter(Boolean).join(' • ');
-      return `<div class="result"><div><strong>${line1 || d.id}</strong><small>${line2}</small><small>${d.id}</small></div><div><button type="button" onclick="pickDevice('${d.id}')">Use</button></div></div>`;
-    }).join('');
-  } catch (e) {
-    box.innerHTML = '<div class="muted" style="padding:10px;">Search unavailable right now.</div>';
-  }
+  }, 120);
 }
+function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function pickDevice(id){
+  id = decodeURIComponent(id);
   document.getElementById('target_type').value = 'single';
   toggleTargetFields();
   document.getElementById('target_device_id').value = id;
@@ -2731,10 +2738,15 @@ def admin_device_revoke(device_id):
 # -------------------------
 
 def _latest_snapshots_map():
+    # Use a grouped SQL query instead of loading every historical snapshot into Python.
     latest = {}
-    for snap in Snapshot.query.order_by(Snapshot.ts.desc()).all():
-        if snap.device_id not in latest:
-            latest[snap.device_id] = snap
+    subq = (db.session.query(Snapshot.device_id, db.func.max(Snapshot.id).label("max_id"))
+            .group_by(Snapshot.device_id).subquery())
+    rows = (Snapshot.query
+            .join(subq, (Snapshot.device_id == subq.c.device_id) & (Snapshot.id == subq.c.max_id))
+            .all())
+    for snap in rows:
+        latest[snap.device_id] = snap
     return latest
 
 
@@ -2752,6 +2764,7 @@ def _device_blob(device):
         'car_name': device.car_name,
         'car_model': device.car_model,
         'plate': device.plate,
+        'phone_number': _device_phone_number(device),
         'extra': extra_obj,
     }
 
@@ -2762,7 +2775,7 @@ def _device_text_match(device, q):
     q = q.lower().strip()
     hay = ' '.join([
         str(device.id or ''), str(device.owner or ''), str(device.car_name or ''),
-        str(device.car_model or ''), str(device.plate or ''), str(device.extra or '')
+        str(device.car_model or ''), str(device.plate or ''), str(_device_phone_number(device) or ''), str(device.extra or '')
     ]).lower()
     return q in hay
 
@@ -3073,7 +3086,15 @@ body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:
     .btn.green{background:var(--green);}
     .btn.blue{background:var(--blue);}
     .btn.red{background:var(--red);}
-    .search{width:100%;box-sizing:border-box;padding:14px 14px;border-radius:16px;border:1px solid #dbe3ef;background:#fff;font-size:16px;outline:none;}
+    .search{width:100%;box-sizing:border-box;padding:15px 16px;border-radius:16px;border:2px solid #7dd3fc;background:#fff;font-size:17px;outline:none;color:#111827;box-shadow:0 0 0 4px rgba(14,134,173,.08);}
+    .search:focus{border-color:#0e86ad;box-shadow:0 0 0 4px rgba(14,134,173,.18);}
+    .user-list{margin-top:12px;border:1px solid #dbe3ef;border-radius:16px;overflow:hidden;background:#fff;}
+    .result{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 14px;border-bottom:1px solid #edf2f7;}
+    .result:last-child{border-bottom:0;}
+    .result small{display:block;color:#64748b;margin-top:3px;font-size:12px;}
+    .result button{white-space:nowrap;}
+    .directory-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;}
+    .count-badge{background:#e0f2fe;color:#075985;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:800;}
     .card{background:var(--card);border:1px solid #e5e7eb;border-radius:20px;padding:14px 16px;box-shadow:0 8px 22px rgba(15,23,42,.05);margin-bottom:12px;}
     .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;}
     .name{font-weight:900;font-size:16px;}

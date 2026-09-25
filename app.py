@@ -160,6 +160,20 @@ class LiveVehicleState(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
 
+class AuthorityInboxMessage(db.Model):
+    __tablename__ = "authority_inbox_message"
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), index=True, nullable=False)
+    owner = db.Column(db.String(128))
+    plate = db.Column(db.String(64))
+    phone_number = db.Column(db.String(32))
+    title = db.Column(db.String(255), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(16), default="unread", index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    read_at = db.Column(db.DateTime, nullable=True)
+
+
 class OperationalIncident(db.Model):
     __tablename__ = "operational_incident"
     id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
@@ -176,8 +190,76 @@ class OperationalIncident(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     resolved_at = db.Column(db.DateTime, nullable=True)
 
+
+class DeviceAlert(db.Model):
+    __tablename__ = "device_alert"
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    device_id = db.Column(db.String(36), index=True, nullable=False)
+    alert_type = db.Column(db.String(64), index=True, nullable=False)
+    severity = db.Column(db.String(16), default="info", index=True)
+    title = db.Column(db.String(255), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    payload = db.Column(db.Text)
+    fingerprint = db.Column(db.String(255), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    acknowledged_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True, index=True)
+
+
+class RoadSafetyProfile(db.Model):
+    __tablename__ = "road_safety_profile"
+    road_id = db.Column(db.String(36), primary_key=True)
+    one_way = db.Column(db.Boolean, default=False, nullable=False)
+    lane_count = db.Column(db.Integer, default=2, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+def _ensure_schema_extensions():
+    backend = db.engine.url.get_backend_name()
+    try:
+        if backend == "sqlite":
+            cols = {row[1] for row in db.session.execute(db.text("PRAGMA table_info(device)")).fetchall()}
+            if "phone_number" not in cols:
+                db.session.execute(db.text("ALTER TABLE device ADD COLUMN phone_number VARCHAR(32)"))
+                db.session.commit()
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_device_phone_number ON device(phone_number)"))
+            db.session.commit()
+        elif backend == "postgresql":
+            db.session.execute(db.text("ALTER TABLE device ADD COLUMN IF NOT EXISTS phone_number VARCHAR(32)"))
+            db.session.execute(db.text("CREATE INDEX IF NOT EXISTS ix_device_phone_number ON device(phone_number)"))
+            db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        if "record_system_error" in globals():
+            record_system_error(exc, source="database:schema-migration", severity="ERROR")
+        raise
+
+
+def _backfill_device_phones():
+    changed = 0
+    try:
+        for device in Device.query.filter(db.or_(Device.phone_number.is_(None), Device.phone_number == "")).all():
+            try:
+                extra = json.loads(device.extra) if device.extra else {}
+            except Exception:
+                extra = {}
+            if isinstance(extra, dict):
+                phone = extra.get("phone_number") or extra.get("phone") or extra.get("mobile")
+                if phone:
+                    device.phone_number = str(phone)[:32]
+                    changed += 1
+        if changed:
+            db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        if "record_system_error" in globals():
+            record_system_error(exc, source="database:phone-backfill", severity="WARNING")
+    return changed
+
 with app.app_context():
     db.create_all()
+    _ensure_schema_extensions()
+    _backfill_device_phones()
     if db.engine.url.get_backend_name() == "sqlite":
         try:
             with db.engine.begin() as conn:
@@ -488,6 +570,22 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
         })
     results.sort(key=lambda x: x["distance_m"])
 
+    road_context = _road_safety_context(self_snap.lat, self_snap.lon)
+    multi_overtake = _multi_overtake_context(self_snap, live_entries, radius_m=min(radius_m, 180.0))
+    if multi_overtake["count"] >= 2 and results:
+        # Two or more plausible same-direction passing candidates create an overlap concern.
+        # A wider one-way corridor is represented as lower uncertainty, not as a guarantee of safety.
+        if road_context["one_way"] and road_context["lane_count"] >= 3:
+            for r in results:
+                if r.get("direction") == "same" and r.get("decision") == "clear":
+                    r["decision"] = "caution"
+                    r["reason"] = "multiple_overtake_candidates_wide_one_way_corridor"
+        else:
+            for r in results:
+                if r.get("direction") == "same" and r.get("decision") in {"clear", "caution"}:
+                    r["decision"] = "caution"
+                    r["reason"] = "multiple_overtake_candidates_overlap_risk"
+
     own = Device.query.get(device_id)
     payload = {
         "self": {
@@ -505,6 +603,8 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
             },
         },
         "nearby": results,
+        "road_context": road_context,
+        "overtake_context": {"candidate_count": multi_overtake["count"]},
     }
     return payload
 
@@ -545,29 +645,20 @@ legacy.send_ws_to_device = _send_ws
 # The deployment may keep these in Render Environment Variables rather than in the database.
 # Supporting both naming conventions keeps older deployments working while avoiding public registration.
 def _render_admin_credentials():
-    """Read the chief-admin credentials from Render as complete name/password pairs.
+    """Return the only supported chief-admin credential pair from Render.
 
-    Pairing the variables avoids accidentally mixing a username from one convention
-    with a password from another when an older variable is still present in Render.
-    The simple ADMIN_NAME + ADMIN_PASSWORD pair is supported first because it is the
-    clearest chief-admin configuration.
+    ADMIN_NAME is the chief-admin username and ADMIN_PASSWORD is its password.
+    The pair is intentionally independent of database state and no other
+    environment-variable aliases are considered.
     """
-    pairs = (
-        ("ADMIN_NAME", "ADMIN_PASSWORD"),
-        ("ADMIN_USER", "ADMIN_PASS"),
-        ("ADMIN_USERNAME", "ADMIN_PASSWORD"),
-        ("BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD"),
-    )
-    for user_key, pass_key in pairs:
-        raw_user = os.environ.get(user_key)
-        raw_pass = os.environ.get(pass_key)
-        # Only accept a complete pair. Do not combine values from unrelated aliases.
-        if raw_user is not None and raw_pass is not None:
-            username = raw_user.strip()
-            password = raw_pass
-            if username and password != "":
-                return username, password
-    return None, None
+    raw_user = os.environ.get("ADMIN_NAME")
+    raw_pass = os.environ.get("ADMIN_PASSWORD")
+    if raw_user is None or raw_pass is None:
+        return None, None
+    username = raw_user.strip()
+    if not username or raw_pass == "":
+        return None, None
+    return username, raw_pass
 
 
 def _sync_render_chief_admin():
@@ -634,8 +725,6 @@ def _set_session(username: str, role: str):
 
 def secure_admin_login():
     if request.method == "GET":
-        # Public registration is never exposed. The configured Render credentials are the
-        # deployment's chief-admin login and are synchronized during startup/login.
         return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.args.get("next", ""))
 
     username = (request.form.get("username") or "").strip()
@@ -645,12 +734,12 @@ def secure_admin_login():
         return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.form.get("next", "")), 400
 
     env_username, env_password = _render_admin_credentials()
-    # Render environment variables are authoritative for the chief administrator.
-    # This works even when a persistent SQLite database contains an older password hash.
-    if env_username and env_password and username == env_username and password == env_password:
-        # The Render-configured chief administrator is authoritative. A persistent
-        # SQLite record is synchronized, but database credentials are never required
-        # for this login path. This keeps a changed Render password immediately usable.
+    # The Render pair is the canonical chief-admin login. Username matching is
+    # case-insensitive for convenience; password matching remains exact.
+    if env_username and env_password and username.casefold() == env_username.casefold():
+        if password != env_password:
+            flash("Invalid credentials")
+            return render_template_string(SECURE_LOGIN_HTML, allow_register=False, next_path=request.form.get("next", "")), 401
         _sync_render_chief_admin()
         _set_session(env_username, "admin")
         next_path = request.form.get("next") or request.args.get("next")
@@ -675,35 +764,8 @@ def secure_admin_login():
 
 
 def secure_admin_register():
-    if Admin.query.count() > 0:
-        flash("Administrator registration is closed. An existing admin must create additional accounts.")
-        return redirect(url_for("admin_login"))
-    if request.method == "GET":
-        return render_template_string("""
-        <!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>First Administrator</title><style>body{font-family:Inter,system-ui;background:#071522;color:#e5eefb;margin:0;padding:30px}.card{max-width:580px;margin:auto;background:#0d1d2e;border:1px solid #29435a;border-radius:18px;padding:24px}input{width:100%;box-sizing:border-box;margin:7px 0 14px;padding:12px;border-radius:10px;border:1px solid #29435a;background:#081525;color:#fff}button{padding:12px 16px;border:0;border-radius:10px;background:#1188ae;color:#fff;font-weight:800}</style></head><body><div class='card'><h1>First administrator</h1><p>This one-time setup closes as soon as an administrator exists.</p><form method='post'><label>Username</label><input name='username' minlength='3' required><label>Password</label><input name='password' type='password' minlength='10' required><label>Confirm password</label><input name='password2' type='password' minlength='10' required><button>Create administrator</button></form></div></body></html>
-        """)
-    username = (request.form.get("username") or "").strip()
-    password = request.form.get("password") or ""
-    password2 = request.form.get("password2") or ""
-    if len(username) < 3 or len(password) < 10:
-        flash("Use at least 3 characters for the username and 10 for the password.")
-        return redirect(url_for("admin_register"))
-    if password != password2:
-        flash("Passwords do not match.")
-        return redirect(url_for("admin_register"))
-    if Admin.query.count() > 0:
-        return redirect(url_for("admin_login"))
-    try:
-        obj = Admin(username=username, password_hash=legacy.generate_password_hash(password))
-        db.session.add(obj)
-        db.session.commit()
-        _set_session(username, "admin")
-        return redirect(url_for("dashboard"))
-    except Exception as exc:
-        db.session.rollback()
-        record_system_error(exc, source="auth:registration")
-        flash("Administrator creation failed. See System Errors.")
-        return redirect(url_for("admin_register"))
+    flash("Public administrator registration is disabled. Use the configured chief administrator credentials.")
+    return redirect(url_for("admin_login"))
 
 
 app.view_functions["admin_login"] = secure_admin_login
@@ -734,9 +796,13 @@ def secure_onboard():
     car_name = payload.get("car_name") or payload.get("vehicle_make") or payload.get("vehicle_type")
     car_model = payload.get("car_model") or payload.get("vehicle_model_name") or payload.get("vehicle_category")
     plate = payload.get("plate")
+    phone_number = str(payload.get("phone_number") or payload.get("phone") or payload.get("mobile") or "").strip()[:32]
     extra = payload.get("extra")
     if extra is not None and not isinstance(extra, (dict, list, str, int, float, bool)):
         return _api_error("extra must be JSON-serializable", 400, "INVALID_EXTRA")
+    if isinstance(extra, dict) and phone_number:
+        extra = dict(extra)
+        extra["phone_number"] = phone_number
     device_id = str(payload.get("device_id") or uuid.uuid4())[:36]
     token = legacy.create_device_token()
     while Device.query.filter_by(token=token).first():
@@ -752,6 +818,8 @@ def secure_onboard():
             existing.car_name = car_name or existing.car_name
             existing.car_model = car_model or existing.car_model
             existing.plate = plate or existing.plate
+            if phone_number:
+                existing.phone_number = phone_number
             existing.extra = json.dumps(extra) if extra is not None else existing.extra
             existing.revoked = False
             db.session.commit()
@@ -759,13 +827,14 @@ def secure_onboard():
             device = existing
         else:
             device = Device(id=device_id, token=token, owner=owner, car_name=car_name,
-                            car_model=car_model, plate=plate,
+                            car_model=car_model, plate=plate, phone_number=phone_number or None,
                             extra=json.dumps(extra) if extra is not None else None)
             db.session.add(device)
             db.session.commit()
         return jsonify({"ok": True, "device_id": device.id, "token": device.token,
                         "owner": device.owner, "car_name": device.car_name,
-                        "car_model": device.car_model, "plate": device.plate})
+                        "car_model": device.car_model, "plate": device.plate,
+                        "phone_number": getattr(device, "phone_number", None)})
     except Exception as exc:
         db.session.rollback()
         record_system_error(exc, source="device:onboard")
@@ -837,6 +906,330 @@ def vehicle_recover():
         record_system_error(exc, source="vehicle:recover", severity="ERROR")
         return _api_error("Vehicle credential recovery failed", 500, "RECOVERY_FAILED")
 
+
+# ---------------------------------------------------------------------------
+# Road context and multi-overtake conflict helpers
+# ---------------------------------------------------------------------------
+def _road_safety_context(lat: float, lon: float) -> dict[str, Any]:
+    try:
+        roads = Road.query.filter(Road.center_lat.isnot(None), Road.center_lon.isnot(None), Road.radius_m.isnot(None)).all()
+        best = None
+        best_d = None
+        for road in roads:
+            d = _haversine_m(lat, lon, float(road.center_lat), float(road.center_lon))
+            if d <= float(road.radius_m or 0) and (best_d is None or d < best_d):
+                best, best_d = road, d
+        if not best:
+            return {"road_id": None, "road_name": None, "one_way": False, "lane_count": 2, "distance_to_center_m": None}
+        profile = RoadSafetyProfile.query.filter_by(road_id=best.id).first()
+        return {
+            "road_id": best.id,
+            "road_name": best.name,
+            "one_way": bool(profile.one_way) if profile else False,
+            "lane_count": int(profile.lane_count) if profile else 2,
+            "distance_to_center_m": round(best_d or 0.0, 1),
+        }
+    except Exception as exc:
+        record_system_error(exc, source="road:safety-context", severity="WARNING")
+        return {"road_id": None, "road_name": None, "one_way": False, "lane_count": 2, "distance_to_center_m": None}
+
+
+def _multi_overtake_context(self_snap, live_entries: list[tuple[str, dict[str, Any]]], radius_m: float = 180.0) -> dict[str, Any]:
+    """Identify clustered same-direction overtaking candidates conservatively.
+
+    An 'interest' candidate is inferred only when another same-direction vehicle
+    is close enough, materially slower than the subject, and therefore creates a
+    plausible passing interaction. Explicit lane position/indicator data, when
+    available in the payload, can be layered on later; this function does not
+    pretend GPS alone proves a lane change.
+    """
+    candidates = []
+    for other_id, entry in live_entries:
+        try:
+            if legacy.classify_direction(self_snap.bearing_deg or 0.0, entry.get("bearing_deg") or 0.0) != "same":
+                continue
+            d = _haversine_m(self_snap.lat, self_snap.lon, entry["lat"], entry["lon"])
+            if d > radius_m or d < 8:
+                continue
+            if (self_snap.speed_mps or 0.0) > (entry.get("speed_mps") or 0.0) + 1.2:
+                candidates.append({"device_id": other_id, "distance_m": d, "speed_mps": entry.get("speed_mps") or 0.0})
+        except Exception:
+            continue
+    return {"count": len(candidates), "candidates": candidates}
+
+# ---------------------------------------------------------------------------
+# Conservative server accident inference override
+# ---------------------------------------------------------------------------
+def _snapshot_payload_value(snap, key, default=None):
+    try:
+        raw = json.loads(snap.raw) if isinstance(snap.raw, str) else (snap.raw or {})
+        if key in raw:
+            return raw.get(key)
+        integ = raw.get("_server_integrity") or {}
+        return integ.get(key, default)
+    except Exception:
+        return default
+
+
+def detect_accident_v2(device_id: str):
+    snaps = legacy._recent_snapshots_for_device(device_id, limit=10)
+    if not snaps or len(snaps) < 3:
+        return None
+    snaps = list(reversed(snaps))
+    now = datetime.utcnow()
+    snaps = [s for s in snaps if s.ts and s.ts >= now - timedelta(seconds=6)]
+    if len(snaps) < 3:
+        return None
+
+    independent = set()
+    best_decel = 0.0
+    best_drop = 0.0
+    best_heading_jump = 0.0
+    best_shock = 0.0
+    source_speed = 0.0
+    latest = snaps[-1]
+    for prev, cur in zip(snaps, snaps[1:]):
+        dt = (cur.ts - prev.ts).total_seconds()
+        if dt <= 0 or dt > 3.0:
+            continue
+        dv = float(cur.speed_mps or 0.0) - float(prev.speed_mps or 0.0)
+        decel = dv / dt
+        best_decel = min(best_decel, decel)
+        best_drop = max(best_drop, max(0.0, -dv))
+        best_heading_jump = max(best_heading_jump, legacy.angle_diff(float(prev.bearing_deg or 0), float(cur.bearing_deg or 0)))
+        shock = _snapshot_payload_value(cur, "accel_mag", 0.0)
+        try:
+            shock = max(0.0, float(shock or 0.0))
+        except Exception:
+            shock = 0.0
+        best_shock = max(best_shock, shock)
+        source_speed = max(source_speed, float(prev.speed_mps or 0.0))
+
+    # Require a meaningful pre-event speed; this prevents ordinary low-speed stops
+    # from being classified as collisions.
+    if source_speed < 8.0:
+        return None
+
+    reason = []
+    confidence = 0.0
+    if best_decel <= -8.0 and best_drop >= 5.0:
+        independent.add("hard_braking")
+        confidence += 0.55
+        reason.append(f"hard_decel_{abs(best_decel):.1f}mps2")
+    elif best_decel <= -6.0 and best_drop >= 3.0:
+        independent.add("strong_braking")
+        confidence += 0.35
+        reason.append(f"strong_decel_{abs(best_decel):.1f}mps2")
+
+    if best_heading_jump >= 75.0 and best_drop >= 3.0:
+        independent.add("trajectory_change")
+        confidence += 0.30
+        reason.append(f"heading_jump_{best_heading_jump:.0f}deg")
+
+    # Linear acceleration magnitude is useful corroboration, not a standalone collision claim.
+    if best_shock >= 20.0 and best_drop >= 3.0:
+        independent.add("impact_shock")
+        confidence += 0.25
+        reason.append(f"accel_shock_{best_shock:.1f}mps2")
+
+    # Nearby corroboration: another vehicle showing a sharp stop at the same place/time.
+    corroboration = 0
+    try:
+        supporters = legacy._devices_near_point(latest.lat, latest.lon, CONFIRMATION_RADIUS_M)
+        for did, _ in supporters.items():
+            if did == device_id:
+                continue
+            other = legacy._recent_snapshots_for_device(did, limit=5)
+            if len(other) >= 2:
+                a, b = other[1], other[0]
+                dt = (b.ts - a.ts).total_seconds() if a.ts and b.ts else 0
+                if 0 < dt <= 3.0 and a.speed_mps >= 8.0 and (a.speed_mps - b.speed_mps) / dt >= 4.0:
+                    corroboration += 1
+        if corroboration:
+            confidence += min(0.2, 0.1 * corroboration)
+            reason.append(f"vehicle_corroboration_{corroboration}")
+    except Exception:
+        pass
+
+    # No accident signal from a single weak condition.
+    if len(independent) < 1 or confidence < 0.55:
+        return None
+    if len(independent) < 2 and corroboration == 0 and not (best_decel <= -8.0 and best_drop >= 5.0):
+        return None
+
+    severity = "high" if confidence >= 0.85 or (best_decel <= -8.0 and best_drop >= 8.0) else "medium"
+    return {
+        "accident": True,
+        "severity": severity,
+        "confidence": round(min(1.0, confidence), 2),
+        "reason": ",".join(reason),
+        "ts": latest.ts.isoformat() if latest.ts else None,
+        "lat": latest.lat,
+        "lon": latest.lon,
+        "device_id": device_id,
+    }
+
+legacy.detect_accident_for_device = detect_accident_v2
+
+# ---------------------------------------------------------------------------
+# Durable device warning queue
+# ---------------------------------------------------------------------------
+def _serialize_device_alert(row: DeviceAlert) -> dict[str, Any]:
+    data = {}
+    try:
+        data = json.loads(row.payload) if row.payload else {}
+    except Exception:
+        data = {}
+    out = {
+        "alert_id": row.id,
+        "type": row.alert_type,
+        "severity": row.severity,
+        "title": row.title,
+        "body": row.body,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+    if isinstance(data, dict):
+        out.update(data)
+    return out
+
+
+def _queue_device_alert(device_id: str, *, alert_type: str, severity: str,
+                        title: str, body: str, payload: dict[str, Any] | None = None,
+                        fingerprint: str | None = None, ttl_s: int = 180) -> DeviceAlert | None:
+    """Persist a warning before attempting WebSocket delivery.
+
+    A fingerprint prevents the same physical condition from generating a new
+    notification on every heartbeat. Socket delivery is an acceleration path;
+    the persisted row is the reliability path.
+    """
+    now = datetime.utcnow()
+    fp = (fingerprint or f"{device_id}:{alert_type}:{title}:{body}")[:255]
+    try:
+        recent = DeviceAlert.query.filter(
+            DeviceAlert.device_id == device_id,
+            DeviceAlert.fingerprint == fp,
+            DeviceAlert.created_at >= now - timedelta(seconds=min(ttl_s, 180)),
+            DeviceAlert.acknowledged_at.is_(None),
+        ).order_by(DeviceAlert.created_at.desc()).first()
+        if recent:
+            return recent
+        row = DeviceAlert(
+            device_id=device_id, alert_type=alert_type[:64], severity=severity[:16],
+            title=title[:255], body=body[:10000], payload=json.dumps(payload or {}, default=str),
+            fingerprint=fp, expires_at=now + timedelta(seconds=max(30, ttl_s)),
+        )
+        db.session.add(row)
+        db.session.commit()
+        event = _serialize_device_alert(row)
+        _send_ws(device_id, "server_alert", event)
+        return row
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="alerts:queue", severity="WARNING")
+        return None
+
+
+def _queue_risk_alerts(device_id: str, nearby_payload: dict[str, Any]):
+    rows = nearby_payload.get("nearby") or []
+    if not rows:
+        return
+    priority = {"red": 3, "caution": 2, "orange": 2}
+    candidates = [r for r in rows if str(r.get("decision", "")).lower() in priority]
+    if not candidates:
+        return
+    candidates.sort(key=lambda r: priority.get(str(r.get("decision", "")).lower(), 0), reverse=True)
+    top = candidates[0]
+    decision = str(top.get("decision", "caution")).lower()
+    severity = "critical" if decision == "red" else "warning"
+    title = "Unsafe overtake risk" if decision == "red" else "Overtaking caution"
+    direction = top.get("direction") or "traffic"
+    reason = top.get("reason") or "Vehicle trajectory requires caution"
+    body = f"{reason}. Nearby vehicle is {round(float(top.get('distance_m') or 0))} m away; direction: {direction}."
+    fp = f"risk:{device_id}:{top.get('device_id')}:{decision}:{reason}"
+    _queue_device_alert(device_id, alert_type="overtake_risk", severity=severity,
+                        title=title, body=body,
+                        payload={"decision": decision, "confidence": top.get("confidence"),
+                                 "reason": reason, "direction": direction,
+                                 "distance_m": top.get("distance_m"), "remote_device_id": top.get("device_id")},
+                        fingerprint=fp, ttl_s=20)
+
+
+def _active_accident_zone_alerts(device_id: str, lat: float, lon: float, speed_mps: float, bearing_deg: float):
+    """Warn a moving vehicle approaching an active accident zone.
+
+    Requires a recent active incident, a relatively close zone, and a heading
+    that points toward the incident with an ETA under two minutes. This keeps
+    unrelated nearby vehicles from being alerted merely because they are close.
+    """
+    try:
+        incidents = OperationalIncident.query.filter(
+            OperationalIncident.type == "possible_accident",
+            OperationalIncident.status == "active",
+            OperationalIncident.created_at >= datetime.utcnow() - timedelta(minutes=10),
+            OperationalIncident.lat.isnot(None),
+            OperationalIncident.lon.isnot(None),
+        ).order_by(OperationalIncident.created_at.desc()).limit(50).all()
+        for inc in incidents:
+            if inc.device_id == device_id:
+                continue
+            d = _haversine_m(lat, lon, inc.lat, inc.lon)
+            if d > 600.0 or speed_mps < 1.4:
+                continue
+            needed_bearing = legacy.bearing_between(lat, lon, inc.lat, inc.lon)
+            diff = legacy.angle_diff(bearing_deg or 0.0, needed_bearing)
+            if diff > 55.0:
+                continue
+            eta = d / max(speed_mps, 0.1)
+            if eta > 120.0:
+                continue
+            _queue_device_alert(
+                device_id, alert_type="hazard_nearby", severity="critical" if d < 220 else "warning",
+                title="Accident ahead", body=f"An active accident zone is approximately {round(d)} m ahead. Slow down and approach with caution.",
+                payload={"incident_id": inc.id, "lat": inc.lat, "lon": inc.lon, "distance_m": round(d, 1),
+                         "eta_s": round(eta, 1), "incident_severity": inc.severity, "incident_confidence": inc.confidence},
+                fingerprint=f"hazard:{device_id}:{inc.id}", ttl_s=60,
+            )
+    except Exception as exc:
+        record_system_error(exc, source="alerts:accident-zone", severity="WARNING")
+
+
+@app.route("/device/alerts", methods=["GET"])
+def device_alerts():
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid device token", 401, "DEVICE_AUTH_REQUIRED")
+    now = datetime.utcnow()
+    try:
+        rows = DeviceAlert.query.filter(
+            DeviceAlert.device_id == device.id,
+            DeviceAlert.acknowledged_at.is_(None),
+            db.or_(DeviceAlert.expires_at.is_(None), DeviceAlert.expires_at >= now),
+        ).order_by(DeviceAlert.created_at.asc()).limit(50).all()
+        for row in rows:
+            if row.delivered_at is None:
+                row.delivered_at = now
+        if rows:
+            db.session.commit()
+        return jsonify({"ok": True, "alerts": [_serialize_device_alert(r) for r in rows]})
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="alerts:fetch", severity="WARNING")
+        return _api_error("Alerts unavailable", 503, "ALERTS_UNAVAILABLE")
+
+
+@app.route("/device/alerts/<alert_id>/ack", methods=["POST"])
+def device_alert_ack(alert_id):
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid device token", 401, "DEVICE_AUTH_REQUIRED")
+    row = DeviceAlert.query.filter_by(id=alert_id, device_id=device.id).first()
+    if not row:
+        return _api_error("Alert not found", 404, "ALERT_NOT_FOUND")
+    row.acknowledged_at = datetime.utcnow()
+    if row.delivered_at is None:
+        row.delivered_at = row.acknowledged_at
+    db.session.commit()
+    return jsonify({"ok": True, "alert_id": row.id, "acknowledged_at": row.acknowledged_at.isoformat()})
 
 # ---------------------------------------------------------------------------
 # Heartbeat / device channel
@@ -1021,6 +1414,7 @@ def secure_heartbeat():
     try:
         payload = compute_nearby_v2(device_id)
         _send_ws(device_id, "nearby_update", payload)
+        _queue_risk_alerts(device_id, payload)
     except Exception as exc:
         record_system_error(exc, source="risk-engine", severity="WARNING")
 
@@ -1033,6 +1427,10 @@ def secure_heartbeat():
                     "road_id": event.road_id, "speed_kmh": event.speed_kmh, "lat": event.lat,
                     "lon": event.lon, "ts": event.ts.isoformat()}
             _send_ws(device_id, "overspeed_alert", data)
+            _queue_device_alert(device_id, alert_type="overspeed", severity="warning",
+                                title="Overspeed warning",
+                                body=f"{data.get('road_id') or 'Road'}: {data.get('speed_kmh')} km/h.",
+                                payload=data, fingerprint=f"overspeed:{event.road_id}:{int(float(event.speed_kmh or 0))}", ttl_s=45)
             legacy.socketio.emit("overspeed_alert", data, room="police")
             legacy.socketio.emit("overspeed_alert", data, room="gk")
     except Exception as exc:
@@ -1047,10 +1445,19 @@ def secure_heartbeat():
                                         reason=acc.get("reason", ""), evidence=acc)
             acc = dict(acc, incident_id=incident.id, device_id=device_id)
             _send_ws(device_id, "accident_alert", acc)
+            _queue_device_alert(device_id, alert_type="accident", severity=acc.get("severity", "high"),
+                                title="Accident detected",
+                                body="A possible accident was detected from vehicle telemetry. Drive carefully and check the incident area.",
+                                payload=acc, fingerprint=f"accident:{incident.id}", ttl_s=300)
             legacy.socketio.emit("accident_alert", acc, room="police")
             legacy.socketio.emit("accident_alert", acc, room="gk")
     except Exception as exc:
         record_system_error(exc, source="risk:accident", severity="WARNING")
+
+    try:
+        _active_accident_zone_alerts(device_id, lat, lon, speed_mps, bearing)
+    except Exception as exc:
+        record_system_error(exc, source="risk:accident-zone", severity="WARNING")
 
     return jsonify({"ok": True, "accepted": True, "saved_at": snap.ts.isoformat() + "Z", "request_id": _request_id(), "nearby": payload or {}})
 
@@ -1312,7 +1719,19 @@ def generate_json_export_bytes() -> bytes:
     return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
 
 
+_status_cache_lock = threading.Lock()
+_status_cache_value: dict[str, Any] | None = None
+_status_cache_at = 0.0
+STATUS_CACHE_TTL_S = float(os.environ.get("STATUS_CACHE_TTL_S", "2.0"))
+_sqlite_integrity_cache: dict[str, Any] = {"checked_at": 0.0, "result": None}
+SQLITE_INTEGRITY_TTL_S = float(os.environ.get("SQLITE_INTEGRITY_TTL_S", "60"))
+
 def system_status() -> dict[str, Any]:
+    global _status_cache_value, _status_cache_at
+    now_mono = time.monotonic()
+    with _status_cache_lock:
+        if _status_cache_value is not None and (now_mono - _status_cache_at) < STATUS_CACHE_TTL_S:
+            return dict(_status_cache_value)
     db_ok = True
     db_err = None
     try:
@@ -1331,11 +1750,17 @@ def system_status() -> dict[str, Any]:
     if db_ok and _db_is_sqlite():
         path = _sqlite_path()
         if path and path.exists():
-            ok_i, detail_i = _sqlite_integrity(path)
-            sqlite_integrity = {"ok": ok_i, "detail": detail_i}
+            now_i = time.monotonic()
+            if _sqlite_integrity_cache.get("result") is None or (now_i - float(_sqlite_integrity_cache.get("checked_at") or 0.0)) >= SQLITE_INTEGRITY_TTL_S:
+                try:
+                    ok_i, detail_i = _sqlite_integrity(path)
+                    _sqlite_integrity_cache.update({"checked_at": now_i, "result": {"ok": ok_i, "detail": detail_i}})
+                except Exception as exc:
+                    _sqlite_integrity_cache.update({"checked_at": now_i, "result": {"ok": False, "detail": str(exc)}})
+            sqlite_integrity = dict(_sqlite_integrity_cache.get("result") or {})
     with _live_cache_lock:
         cache_count = len(_live_cache)
-    return {
+    result = {
         "ok": db_ok and (sqlite_integrity is None or sqlite_integrity.get("ok", False)),
         "time": datetime.utcnow().isoformat() + "Z",
         "database": {"ok": db_ok, "backend": db.engine.url.get_backend_name(), "error": db_err, "sqlite_integrity": sqlite_integrity},
@@ -1346,6 +1771,10 @@ def system_status() -> dict[str, Any]:
         "overspeed_events": OverspeedEvent.query.count() if db_ok else None,
         "incidents": OperationalIncident.query.filter_by(status="active").count() if db_ok else None,
     }
+    with _status_cache_lock:
+        _status_cache_value = dict(result)
+        _status_cache_at = now_mono
+    return result
 
 
 def _pdf_table(elems, headers, rows):
@@ -1397,9 +1826,10 @@ def generate_authority_pdf(kind: str, *, admin_sensitive: bool = False) -> bytes
         for d in Device.query.order_by(Device.created_at.desc()).limit(1000).all():
             snap = Snapshot.query.filter_by(device_id=d.id).order_by(Snapshot.ts.desc()).first()
             owner = d.owner if admin_sensitive else ("[restricted]" if d.owner else "")
-            rows.append((d.id[:12], d.plate or "", d.car_name or d.car_model or "", owner,
+            phone = legacy._device_phone_number(d) if admin_sensitive else ("[restricted]" if legacy._device_phone_number(d) else "")
+            rows.append((d.id[:12], d.plate or "", d.car_name or d.car_model or "", owner, phone or "",
                          snap.ts.isoformat() if snap and snap.ts else ""))
-        _pdf_table(elems, ["Device", "Plate", "Vehicle", "Owner", "Last seen"], rows)
+        _pdf_table(elems, ["Device", "Plate", "Vehicle", "Owner", "Phone", "Last seen"], rows)
         elems.append(Spacer(1, 10))
 
     if kind in {"summary", "overspeeds", "backup"}:
@@ -1668,7 +2098,7 @@ app.view_functions["report_all_pdf"] = repaired_legacy_all_pdf
 # ---------------------------------------------------------------------------
 ERRORS_HTML = """
 <!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — System Errors</title><style>body{font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,Arial;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1400px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:15px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn{display:inline-block;background:#11698e;border:1px solid #1f8fb8;color:#fff;padding:10px 13px;border-radius:10px;text-decoration:none;font-weight:800;cursor:pointer}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.k{font-size:11px;color:#8da5bb;text-transform:uppercase;letter-spacing:.1em}.v{font-size:30px;font-weight:900;margin-top:5px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.toolbar input,.toolbar select{padding:10px;border:1px solid #29435a;background:#081525;color:#fff;border-radius:10px;min-width:200px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px 8px;border-bottom:1px solid #20394f;text-align:left;vertical-align:top;font-size:12px}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#4c1d1d;color:#fecaca}.warning{background:#49370a;color:#fde68a}.trace{white-space:pre-wrap;max-width:520px;max-height:180px;overflow:auto;color:#cbd5e1}.muted{color:#94a3b8}.empty{text-align:center;padding:30px;color:#94a3b8}@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.stats{grid-template-columns:1fr}.table{font-size:11px}}</style></head>
-<body><div class='wrap'><div class='top'><div><div style='font-size:12px;letter-spacing:.1em;color:#7dd3fc'>BEACON OPERATIONS</div><h1 style='margin:.1em 0'>System Errors & Health</h1><div class='muted'>One place for backend exceptions, database failures and authority dashboard errors.</div></div><div class='nav'><a href='{{ url_for("dashboard") }}'>Dashboard</a><a href='{{ url_for("authority_reports") }}'>Reports & backups</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div>
+<body><div class='wrap'><div class='top'><div><div style='font-size:12px;letter-spacing:.1em;color:#7dd3fc'>BEACON OPERATIONS</div><h1 style='margin:.1em 0'>System Errors & Health</h1><div class='muted'>One place for backend exceptions, database failures and authority dashboard errors.</div></div><div class='nav'><a href='{{ url_for("dashboard") }}'>Dashboard</a><a href='{{ url_for("authority_reports") }}'>Reports & backups</a><a href='{{ url_for("authority_inbox") }}'>Driver inbox</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div>
 <div class='stats'><div class='card'><div class='k'>Open errors</div><div class='v' id='open'>—</div></div><div class='card'><div class='k'>Database</div><div class='v' id='db'>—</div></div><div class='card'><div class='k'>Live devices</div><div class='v' id='live'>—</div></div><div class='card'><div class='k'>Sockets</div><div class='v' id='sockets'>—</div></div></div>
 <div class='card'><div class='toolbar'><input id='q' placeholder='Search source, route, error type, message'><select id='state'><option value='all'>All errors</option><option value='open'>Open</option><option value='resolved'>Resolved</option></select><button class='btn' onclick='loadErrors()'>Refresh</button><button class='btn' onclick='window.location="{{ url_for("authority_report_errors_pdf") }}"'>PDF</button><button class='btn' onclick='window.location="{{ url_for("admin_backup_json") }}"'>JSON backup</button></div><div style='overflow:auto'><table class='table'><thead><tr><th>Time</th><th>Severity</th><th>Source</th><th>Type</th><th>Message</th><th>Route</th><th>State</th><th>Trace / action</th></tr></thead><tbody id='rows'></tbody></table></div></div></div>
 <script>
@@ -1779,11 +2209,11 @@ app.view_functions["admin_admins"] = admin_users_v2
 # Police / GK live consoles
 # ---------------------------------------------------------------------------
 POLICE_HTML = """
-<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Police Operations</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.grid{display:grid;grid-template-columns:1.5fr .8fr;gap:14px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.feed{max-height:620px;overflow:auto;display:flex;flex-direction:column;gap:10px}.event{border:1px solid #29435a;background:#081827;border-radius:12px;padding:12px}.critical{border-color:#7f1d1d}.muted{color:#94a3b8}.tag{display:inline-block;padding:4px 7px;border-radius:999px;background:#173047;color:#bfe8ff;font-size:11px}.empty{text-align:center;padding:30px;color:#94a3b8}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON POLICE</div><h1>Police Operations</h1><div class='muted'>Live watchlist, LPR and safety event feed for the authenticated police session.</div></div><div class='nav'><a href='{{ url_for("all_vehicles") }}'>Vehicle search</a><a href='{{ url_for("authority_reports") }}'>Reports</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='grid'><div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operations</h2><span class='tag' id='authState'>Connecting…</span></div><div id='feed' class='feed'><div class='empty'>Waiting for live events…</div></div></div><div><div class='card'><h2>Session health</h2><p>Role: <strong>Police</strong></p><p>Live channel: <strong id='socket'>Connecting</strong></p><p>Platform: <strong id='health'>Checking</strong></p><a class='nav' style='display:inline-block;margin-top:8px' href='{{ url_for("authority_report_incidents_pdf") }}'>Download incident PDF</a></div><div class='card' style='margin-top:14px'><h2>What this console receives</h2><div class='muted'>Watchlist hits, plate sightings, overspeed events and server-inferred accident alerts. The channel uses the authenticated police session—no administrator API token is required.</div></div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(title,d,critical){if(feed.querySelector('.empty'))feed.innerHTML='';const e=document.createElement('div');e.className='event'+(critical?' critical':'');e.innerHTML='<strong>'+esc(title)+'</strong><div class="muted" style="margin-top:5px">'+esc(d.plate||d.watch_plate||d.device_id||'')+' · '+esc(d.ts||'')+'</div><div style="margin-top:7px">'+esc(d.watch_label||d.reason||'Operational event')+'</div>';feed.prepend(e);}function reportClientError(message,stack){fetch('/authority/client-error',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,source:location.pathname,stack:stack||''})}).catch(()=>{});}window.addEventListener('error',e=>reportClientError(e.message||'window error',e.error?.stack));window.addEventListener('unhandledrejection',e=>reportClientError(String(e.reason||'unhandled promise rejection'),e.reason?.stack));s.on('connect',()=>{document.getElementById('socket').textContent='Connected';s.emit('police_auth_v2',{});});s.on('police_auth_ok_v2',()=>{document.getElementById('authState').textContent='Authorized';});s.on('police_auth_failed_v2',()=>{document.getElementById('authState').textContent='Denied';});s.on('disconnect',()=>{document.getElementById('socket').textContent='Disconnected';document.getElementById('authState').textContent='Disconnected';});s.on('watch_hit',d=>add('WATCHLIST HIT',d,true));s.on('plate_sighting',d=>add('PLATE SIGHTING',d,false));s.on('overspeed_alert',d=>add('OVERSPEED',d,false));s.on('accident_alert',d=>add('ACCIDENT ALERT',d,true));async function health(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('health').textContent=j.ok?'Healthy':'Degraded';}catch(e){document.getElementById('health').textContent='Unavailable';}}health();setInterval(health,5000);</script></body></html>
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Police Operations</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.grid{display:grid;grid-template-columns:1.5fr .8fr;gap:14px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.feed{max-height:620px;overflow:auto;display:flex;flex-direction:column;gap:10px}.event{border:1px solid #29435a;background:#081827;border-radius:12px;padding:12px}.critical{border-color:#7f1d1d}.muted{color:#94a3b8}.tag{display:inline-block;padding:4px 7px;border-radius:999px;background:#173047;color:#bfe8ff;font-size:11px}.empty{text-align:center;padding:30px;color:#94a3b8}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON POLICE</div><h1>Police Operations</h1><div class='muted'>Live watchlist, LPR and safety event feed for the authenticated police session.</div></div><div class='nav'><a href='{{ url_for("all_vehicles") }}'>Vehicle search</a><a href='{{ url_for("authority_reports") }}'>Reports</a><a href='{{ url_for("authority_inbox") }}'>Driver inbox</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='grid'><div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operations</h2><span class='tag' id='authState'>Connecting…</span></div><div id='feed' class='feed'><div class='empty'>Waiting for live events…</div></div></div><div><div class='card'><h2>Session health</h2><p>Role: <strong>Police</strong></p><p>Live channel: <strong id='socket'>Connecting</strong></p><p>Platform: <strong id='health'>Checking</strong></p><a class='nav' style='display:inline-block;margin-top:8px' href='{{ url_for("authority_report_incidents_pdf") }}'>Download incident PDF</a></div><div class='card' style='margin-top:14px'><h2>What this console receives</h2><div class='muted'>Watchlist hits, plate sightings, overspeed events and server-inferred accident alerts. The channel uses the authenticated police session—no administrator API token is required.</div></div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(title,d,critical){if(feed.querySelector('.empty'))feed.innerHTML='';const e=document.createElement('div');e.className='event'+(critical?' critical':'');e.innerHTML='<strong>'+esc(title)+'</strong><div class="muted" style="margin-top:5px">'+esc(d.plate||d.watch_plate||d.device_id||'')+' · '+esc(d.ts||'')+'</div><div style="margin-top:7px">'+esc(d.watch_label||d.reason||'Operational event')+'</div>';feed.prepend(e);}function reportClientError(message,stack){fetch('/authority/client-error',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,source:location.pathname,stack:stack||''})}).catch(()=>{});}window.addEventListener('error',e=>reportClientError(e.message||'window error',e.error?.stack));window.addEventListener('unhandledrejection',e=>reportClientError(String(e.reason||'unhandled promise rejection'),e.reason?.stack));s.on('connect',()=>{document.getElementById('socket').textContent='Connected';s.emit('police_auth_v2',{});s.emit('authority_auth_v2',{});});s.on('authority_inbox_message',d=>add('DRIVER MESSAGE',d,false));s.on('police_auth_ok_v2',()=>{document.getElementById('authState').textContent='Authorized';});s.on('police_auth_failed_v2',()=>{document.getElementById('authState').textContent='Denied';});s.on('disconnect',()=>{document.getElementById('socket').textContent='Disconnected';document.getElementById('authState').textContent='Disconnected';});s.on('watch_hit',d=>add('WATCHLIST HIT',d,true));s.on('plate_sighting',d=>add('PLATE SIGHTING',d,false));s.on('overspeed_alert',d=>add('OVERSPEED',d,false));s.on('accident_alert',d=>add('ACCIDENT ALERT',d,true));async function health(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('health').textContent=j.ok?'Healthy':'Degraded';}catch(e){document.getElementById('health').textContent='Unavailable';}}health();setInterval(health,5000);</script></body></html>
 """
 
 GK_HTML = """
-<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Command Center</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.k{font-size:11px;color:#8da5bb;text-transform:uppercase;letter-spacing:.1em}.v{font-size:27px;font-weight:900;margin-top:4px}.feed{margin-top:14px;display:flex;flex-direction:column;gap:9px;max-height:500px;overflow:auto}.event{padding:12px;background:#081827;border:1px solid #29435a;border-radius:12px}.muted{color:#94a3b8;line-height:1.5}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.cards{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON COMMAND</div><h1>GK / Command Center</h1><div class='muted'>System-wide situational view with authorized communications and reporting.</div></div><div class='nav'><a href='{{ url_for("authority_reports") }}'>Reports & backups</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='cards'><div class='card'><div class='k'>Live devices</div><div class='v' id='live'>—</div></div><div class='card'><div class='k'>Active incidents</div><div class='v' id='incidents'>—</div></div><div class='card'><div class='k'>Open system errors</div><div class='v' id='errors'>—</div></div><div class='card'><div class='k'>Database</div><div class='v' id='db'>—</div></div></div><div class='card' style='margin-top:14px'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operational feed</h2><a class='btn' href='{{ url_for("authority_report_incidents_pdf") }}'>Incident PDF</a></div><div id='feed' class='feed'><div class='muted'>Waiting for command events…</div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(t,d){if(feed.children.length===1&&feed.firstElementChild.classList.contains('muted'))feed.innerHTML='';const e=document.createElement('div');e.className='event';e.innerHTML='<strong>'+esc(t)+'</strong><div class="muted">'+esc(d.device_id||d.plate||'')+' · '+esc(d.ts||'')+'</div><div>'+esc(d.reason||d.watch_label||'Operational event')+'</div>';feed.prepend(e);}function reportClientError(message,stack){fetch('/authority/client-error',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,source:location.pathname,stack:stack||''})}).catch(()=>{});}window.addEventListener('error',e=>reportClientError(e.message||'window error',e.error?.stack));window.addEventListener('unhandledrejection',e=>reportClientError(String(e.reason||'unhandled promise rejection'),e.reason?.stack));s.on('connect',()=>s.emit('gk_auth_v2',{}));s.on('watch_hit',d=>add('WATCHLIST HIT',d));s.on('overspeed_alert',d=>add('OVERSPEED',d));s.on('accident_alert',d=>add('ACCIDENT ALERT',d));async function load(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('live').textContent=j.live?.devices??'—';document.getElementById('incidents').textContent=j.incidents??'—';document.getElementById('errors').textContent=j.errors?.open??'—';document.getElementById('db').textContent=j.database?.ok?'OK':'DOWN';}catch(e){reportClientError(e.message,'health');}}load();setInterval(load,5000);</script></body></html>
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Command Center</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.k{font-size:11px;color:#8da5bb;text-transform:uppercase;letter-spacing:.1em}.v{font-size:27px;font-weight:900;margin-top:4px}.feed{margin-top:14px;display:flex;flex-direction:column;gap:9px;max-height:500px;overflow:auto}.event{padding:12px;background:#081827;border:1px solid #29435a;border-radius:12px}.muted{color:#94a3b8;line-height:1.5}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.cards{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON COMMAND</div><h1>GK / Command Center</h1><div class='muted'>System-wide situational view with authorized communications and reporting.</div></div><div class='nav'><a href='{{ url_for("authority_reports") }}'>Reports & backups</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='cards'><div class='card'><div class='k'>Live devices</div><div class='v' id='live'>—</div></div><div class='card'><div class='k'>Active incidents</div><div class='v' id='incidents'>—</div></div><div class='card'><div class='k'>Open system errors</div><div class='v' id='errors'>—</div></div><div class='card'><div class='k'>Database</div><div class='v' id='db'>—</div></div></div><div class='card' style='margin-top:14px'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operational feed</h2><a class='btn' href='{{ url_for("authority_report_incidents_pdf") }}'>Incident PDF</a></div><div id='feed' class='feed'><div class='muted'>Waiting for command events…</div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(t,d){if(feed.children.length===1&&feed.firstElementChild.classList.contains('muted'))feed.innerHTML='';const e=document.createElement('div');e.className='event';e.innerHTML='<strong>'+esc(t)+'</strong><div class="muted">'+esc(d.device_id||d.plate||'')+' · '+esc(d.ts||'')+'</div><div>'+esc(d.reason||d.watch_label||'Operational event')+'</div>';feed.prepend(e);}function reportClientError(message,stack){fetch('/authority/client-error',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,source:location.pathname,stack:stack||''})}).catch(()=>{});}window.addEventListener('error',e=>reportClientError(e.message||'window error',e.error?.stack));window.addEventListener('unhandledrejection',e=>reportClientError(String(e.reason||'unhandled promise rejection'),e.reason?.stack));s.on('connect',()=>{s.emit('gk_auth_v2',{});s.emit('authority_auth_v2',{});});s.on('authority_inbox_message',d=>add('DRIVER MESSAGE',d));s.on('watch_hit',d=>add('WATCHLIST HIT',d));s.on('overspeed_alert',d=>add('OVERSPEED',d));s.on('accident_alert',d=>add('ACCIDENT ALERT',d));async function load(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('live').textContent=j.live?.devices??'—';document.getElementById('incidents').textContent=j.incidents??'—';document.getElementById('errors').textContent=j.errors?.open??'—';document.getElementById('db').textContent=j.database?.ok?'OK':'DOWN';}catch(e){reportClientError(e.message,'health');}}load();setInterval(load,5000);</script></body></html>
 """
 
 
@@ -1817,8 +2247,299 @@ def _inject_dashboard_tools(template: str, role: str) -> str:
 legacy.DASHBOARD_HTML = _inject_dashboard_tools(legacy.DASHBOARD_HTML, "admin")
 
 # ---------------------------------------------------------------------------
+# Fast authority vehicle/device directory overrides
+# ---------------------------------------------------------------------------
+def _device_connection_state(device_id: str, last_ts: datetime | None = None) -> tuple[bool, bool, str]:
+    socket_online = _device_connected(device_id)
+    if last_ts is None:
+        return socket_online, False, "REAL-TIME" if socket_online else "OFFLINE"
+    age = max(0.0, (datetime.utcnow() - last_ts).total_seconds())
+    telemetry_online = age <= max(30.0, LIVE_CACHE_TTL_S * 2.0)
+    if socket_online:
+        return True, telemetry_online, "REAL-TIME"
+    if telemetry_online:
+        return False, True, "TELEMETRY ONLINE"
+    return False, False, "OFFLINE"
+
+
+def _fast_device_directory(q: str = "", limit: int = 200):
+    qn = (q or "").strip().lower()
+    devices = Device.query.filter_by(revoked=False).order_by(Device.created_at.desc()).all()
+    latest = legacy._latest_snapshots_map()
+    out = []
+    for d in devices:
+        phone = legacy._device_phone_number(d)
+        hay = " ".join([str(d.id or ""), str(d.owner or ""), str(d.car_name or ""), str(d.car_model or ""), str(d.plate or ""), str(phone or ""), str(d.extra or "")]).lower()
+        if qn and qn not in hay:
+            continue
+        snap = latest.get(d.id)
+        socket_online, telemetry_online, state = _device_connection_state(d.id, snap.ts if snap else None)
+        out.append({
+            "id": d.id,
+            "owner": d.owner,
+            "car_name": d.car_name,
+            "car_model": d.car_model,
+            "plate": d.plate,
+            "phone_number": phone,
+            "speed_kmh": round(float(snap.speed_mps or 0.0) * 3.6, 1) if snap else None,
+            "ts": snap.ts.isoformat() if snap and snap.ts else None,
+            "connected": socket_online,
+            "telemetry_online": telemetry_online,
+            "connection_state": state,
+        })
+        if len(out) >= limit:
+            break
+    return out, len(out)
+
+
+def optimized_admin_devices():
+    if _current_role() != "admin":
+        return redirect(url_for("admin_login"))
+    devices, _ = _fast_device_directory(limit=500)
+    return jsonify({"devices": devices})
+
+
+def optimized_admin_device_json(device_id):
+    if _current_role() != "admin":
+        return _api_error("Authorized administrator required", 401, "ADMIN_REQUIRED")
+    d = Device.query.get_or_404(device_id)
+    snaps = legacy._recent_snapshots_for_device(device_id, limit=20)
+    snaps_out = []
+    for s in snaps:
+        raw = None
+        if s.raw:
+            try: raw = json.loads(s.raw)
+            except Exception: raw = s.raw
+        snaps_out.append({"ts": s.ts.isoformat() if s.ts else None, "lat": s.lat, "lon": s.lon,
+                          "speed_mps": s.speed_mps, "bearing_deg": s.bearing_deg, "source": s.source, "raw": raw})
+    last_ts = snaps[0].ts if snaps else None
+    socket_online, telemetry_online, state = _device_connection_state(d.id, last_ts)
+    return jsonify({
+        "device": {"id": d.id, "owner": d.owner, "car_name": d.car_name, "car_model": d.car_model,
+                   "plate": d.plate, "phone_number": legacy._device_phone_number(d), "extra": legacy._device_extra_object(d),
+                   "created_at": d.created_at.isoformat() if d.created_at else None, "revoked": bool(d.revoked)},
+        "last_snapshot": snaps_out[0] if snaps_out else None,
+        "snapshots": snaps_out,
+        "connected": socket_online,
+        "telemetry_online": telemetry_online,
+        "connection_state": state,
+        "last_seen": last_ts.isoformat() if last_ts else None,
+    })
+
+
+def optimized_admin_vehicles():
+    role = _current_role()
+    if role not in {"admin", "police", "gk"}:
+        return _api_error("Login required", 401, "AUTH_REQUIRED")
+    q = (request.args.get("q") or "").strip().lower()
+    field = (request.args.get("field") or "all").strip().lower()
+    devices = Device.query.filter_by(revoked=False).order_by(Device.created_at.desc()).all()
+    latest = legacy._latest_snapshots_map()
+    out = []
+    for d in devices:
+        phone = legacy._device_phone_number(d)
+        if q:
+            hay = {"plate": str(d.plate or "").lower(), "owner": str(d.owner or "").lower(), "phone": str(phone or "").lower(),
+                   "all": " ".join([str(d.plate or ""), str(d.owner or ""), str(d.car_name or ""), str(d.car_model or ""), str(phone or "")]).lower()}
+            if q not in hay.get(field, hay["all"]):
+                continue
+        snap = latest.get(d.id)
+        socket_online, telemetry_online, state = _device_connection_state(d.id, snap.ts if snap else None)
+        out.append({"id": d.id, "owner": d.owner, "car_name": d.car_name, "car_model": d.car_model, "plate": d.plate,
+                    "phone_number": phone, "connected": socket_online, "telemetry_online": telemetry_online,
+                    "connection_state": state,
+                    "last_snapshot": {"ts": snap.ts.isoformat() if snap and snap.ts else None, "lat": snap.lat if snap else None,
+                                      "lon": snap.lon if snap else None, "speed_mps": round(snap.speed_mps or 0.0, 3) if snap else None,
+                                      "bearing_deg": round(snap.bearing_deg or 0.0, 1) if snap else None} if snap else None})
+    return jsonify({"vehicles": out, "count": len(out)})
+
+app.view_functions["admin_devices"] = optimized_admin_devices
+app.view_functions["admin_device_json"] = optimized_admin_device_json if "admin_device_json" in app.view_functions else app.view_functions.get("admin_device_json")
+if "admin_vehicles" in app.view_functions:
+    app.view_functions["admin_vehicles"] = optimized_admin_vehicles
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional authority ↔ driver messaging
+# ---------------------------------------------------------------------------
+def _strict_device_from_request() -> Device | None:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    form = request.form.to_dict(flat=True) if request.form else {}
+    auth = request.headers.get("Authorization", "")
+    token = None
+    if auth.lower().startswith(("token ", "bearer ")):
+        token = auth.split(" ", 1)[1].strip()
+    token = (token or request.headers.get("X-Device-Token") or body.get("token")
+             or form.get("token") or request.args.get("token"))
+    if not token:
+        return None
+    try:
+        return Device.query.filter_by(token=str(token), revoked=False).first()
+    except Exception as exc:
+        record_system_error(exc, source="device-auth", severity="WARNING")
+        return None
+
+
+def _serialize_inbox(row: AuthorityInboxMessage) -> dict[str, Any]:
+    return {"id": row.id, "device_id": row.device_id, "owner": row.owner, "plate": row.plate,
+            "phone_number": row.phone_number, "title": row.title, "body": row.body,
+            "status": row.status, "created_at": row.created_at.isoformat() if row.created_at else None,
+            "read_at": row.read_at.isoformat() if row.read_at else None}
+
+
+def _notify_authorities(event: str, payload: dict[str, Any]):
+    for room in ("authority", "admin", "police", "gk"):
+        try:
+            legacy.socketio.emit(event, payload, room=room)
+        except Exception as exc:
+            record_system_error(exc, source="socket:authority-broadcast", severity="WARNING")
+
+
+@app.route("/device/authority-message", methods=["POST"])
+def device_authority_message():
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid device token", 401, "DEVICE_AUTH_REQUIRED")
+    try:
+        body = _parse_json_body() if request.is_json else request.form.to_dict(flat=True)
+    except ValueError as exc:
+        return _api_error(str(exc), 400, "INVALID_JSON")
+    title = (body.get("title") or "Message from driver").strip()[:255]
+    message_body = (body.get("body") or body.get("message") or "").strip()
+    if not message_body:
+        return _api_error("Message body is required", 400, "MESSAGE_BODY_REQUIRED")
+    row = AuthorityInboxMessage(device_id=device.id, owner=device.owner, plate=device.plate,
+                                phone_number=legacy._device_phone_number(device), title=title,
+                                body=message_body, status="unread")
+    try:
+        db.session.add(row)
+        db.session.commit()
+        payload = _serialize_inbox(row)
+        _notify_authorities("authority_inbox_message", payload)
+        return jsonify({"ok": True, "message": payload})
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="device:authority-message")
+        return _api_error("Could not send message to authority", 500, "AUTHORITY_MESSAGE_FAILED")
+
+
+@app.route("/device/messages/history", methods=["GET"])
+def device_messages_history():
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid device token", 401, "DEVICE_AUTH_REQUIRED")
+    limit = max(1, min(100, int(request.args.get("limit", 50))))
+    rows = (db.session.query(BroadcastDelivery, BroadcastMessage)
+            .join(BroadcastMessage, BroadcastMessage.id == BroadcastDelivery.message_id)
+            .filter(BroadcastDelivery.device_id == device.id)
+            .order_by(BroadcastMessage.created_at.desc()).limit(limit).all())
+    return jsonify({"ok": True, "messages": [{**legacy._serialize_message(m),
+        "delivered_at": d.delivered_at.isoformat() if d.delivered_at else None,
+        "read_at": d.read_at.isoformat() if d.read_at else None} for d, m in rows]})
+
+
+@app.route("/authority/inbox")
+def authority_inbox():
+    role = _require_authority()
+    q = (request.args.get("q") or "").strip().lower()
+    rows = AuthorityInboxMessage.query.order_by(AuthorityInboxMessage.created_at.desc()).limit(300).all()
+    messages = []
+    for row in rows:
+        text_blob = " ".join([str(row.owner or ""), str(row.plate or ""), str(row.phone_number or ""), str(row.title or ""), str(row.body or "")]).lower()
+        if q and q not in text_blob:
+            continue
+        messages.append(_serialize_inbox(row))
+    return render_template_string(AUTHORITY_INBOX_HTML, role=role, messages=messages)
+
+
+@app.route("/authority/inbox/<message_id>/read", methods=["POST"])
+def authority_inbox_read(message_id):
+    _require_authority()
+    row = AuthorityInboxMessage.query.get_or_404(message_id)
+    row.status = "read"
+    row.read_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({"ok": True, "message": _serialize_inbox(row)})
+
+
+AUTHORITY_INBOX_HTML = """
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Authority Inbox</title>
+<style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1300px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn{background:#11698e;color:#fff;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;text-decoration:none;font-weight:800;cursor:pointer}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px;margin-top:14px}.search{width:100%;box-sizing:border-box;padding:15px;border:2px solid #7dd3fc;border-radius:14px;background:#081525;color:#fff;font-size:17px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:14px}.msg{background:#081827;border:1px solid #29435a;border-radius:14px;padding:14px}.meta{color:#94a3b8;font-size:12px;line-height:1.55}.body{margin-top:10px;white-space:pre-wrap;line-height:1.55}.unread{border-color:#0e86ad;box-shadow:0 0 0 2px rgba(14,134,173,.12)}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#173047;color:#bfe8ff;font-size:11px;font-weight:800}@media(max-width:850px){.grid{grid-template-columns:1fr}}</style></head>
+<body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON AUTHORITY</div><h1>Driver → Authority Inbox</h1><div style='color:#94a3b8'>Messages sent from registered driver devices. Live updates remain available while this page is open.</div></div><div class='nav'><a href='{{ url_for("authority_reports") }}'>Reports</a><a href='{{ url_for("admin_messages") }}'>Send messages</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div>
+<div class='card'><input id='q' class='search' placeholder='Search driver, phone, plate, title or message…' value='{{ request.args.get("q", "")|e }}'></div>
+<div id='list' class='grid'>{% if messages %}{% for m in messages %}<article class='msg {% if m.status=="unread" %}unread{% endif %}' data-text='{{ (m.owner ~ " " ~ m.plate ~ " " ~ m.phone_number ~ " " ~ m.title ~ " " ~ m.body)|e }}'><div style='display:flex;justify-content:space-between;gap:10px;align-items:flex-start'><div><strong>{{ m.title }}</strong><div class='meta'>{{ m.owner or 'Unknown driver' }} · {{ m.plate or 'No plate' }} · {{ m.phone_number or 'No phone captured' }}</div><div class='meta'>{{ m.created_at or '' }} · Device {{ m.device_id }}</div></div><span class='pill'>{{ m.status }}</span></div><div class='body'>{{ m.body }}</div>{% if m.status=='unread' %}<button class='btn' style='margin-top:12px' onclick='markRead("{{ m.id }}")'>Mark read</button>{% endif %}</article>{% endfor %}{% else %}<div class='card' style='grid-column:1/-1;color:#94a3b8'>No driver messages yet.</div>{% endif %}</div>
+<script src='/socket.io/socket.io.js'></script><script>const q=document.getElementById('q');q.addEventListener('input',()=>{const x=q.value.toLowerCase().trim();document.querySelectorAll('.msg').forEach(e=>e.style.display=(!x||e.dataset.text.toLowerCase().includes(x))?'':'none')});async function markRead(id){await fetch('/authority/inbox/'+encodeURIComponent(id)+'/read',{method:'POST'});location.reload();}const s=io({transports:['polling','websocket'],reconnection:true});s.on('connect',()=>s.emit('authority_auth_v2',{}));s.on('authority_inbox_message',m=>{const list=document.getElementById('list');const empty=list.querySelector('.card');if(empty)empty.remove();const el=document.createElement('article');el.className='msg unread';el.dataset.text=[m.owner,m.plate,m.phone_number,m.title,m.body].join(' ').toLowerCase();el.innerHTML='<div style="display:flex;justify-content:space-between;gap:10px"><div><strong>'+esc(m.title)+'</strong><div class="meta">'+esc(m.owner||'Unknown driver')+' · '+esc(m.plate||'No plate')+' · '+esc(m.phone_number||'No phone captured')+'</div><div class="meta">'+esc(m.created_at||'')+' · Device '+esc(m.device_id||'')+'</div></div><span class="pill">unread</span></div><div class="body">'+esc(m.body)+'</div><button class="btn" style="margin-top:12px" onclick="markRead(\''+m.id+'\')">Mark read</button>';list.prepend(el)});function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}</script>
+</div></body></html>
+"""
+
+def optimized_admin_messages():
+    role = _current_role()
+    if role not in {"admin", "gk"}:
+        return redirect(url_for("admin_login"))
+    if request.method == "POST":
+        body = request.form.to_dict(flat=True)
+        if request.is_json:
+            body = request.get_json(force=True, silent=True) or {}
+        payload, err = legacy._create_message_and_dispatch(body)
+        if request.is_json:
+            if err:
+                return _api_error(err, 400, "MESSAGE_SEND_FAILED")
+            return jsonify({"ok": True, "message": payload})
+        flash(err or f"Message sent to {payload.get('recipient_count', 0)} device(s)")
+        return redirect(url_for("admin_messages"))
+    try:
+        roads = Road.query.order_by(Road.created_at.desc()).all()
+    except Exception as exc:
+        record_system_error(exc, source="messages:roads", severity="WARNING")
+        roads = []
+    try:
+        zones = TrafficZone.query.order_by(TrafficZone.created_at.desc()).all()
+    except Exception as exc:
+        record_system_error(exc, source="messages:zones", severity="WARNING")
+        zones = []
+    try:
+        recent_messages = BroadcastMessage.query.order_by(BroadcastMessage.created_at.desc()).limit(20).all()
+    except Exception as exc:
+        record_system_error(exc, source="messages:history", severity="WARNING")
+        recent_messages = []
+    return legacy._safe_render(MESSAGES_HTML, devices=[], speeders=[], roads=roads, zones=zones, recent_messages=recent_messages)
+
+app.view_functions["admin_messages"] = optimized_admin_messages
+
+# Fast phone-aware recipient directory used by the Messages Center.
+def optimized_admin_message_search_devices():
+    role = _current_role()
+    if role not in {"admin", "gk"}:
+        return _api_error("Authorized authority login required", 401, "AUTH_REQUIRED")
+    q = (request.args.get("q") or "").strip()
+    try:
+        devices, _ = _fast_device_directory(q=q, limit=5000)
+        # The directory intentionally returns all matching registered vehicles, not an arbitrary first page.
+        return jsonify({"devices": devices, "total": len(devices)})
+    except Exception as exc:
+        record_system_error(exc, source="message:user-directory", severity="WARNING")
+        return _api_error("User directory unavailable", 503, "USER_DIRECTORY_UNAVAILABLE")
+
+app.view_functions["admin_message_search_devices"] = optimized_admin_message_search_devices
+
+# ---------------------------------------------------------------------------
 # Socket.IO v2 authority channels and device registration channels
 # ---------------------------------------------------------------------------
+@legacy.socketio.on("authority_auth_v2")
+def authority_auth_v2(_data):
+    try:
+        role = _role()
+        if role in {"admin", "police", "gk"}:
+            legacy.join_room("authority")
+            legacy.join_room(role)
+            legacy.emit("authority_auth_ok_v2", {"ok": True, "role": role})
+            return
+    except Exception as exc:
+        record_system_error(exc, source="socket:authority-auth", severity="WARNING")
+    legacy.emit("authority_auth_failed_v2", {"ok": False})
+
 @legacy.socketio.on("police_auth_v2")
 def police_auth_v2(_data):
     try:
@@ -1870,6 +2591,33 @@ def get_nearby_v2(data):
     except Exception as exc:
         record_system_error(exc, source="socket:nearby", severity="WARNING")
         legacy.emit("error", {"error": "nearby calculation failed", "request_id": _request_id()})
+
+# ---------------------------------------------------------------------------
+# Road safety profile administration
+# ---------------------------------------------------------------------------
+@app.route("/admin/road/<road_id>/safety", methods=["GET", "POST"])
+def admin_road_safety_profile(road_id):
+    if _role() not in {"admin", "gk"}:
+        return _api_error("Authorized authority login required", 401, "AUTH_REQUIRED")
+    road = Road.query.get_or_404(road_id)
+    profile = RoadSafetyProfile.query.filter_by(road_id=road_id).first()
+    if profile is None:
+        profile = RoadSafetyProfile(road_id=road_id, one_way=False, lane_count=2)
+        db.session.add(profile)
+    if request.method == "POST":
+        try:
+            body = _parse_json_body()
+        except ValueError as exc:
+            return _api_error(str(exc), 400, "INVALID_JSON")
+        profile.one_way = bool(body.get("one_way", profile.one_way))
+        try:
+            profile.lane_count = max(1, min(12, int(body.get("lane_count", profile.lane_count))))
+        except (TypeError, ValueError):
+            return _api_error("lane_count must be an integer", 400, "INVALID_LANE_COUNT")
+        profile.updated_at = datetime.utcnow()
+        db.session.commit()
+    return jsonify({"ok": True, "road_id": road.id, "road_name": road.name,
+                    "one_way": bool(profile.one_way), "lane_count": int(profile.lane_count)})
 
 # ---------------------------------------------------------------------------
 # LPR ingestion security override
@@ -1959,23 +2707,105 @@ def _beacon_exception(exc):
 def healthz():
     try:
         db.session.execute(db.text("SELECT 1"))
-        if _db_is_sqlite():
-            path = _sqlite_path()
-            if path and path.exists():
-                ok_i, detail_i = _sqlite_integrity(path)
-                if not ok_i:
-                    return jsonify({"ok": False, "service": "beacon-cloud", "error": detail_i}), 503
+        # Keep the platform health probe cheap. SQLite integrity scans are expensive and
+        # are performed on a cached interval by /authority/status instead.
         return jsonify({"ok": True, "service": "beacon-cloud", "version": BEACON_VERSION if "BEACON_VERSION" in globals() else "booting", "time": datetime.utcnow().isoformat() + "Z"})
     except Exception as exc:
         record_system_error(exc, source="healthz", severity="CRITICAL")
         return jsonify({"ok": False, "error": "database unavailable"}), 503
 
 
+
+
+def _device_message_history_for_view(device_id: str, mark_pending: bool = True, limit: int = 100):
+    rows = (db.session.query(BroadcastDelivery, BroadcastMessage)
+            .join(BroadcastMessage, BroadcastMessage.id == BroadcastDelivery.message_id)
+            .filter(BroadcastDelivery.device_id == device_id)
+            .order_by(BroadcastMessage.created_at.desc()).limit(limit).all())
+    now = datetime.utcnow()
+    if mark_pending:
+        changed = False
+        for delivery, _msg in rows:
+            if delivery.delivered_at is None:
+                delivery.delivered_at = now
+                changed = True
+        if changed:
+            db.session.commit()
+    return [legacy._serialize_message(msg) for _delivery, msg in rows]
+
+
+def device_messages_fixed():
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid token", 401, "DEVICE_AUTH_REQUIRED")
+    return jsonify({"ok": True, "messages": _device_message_history_for_view(device.id, mark_pending=True)})
+
+app.view_functions["device_messages"] = device_messages_fixed
+
+
+# Mobile inbox: show delivered history and provide a direct driver -> authority compose path.
+def device_messages_view_fixed():
+    device = _strict_device_from_request()
+    if not device:
+        return render_template_string("""
+<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Taifa Messages</title>
+<style>body{font-family:Inter,system-ui;background:#f5f7fb;color:#111827;margin:0;padding:22px}.card{max-width:760px;margin:auto;background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:20px}</style></head>
+<body><div class='card'><h1>Taifa Messages</h1><p>Open this page from the linked app so the server can identify the device.</p></div></body></html>
+""")
+    try:
+        messages = _device_message_history_for_view(device.id, mark_pending=True, limit=100)
+        return render_template_string("""
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Taifa Messages</title>
+<style>
+:root{--bg:#f3f6fb;--card:#fff;--text:#0f172a;--muted:#64748b;--blue:#0e86ad;--green:#15803d}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;padding:16px}.wrap{max-width:900px;margin:auto}
+h1{font-size:27px;margin:0}.muted{color:var(--muted);line-height:1.5}.card{background:var(--card);border:1px solid #e2e8f0;border-radius:18px;padding:16px;margin-bottom:13px;box-shadow:0 8px 24px rgba(15,23,42,.05)}
+input,textarea{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:12px;padding:12px;font:inherit;background:#fff;margin-top:7px}textarea{min-height:105px;resize:vertical}
+button{border:0;border-radius:12px;padding:11px 15px;background:var(--blue);color:#fff;font-weight:800;cursor:pointer}.row{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.msg{padding:13px;border:1px solid #e2e8f0;border-radius:14px;margin-top:9px;background:#fff}.msg .meta{font-size:12px;color:var(--muted);margin-top:3px}.msg .body{margin-top:8px;white-space:pre-wrap;line-height:1.55}.status{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0f2fe;color:#075985;font-size:11px;font-weight:800}.ok{background:#dcfce7;color:#166534}
+</style></head><body><div class='wrap'>
+<div class='card'><div class='row'><div><div style='font-size:11px;letter-spacing:.1em;color:#0284c7;font-weight:900'>BEACON CLOUD</div><h1>Taifa Messages</h1><div class='muted'>Your secure cloud inbox and authority contact channel.</div></div><span class='status ok'>Device linked</span></div></div>
+<div class='card'><h2 style='margin-top:0'>Contact authority</h2><div class='muted'>Send a message to the authorized operations team. Your registered vehicle details are attached automatically.</div>
+<form method='post' action='/device/authority-message'><input type='hidden' name='device_id' value='{{ device.id }}'><input type='hidden' name='token' value='{{ token }}'><label>Subject</label><input name='title' maxlength='255' placeholder='e.g. Report, question, assistance' required><label>Message</label><textarea name='body' maxlength='5000' placeholder='Type your message…' required></textarea><button type='submit' style='margin-top:10px'>Send to authority</button></form></div>
+<div class='card'><div class='row'><h2 style='margin:0'>Cloud inbox</h2><button type='button' onclick='location.reload()'>Refresh</button></div>
+{% if messages %}{% for m in messages %}<div class='msg'><div class='row'><div><strong>{{ m.title }}</strong><div class='meta'>{{ m.created_at or '' }} · {{ m.target_type or 'message' }}</div></div><span class='status'>received</span></div><div class='body'>{{ m.body }}</div></div>{% endfor %}{% else %}<p class='muted'>No authority messages yet.</p>{% endif %}
+</div></div></body></html>
+""", device=device, token=(request.args.get('token') or ''))
+    except Exception as exc:
+        record_system_error(exc, source="device:messages-view")
+        return render_template_string("<html><body style='font-family:sans-serif;padding:24px'><h2>Taifa Messages</h2><p>Messages could not be loaded.</p><p>Request ID: {{ rid }}</p></body></html>", rid=_request_id()), 500
+
+app.view_functions["device_messages_view"] = device_messages_view_fixed
+
+# Background polling remains pending-only, so old messages are not re-fired every 15 seconds.
+def device_messages_pending_fixed():
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid token", 401, "DEVICE_AUTH_REQUIRED")
+    return jsonify({"ok": True, "messages": legacy._pending_messages_for_device(device.id, mark_delivered=True)})
+
+app.view_functions["device_messages"] = device_messages_pending_fixed
+
+@app.route("/device/messages/<message_id>/read", methods=["POST"])
+def device_message_mark_read(message_id):
+    device = _strict_device_from_request()
+    if not device:
+        return _api_error("Missing or invalid token", 401, "DEVICE_AUTH_REQUIRED")
+    delivery = BroadcastDelivery.query.filter_by(message_id=message_id, device_id=device.id).first()
+    if not delivery:
+        return _api_error("Message not found", 404, "MESSAGE_NOT_FOUND")
+    delivery.read_at = datetime.utcnow()
+    if delivery.delivered_at is None:
+        delivery.delivered_at = delivery.read_at
+    db.session.commit()
+    return jsonify({"ok": True, "message_id": message_id, "read_at": delivery.read_at.isoformat()})
+
 # ---------------------------------------------------------------------------
 # Final initialization and metadata
 # ---------------------------------------------------------------------------
 with app.app_context():
     db.create_all()
+    _ensure_schema_extensions()
+    _backfill_device_phones()
     try:
         if _db_is_sqlite():
             with db.engine.connect() as conn:
@@ -1987,7 +2817,7 @@ with app.app_context():
         record_system_error(exc, source="database:sqlite-pragmas", severity="WARNING")
 
 # Store a small version marker for status/reporting.
-BEACON_VERSION = "2026.09.25-repair-v2"
+BEACON_VERSION = "2026.09.25-integrated-release-v4"
 
 if __name__ == "__main__":
     legacy.socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG", "0") == "1")

@@ -6,7 +6,7 @@
 
 ## Start command
 
-`gunicorn -w 1 --threads 50 app:app --bind 0.0.0.0:$PORT`
+`gunicorn -w 1 --worker-class gthread --threads 100 app:app --bind 0.0.0.0:$PORT`
 
 ## Health check
 
@@ -14,7 +14,7 @@ Set Render Health Check Path to `/healthz`. Do not use `/pulse_receiver` as a he
 
 ## Required environment
 
-Set a strong `FLASK_SECRET` (or `SECRET_KEY`). For protected production enrollment, set `PUBLIC_ENROLLMENT=0` and configure `ENROLLMENT_KEY`; the Android build can continue using the public demo enrollment mode for a controlled demonstration. Set `ADMIN_API_TOKEN` only for approved integrations.
+For the chief administrator, set only `ADMIN_NAME` and `ADMIN_PASSWORD` in Render Environment Variables. No admin registration is required. The application generates its session secret locally on first boot and keeps it with the persistent data directory; it is not a required Render credential. For protected device enrollment, set `PUBLIC_ENROLLMENT=0` and configure `ENROLLMENT_KEY`.
 
 For durable SQLite data/backups on Render, attach a persistent disk and mount it at `/var/data`, then set `BEACON_DATA_DIR=/var/data`. Without a persistent disk, a local SQLite database/backups can be lost when the service filesystem is replaced.
 
@@ -34,6 +34,11 @@ Empty health probes to `/pulse_receiver` return a successful probe response. Rea
 
 ## Chief administrator login
 
-Set the chief administrator credentials in Render Environment Variables. Supported names are `ADMIN_USER` + `ADMIN_PASS` (preferred), or `ADMIN_USERNAME` + `ADMIN_PASSWORD`; the legacy `BOOTSTRAP_ADMIN_USERNAME` + `BOOTSTRAP_ADMIN_PASSWORD` names are also accepted. Public registration remains disabled. On boot and on login, the configured chief-admin username/password is synchronized to the persistent SQLite database, so a password changed in Render does not remain blocked by an older stored hash.
+Set exactly these two Render Environment Variables:
+
+- `ADMIN_NAME` — chief administrator username
+- `ADMIN_PASSWORD` — chief administrator password
+
+The login path checks this pair directly before consulting SQLite, so an old persistent password hash cannot reject a newly configured Render password. Public administrator registration is disabled.
 
 The application also accepts a device token in `Authorization: Token ...`, `Authorization: Bearer ...`, `X-Device-Token`, or the JSON `token` field for mobile telemetry. Integration pulse callers can continue using `PULSE_TOKEN` or `ADMIN_API_TOKEN`.
