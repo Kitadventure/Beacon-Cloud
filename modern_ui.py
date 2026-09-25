@@ -27,6 +27,7 @@ SystemError = globals().get("SystemError")
 LiveVehicleState = globals().get("LiveVehicleState")
 AuthorityInboxMessage = globals().get("AuthorityInboxMessage")
 OperationalIncident = globals().get("OperationalIncident")
+PlaceCache = globals().get("PlaceCache")
 
 # These globals are populated by install_modern_ui from app.py after all models/helpers exist.
 _core = None
@@ -174,6 +175,25 @@ def _latest_live_by_ids(ids):
         return {}
 
 
+def _place_for_state(state):
+    """Return a readable place name without exposing coordinates in the main UI."""
+    if not state:
+        return None
+    name = (getattr(state, "place_name", None) or "").strip()
+    if name:
+        return name
+    if PlaceCache:
+        try:
+            key = _core._place_key(float(state.lat), float(state.lon)) if _core and hasattr(_core, "_place_key") else None
+            if key:
+                cached = PlaceCache.query.filter_by(key=key).first()
+                if cached:
+                    return cached.place_name
+        except Exception:
+            pass
+    return None
+
+
 def _state_for_device(did, ts):
     if _core:
         return _core._device_connection_state(did, ts)
@@ -210,7 +230,7 @@ def _device_rows(q="", limit=100, offset=0):
             "lat": state.lat if state else None, "lon": state.lon if state else None,
             "ts": state.ts.isoformat() if state and state.ts else None,
             "socket_online": socket_online, "telemetry_online": telemetry_online, "connection_state": state_name,
-            "place_name": state.place_name if state else None,
+            "place_name": _place_for_state(state),
         })
     return out, total
 
@@ -251,7 +271,6 @@ DASHBOARD_BODY = """
 <div class="card"><div class="row-between"><h2>Recent vehicle activity</h2><a class="btn" href="__DEV__">Open all</a></div><div id="recent" class="list"><div class="small-muted">Loading…</div></div></div>
 <div class="card"><div class="row-between"><h2>System health</h2><a class="btn" href="__HEALTH__">Details</a></div><div class="stack" id="health"></div></div>
 </div>
-<div class="hero" style="margin-top:14px"><div class="row-between"><div><h2 style="margin:0 0 4px">Live vehicle map</h2><p class="page-sub">Open the dedicated map when geographic visibility is needed; the dashboard stays fast.</p></div><a class="btn btn-soft" href="__MAP__">Open live map</a></div></div>
 """
 
 
@@ -567,7 +586,7 @@ def modern_vehicle_map():
         return resp
     data_url = url_for("modern_map_data")
     body = """
-<div class="page-head"><div><div class="eyebrow">Geographic operations</div><h1 class="page-title">Live vehicle map</h1><p class="page-sub">Every live vehicle is represented. Dense areas are aggregated into counted dots/clusters so the map remains usable at very large fleet sizes.</p></div><div class="toolbar"><span class="pill" id="mapStatus">Loading map…</span><button class="btn" id="mapRefresh">Refresh</button></div></div>
+<div class="page-head"><div><div class="eyebrow">Geographic operations</div><h1 class="page-title">Live vehicle map</h1><p class="page-sub">Every known vehicle with a last location is represented. Dense areas are aggregated into counted dots/clusters so the map remains usable at very large fleet sizes.</p></div><div class="toolbar"><span class="pill" id="mapStatus">Loading map…</span><button class="btn" id="mapRefresh">Refresh</button></div></div>
 <div class="card"><div id="vehicleMap" style="height:calc(100vh - 190px);min-height:520px;border-radius:14px;overflow:hidden;background:#e9eef3"></div><div class="row-between" style="margin-top:9px"><span class="small-muted" id="mapSummary">Preparing live fleet view…</span><span class="small-muted">Click a vehicle/cluster for details. Coordinates are hidden until a detail is opened.</span></div></div>
 """
     js = f"""
@@ -605,7 +624,7 @@ def modern_vehicle_map():
       layer.clearLayers();
       for(const c of (d.clusters||[])) dot(c.lat,c.lon,c.count,c.place_name,c.device_id,c.details_url,c.connection_state);
       for(const v of (d.vehicles||[])) dot(v.lat,v.lon,1,v.place_name,v.device_id,v.details_url,v.connection_state);
-      summary.textContent=`${{Number(d.total||0).toLocaleString()}} live vehicle(s) represented · ${{Number(d.clusters||0).toLocaleString()}} clusters · ${{Number(d.vehicles?.length||0).toLocaleString()}} individual dots`;
+      summary.textContent=`${{Number(d.total||0).toLocaleString()}} known vehicle(s) represented · ${{Number((d.clusters||[]).length).toLocaleString()}} clusters · ${{Number(d.vehicles?.length||0).toLocaleString()}} individual dots`;
       status.textContent=d.total?'LIVE MAP':'No live vehicles';
     }}catch(e){{
       status.textContent='Map unavailable'; summary.textContent=String(e.message||e); beaconReportError(e,'vehicle-map');
@@ -625,44 +644,75 @@ def modern_map_data():
     if resp:
         return resp
     try:
-        min_lat=float(request.args.get("min_lat",-90)); max_lat=float(request.args.get("max_lat",90))
-        min_lon=float(request.args.get("min_lon",-180)); max_lon=float(request.args.get("max_lon",180))
-        zoom=max(0,min(19,int(request.args.get("zoom",6))))
-        if min_lat>=max_lat or min_lon>=max_lon: raise ValueError("Invalid map bounds")
-    except Exception as exc:
-        return jsonify({"ok":False,"error":"Invalid map viewport","request_id":str(uuid.uuid4())}),400
+        min_lat=float(request.args.get("min_lat", -90))
+        max_lat=float(request.args.get("max_lat", 90))
+        min_lon=float(request.args.get("min_lon", -180))
+        max_lon=float(request.args.get("max_lon", 180))
+        zoom=max(0, min(19, int(request.args.get("zoom", 6))))
+        if min_lat >= max_lat or min_lon >= max_lon:
+            raise ValueError("Invalid map bounds")
+    except Exception:
+        return jsonify({"ok":False,"error":"Invalid map viewport","request_id":str(uuid.uuid4())}), 400
+
     try:
-        q=LiveVehicleState.query.filter(LiveVehicleState.lat>=min_lat,LiveVehicleState.lat<=max_lat,LiveVehicleState.lon>=min_lon,LiveVehicleState.lon<=max_lon)
+        # Last-known state is intentionally used here.  A restored/offline vehicle stays
+        # represented on the authority map instead of disappearing from history.
+        q=(LiveVehicleState.query
+           .join(Device, Device.id == LiveVehicleState.device_id)
+           .filter(Device.revoked.is_(False),
+                   LiveVehicleState.lat >= min_lat, LiveVehicleState.lat <= max_lat,
+                   LiveVehicleState.lon >= min_lon, LiveVehicleState.lon <= max_lon))
         total=q.count()
-        # Dense view: server-side grid aggregation. No million-point browser payloads.
-        if total>2200 or zoom<11:
-            span=max(max_lat-min_lat,max_lon-min_lon)
-            cell=max(span/24.0,0.0002)
+
+        # Never ask a browser to render millions of DOM markers.  At broad zooms or dense
+        # viewports, represent every vehicle through a bounded set of server-side grid cells.
+        if total > 2200 or zoom < 11:
+            span=max(max_lat-min_lat, max_lon-min_lon)
+            cell=max(span/28.0, 0.00015)
             sql=db.text("""
-                SELECT CAST((lat-:min_lat)/:cell AS INTEGER) AS gx,
-                       CAST((lon-:min_lon)/:cell AS INTEGER) AS gy,
-                       COUNT(*) AS n, AVG(lat) AS lat, AVG(lon) AS lon,
-                       MAX(updated_at) AS newest
-                FROM live_vehicle_state
-                WHERE lat BETWEEN :min_lat AND :max_lat
-                  AND lon BETWEEN :min_lon AND :max_lon
+                SELECT
+                    CAST((s.lat-:min_lat)/:cell AS INTEGER) AS gx,
+                    CAST((s.lon-:min_lon)/:cell AS INTEGER) AS gy,
+                    COUNT(*) AS n,
+                    AVG(s.lat) AS lat, AVG(s.lon) AS lon,
+                    MAX(s.updated_at) AS newest,
+                    MAX(NULLIF(s.place_name,'')) AS place_name
+                FROM live_vehicle_state s
+                JOIN device d ON d.id=s.device_id
+                WHERE d.revoked=0
+                  AND s.lat BETWEEN :min_lat AND :max_lat
+                  AND s.lon BETWEEN :min_lon AND :max_lon
                 GROUP BY gx, gy
                 ORDER BY n DESC
                 LIMIT 5000
             """)
-            rows=db.session.execute(sql,{{"min_lat":min_lat,"max_lat":max_lat,"min_lon":min_lon,"max_lon":max_lon,"cell":cell,"cutoff":cutoff}}).mappings().all()
-            clusters=[{{"lat":float(r["lat"]),"lon":float(r["lon"]),"count":int(r["n"]),"place_name":None}} for r in rows]
+            params={"min_lat":min_lat,"max_lat":max_lat,"min_lon":min_lon,"max_lon":max_lon,"cell":cell}
+            rows=db.session.execute(sql, params).mappings().all()
+            clusters=[]
+            for r in rows:
+                clusters.append({
+                    "lat":float(r["lat"]), "lon":float(r["lon"]), "count":int(r["n"]),
+                    "place_name":(str(r["place_name"]).strip() if r.get("place_name") else None),
+                    "latest":r["newest"].isoformat() if r.get("newest") else None,
+                })
             return jsonify({"ok":True,"total":total,"clusters":clusters,"vehicles":[],"clustered":True})
+
         rows=q.order_by(LiveVehicleState.updated_at.desc()).limit(5000).all()
         out=[]
+        now=datetime.utcnow()
         for st in rows:
-            age=(datetime.utcnow()-st.updated_at).total_seconds() if st.updated_at else 10**9
-            state_name="REAL-TIME" if age<30 else ("TELEMETRY ONLINE" if age<180 else "OFFLINE")
-            out.append({"device_id":st.device_id,"lat":float(st.lat),"lon":float(st.lon),"place_name":st.place_name,"connection_state":state_name,"details_url":url_for("modern_device_detail",device_id=st.device_id)})
+            age=(now-st.updated_at).total_seconds() if st.updated_at else 10**9
+            state_name="REAL-TIME" if age < 30 else ("TELEMETRY ONLINE" if age < 180 else "OFFLINE")
+            out.append({
+                "device_id":st.device_id, "lat":float(st.lat), "lon":float(st.lon),
+                "place_name":_place_for_state(st), "connection_state":state_name,
+                "details_url":url_for("modern_device_detail",device_id=st.device_id)
+            })
         return jsonify({"ok":True,"total":total,"clusters":[],"vehicles":out,"clustered":False})
     except Exception as exc:
-        if _core: _core.record_system_error(exc,source="ui:vehicle-map",severity="ERROR")
-        return jsonify({"ok":False,"error":"Vehicle map data unavailable","request_id":_core._request_id() if _core else str(uuid.uuid4())}),200
+        if _core:
+            _core.record_system_error(exc, source="ui:vehicle-map", severity="ERROR")
+        return jsonify({"ok":False,"error":"Vehicle map data unavailable","request_id":_core._request_id() if _core else str(uuid.uuid4())}), 200
 
 
 def modern_traffic_hub():
@@ -883,10 +933,10 @@ def _wrap_heartbeat(original):
 
 
 def install_modern_ui(core):
-    global _core, SystemError, LiveVehicleState, AuthorityInboxMessage, OperationalIncident, DeviceAlert
+    global _core, SystemError, LiveVehicleState, AuthorityInboxMessage, OperationalIncident, DeviceAlert, PlaceCache
     _core=core
     SystemError=core.SystemError; LiveVehicleState=core.LiveVehicleState; AuthorityInboxMessage=core.AuthorityInboxMessage; OperationalIncident=core.OperationalIncident
-    DeviceAlert=core.DeviceAlert
+    DeviceAlert=core.DeviceAlert; PlaceCache=getattr(core, "PlaceCache", None)
     with app.app_context():
         db.create_all()
 
@@ -907,6 +957,10 @@ def install_modern_ui(core):
     app.add_url_rule("/admin/incidents/view", endpoint="modern_incidents_page", view_func=modern_incidents_page, methods=["GET"])
     app.add_url_rule("/admin/users/view", endpoint="modern_users_page", view_func=modern_users_page, methods=["GET"])
     app.add_url_rule("/admin/reports/view", endpoint="authority_reports_modern_alias", view_func=modern_reports_page, methods=["GET"])
+
+    # Backward-compatible endpoint name for older authority templates.
+    if "admin_traffic_zones" not in app.view_functions:
+        app.add_url_rule("/admin/traffic/zones", endpoint="admin_traffic_zones", view_func=modern_traffic_hub, methods=["GET"])
 
     # Replace legacy dashboard/page handlers without changing their URLs.
     for ep, fn in [("dashboard",modern_dashboard),("admin_devices",modern_devices_page),("admin_messages",modern_messages_page),

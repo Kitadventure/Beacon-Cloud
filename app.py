@@ -2656,8 +2656,14 @@ def device_bridge_data():
     try:
         state=LiveVehicleState.query.filter_by(device_id=device.id).first() if LiveVehicleState else None
         payload={"ok":True,"device":{"id":device.id,"owner":device.owner,"plate":device.plate,"phone_number":legacy._device_phone_number(device),"place_name":state.place_name if state else None,"updated_at":state.updated_at.isoformat() if state and state.updated_at else None},"nearby":{},"messages":[],"alerts":[]}
-        try: payload["nearby"]=compute_nearby_v2(device.id)
-        except Exception as exc: record_system_error(exc,source="bridge:nearby",severity="WARNING")
+        try:
+            payload["nearby"] = compute_nearby_v2(device.id)
+        except Exception as exc:
+            # "No live telemetry" is a normal availability state for a device that has
+            # stopped reporting; it must not flood the System Errors page every poll.
+            if "no live telemetry for device" not in str(exc).lower():
+                record_system_error(exc, source="bridge:nearby", severity="WARNING")
+            payload["nearby"] = {"status": "TELEMETRY_OFFLINE", "message": "Waiting for fresh vehicle telemetry."}
         try:
             rows=(db.session.query(BroadcastDelivery,BroadcastMessage).join(BroadcastMessage,BroadcastMessage.id==BroadcastDelivery.message_id).filter(BroadcastDelivery.device_id==device.id).order_by(BroadcastMessage.created_at.desc()).limit(10).all())
             payload["messages"]=[{**legacy._serialize_message(m),"read_at":d.read_at.isoformat() if d.read_at else None} for d,m in rows if d.read_at is None]
@@ -2699,7 +2705,7 @@ with app.app_context():
         record_system_error(exc, source="database:sqlite-pragmas", severity="WARNING")
 
 # Store a small version marker for status/reporting.
-BEACON_VERSION = "2026.09.25-integrated-road-safety-v7"
+BEACON_VERSION = "2026.09.25-authority-platform-v8"
 
 # Final authority UI / performance integration. Loaded only after every legacy route/model
 # and the chief-admin environment synchronization above are initialized.
