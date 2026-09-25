@@ -23,6 +23,10 @@ import re
 import sqlite3
 import tempfile
 import threading
+import shutil
+import zipfile
+import hashlib
+import secrets
 import time
 import traceback
 import uuid
@@ -30,7 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from flask import Response, abort, flash, g, jsonify, redirect, render_template_string, request, send_file, session, url_for
+from flask import Response, abort, flash, g, has_request_context, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from werkzeug.exceptions import HTTPException
 
 import app_legacy as legacy
@@ -55,18 +59,30 @@ PlateSighting = legacy.PlateSighting
 # ---------------------------------------------------------------------------
 # Configuration / process state
 # ---------------------------------------------------------------------------
-app.secret_key = os.environ.get("FLASK_SECRET") or os.environ.get("SECRET_KEY")
-if not app.secret_key:
-    if os.environ.get("FLASK_DEBUG") == "1":
-        app.secret_key = "local-development-only-change-me"
-    else:
-        raise RuntimeError("FLASK_SECRET or SECRET_KEY must be configured")
+# Prefer an explicitly supplied secret. When omitted, generate a durable secret
+# beside the database so the service can boot cleanly and retain sessions when
+# a persistent data disk is attached.
+_secret_value = os.environ.get("FLASK_SECRET") or os.environ.get("SECRET_KEY")
+if not _secret_value:
+    _secret_dir = Path(os.environ.get("BEACON_DATA_DIR") or ("/var/data" if Path("/var/data").is_dir() else str(Path(app.instance_path))))
+    _secret_dir.mkdir(parents=True, exist_ok=True)
+    _secret_file = _secret_dir / ".flask_secret"
+    try:
+        _secret_value = _secret_file.read_text(encoding="utf-8").strip() if _secret_file.exists() else ""
+        if not _secret_value:
+            _secret_value = secrets.token_urlsafe(48)
+            _secret_file.write_text(_secret_value, encoding="utf-8")
+            try: _secret_file.chmod(0o600)
+            except Exception: pass
+    except Exception:
+        _secret_value = secrets.token_urlsafe(48)
+app.secret_key = _secret_value
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "0") == "1",
-    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_UPLOAD_MB", "100")) * 1024 * 1024,
     JSON_SORT_KEYS=False,
 )
 
@@ -78,8 +94,9 @@ if _socket_origins:
     except Exception:
         pass
 
-CLEANUP_STALE_SECONDS = float(os.environ.get("CLEANUP_STALE_SECONDS", "12"))
-CLEANUP_INTERVAL_S = float(os.environ.get("CLEANUP_INTERVAL_S", "15"))
+LIVE_CACHE_TTL_S = float(os.environ.get("LIVE_CACHE_TTL_S", "15"))
+SNAPSHOT_RETENTION_S = float(os.environ.get("SNAPSHOT_RETENTION_S", str(7 * 24 * 3600)))
+CLEANUP_INTERVAL_S = float(os.environ.get("CLEANUP_INTERVAL_S", "60"))
 HEARTBEAT_MIN_INTERVAL_S = float(os.environ.get("HEARTBEAT_MIN_INTERVAL_S", "0.75"))
 MAX_HEARTBEAT_JSON_BYTES = int(os.environ.get("MAX_HEARTBEAT_JSON_BYTES", "65536"))
 NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))
@@ -87,10 +104,21 @@ UNSAFE_TTC_SECONDS = float(os.environ.get("UNSAFE_TTC_SECONDS", "6.0"))
 CONFIRMATION_RADIUS_M = float(os.environ.get("CONFIRMATION_RADIUS_M", "30.0"))
 ALLOW_SIMULATION = os.environ.get("ALLOW_SIMULATION", "0") == "1"
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN")
+ENROLLMENT_KEY = os.environ.get("ENROLLMENT_KEY")
+PUBLIC_ENROLLMENT = os.environ.get("PUBLIC_ENROLLMENT", "1") == "1"
+BACKUP_RETENTION_COUNT = int(os.environ.get("BACKUP_RETENTION_COUNT", "30"))
+DATA_DIR = Path(os.environ.get("BEACON_DATA_DIR") or ("/var/data" if Path("/var/data").is_dir() else str(Path(app.instance_path))))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR = Path(os.environ.get("BEACON_BACKUP_DIR") or (DATA_DIR / "backups"))
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = BACKUP_DIR / "incoming"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _last_heartbeat_at: dict[str, float] = {}
-_last_sequence: dict[str, int] = {}
+_last_sequence: dict[tuple[str, str], int] = {}
 _last_cleanup_at = 0.0
+_live_cache: dict[str, dict[str, Any]] = {}
+_live_cache_lock = threading.RLock()
 _connected_lock = threading.Lock()
 
 # The legacy module already owns this dict; use it so legacy routes/events remain compatible.
@@ -115,6 +143,23 @@ class SystemError(db.Model):
     traceback_text = db.Column(db.Text)
 
 
+class LiveVehicleState(db.Model):
+    __tablename__ = "live_vehicle_state"
+    device_id = db.Column(db.String(36), primary_key=True)
+    snapshot_id = db.Column(db.Integer, nullable=True, index=True)
+    ts = db.Column(db.DateTime, nullable=False, index=True)
+    lat = db.Column(db.Float, nullable=False)
+    lon = db.Column(db.Float, nullable=False)
+    speed_mps = db.Column(db.Float, nullable=False, default=0.0)
+    bearing_deg = db.Column(db.Float, nullable=False, default=0.0)
+    heading_deg = db.Column(db.Float, nullable=False, default=0.0)
+    accuracy_m = db.Column(db.Float, nullable=True)
+    sequence = db.Column(db.Integer, nullable=True)
+    session_id = db.Column(db.String(96), nullable=True)
+    source = db.Column(db.String(32), nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+
 class OperationalIncident(db.Model):
     __tablename__ = "operational_incident"
     id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
@@ -133,6 +178,14 @@ class OperationalIncident(db.Model):
 
 with app.app_context():
     db.create_all()
+    if db.engine.url.get_backend_name() == "sqlite":
+        try:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+                conn.exec_driver_sql("PRAGMA busy_timeout=15000")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -175,8 +228,9 @@ def record_system_error(
 ) -> int | None:
     """Persist diagnostics, with a file fallback when the DB is unavailable."""
     rid = request_id or _request_id()
-    route_value = route or (request.path if request else "")
-    method = request.method if request else ""
+    in_request = has_request_context()
+    route_value = route or (request.path if in_request else "")
+    method = request.method if in_request else ""
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     try:
         db.session.rollback()
@@ -188,7 +242,7 @@ def record_system_error(
             route=_safe_text(route_value, 512),
             method=_safe_text(method, 16),
             request_id=_safe_text(rid, 64),
-            username=_safe_text(username or session.get("username"), 128),
+            username=_safe_text(username or (session.get("username") if in_request else ""), 128),
             traceback_text=_safe_text(tb, 20000),
         )
         db.session.add(row)
@@ -266,24 +320,33 @@ def _device_connected(device_id: str) -> bool:
 
 
 def _latest_live_entries(exclude: str | None = None) -> list[tuple[str, dict[str, Any]]]:
-    cutoff = datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)
-    with legacy.active_devices_lock:
-        entries = list(legacy.active_devices.items())
-    out = []
-    for device_id, entry in entries:
-        if exclude and device_id == exclude:
-            continue
-        if not entry.get("ts") or entry["ts"] < cutoff:
-            continue
-        if entry.get("lat") is None or entry.get("lon") is None:
-            continue
-        out.append((device_id, entry))
-    return out
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=LIVE_CACHE_TTL_S)
+    rows: dict[str, dict[str, Any]] = {}
+    with _live_cache_lock:
+        stale = [k for k, v in _live_cache.items() if v.get("ts") is None or v["ts"] < cutoff]
+        for k in stale:
+            _live_cache.pop(k, None)
+        for device_id, value in _live_cache.items():
+            if device_id != exclude and value.get("ts") and value["ts"] >= cutoff:
+                rows[device_id] = dict(value)
+    try:
+        cached_ids = set(rows)
+        live_rows = LiveVehicleState.query.filter(LiveVehicleState.updated_at >= cutoff).all()
+        for row in live_rows:
+            if row.device_id == exclude:
+                continue
+            if row.device_id not in cached_ids or row.updated_at > rows[row.device_id].get("ts", datetime.min):
+                rows[row.device_id] = {
+                    "lat": row.lat, "lon": row.lon, "speed_mps": row.speed_mps,
+                    "bearing_deg": row.bearing_deg, "heading_deg": row.heading_deg,
+                    "ts": row.ts, "raw": None, "accuracy_m": row.accuracy_m,
+                    "sequence": row.sequence, "session_id": row.session_id, "source": row.source
+                }
+    except Exception as exc:
+        record_system_error(exc, source="cache:live-state", severity="WARNING")
+    return list(rows.items())
 
-
-# ---------------------------------------------------------------------------
-# Modernized telemetry / nearby engine
-# ---------------------------------------------------------------------------
 def _haversine_m(lat1, lon1, lat2, lon2):
     return legacy.haversine_m(lat1, lon1, lat2, lon2)
 
@@ -341,12 +404,10 @@ def _classify_risk(self_snap, other_snap):
 
 
 def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M) -> dict[str, Any]:
-    self_snap = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).first()
-    if not self_snap:
-        with legacy.active_devices_lock:
-            entry = legacy.active_devices.get(device_id)
-        if not entry:
-            raise RuntimeError("no snapshot for device")
+    self_snap = None
+    with _live_cache_lock:
+        entry = _live_cache.get(device_id)
+    if entry and entry.get("ts") and entry["ts"] >= datetime.utcnow() - timedelta(seconds=LIVE_CACHE_TTL_S):
         class Tmp: pass
         self_snap = Tmp()
         self_snap.device_id = device_id
@@ -356,6 +417,25 @@ def compute_nearby_v2(device_id: str, radius_m: float = NEARBY_DEFAULT_RADIUS_M)
         self_snap.bearing_deg = entry.get("bearing_deg") or 0.0
         self_snap.ts = entry["ts"]
         self_snap.raw = entry.get("raw")
+    if not self_snap:
+        state = LiveVehicleState.query.filter_by(device_id=device_id).first()
+        if state and state.updated_at and state.updated_at >= datetime.utcnow() - timedelta(seconds=LIVE_CACHE_TTL_S):
+            class Tmp: pass
+            self_snap = Tmp()
+            self_snap.device_id = device_id; self_snap.lat = state.lat; self_snap.lon = state.lon
+            self_snap.speed_mps = state.speed_mps or 0.0; self_snap.bearing_deg = state.bearing_deg or 0.0
+            self_snap.ts = state.ts; self_snap.raw = None
+    if not self_snap:
+        self_snap = Snapshot.query.filter_by(device_id=device_id).order_by(Snapshot.ts.desc()).first()
+    if not self_snap:
+        with legacy.active_devices_lock:
+            entry = legacy.active_devices.get(device_id)
+        if not entry:
+            raise RuntimeError("no live telemetry for device")
+        class Tmp: pass
+        self_snap = Tmp(); self_snap.device_id = device_id; self_snap.lat = entry["lat"]; self_snap.lon = entry["lon"]
+        self_snap.speed_mps = entry.get("speed_mps") or 0.0; self_snap.bearing_deg = entry.get("bearing_deg") or 0.0
+        self_snap.ts = entry["ts"]; self_snap.raw = entry.get("raw")
 
     results = []
     device_rows: dict[str, Device] = {}
@@ -538,11 +618,22 @@ app.view_functions["admin_login"] = secure_admin_login
 app.view_functions["admin_register"] = secure_admin_register
 
 
+def _enrollment_authorized() -> bool:
+    role = _role()
+    if role in {"admin", "police", "gk"}:
+        return True
+    auth = request.headers.get("Authorization", "")
+    supplied = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") else request.headers.get("X-Enrollment-Key")
+    if ENROLLMENT_KEY and supplied and supplied == ENROLLMENT_KEY:
+        return True
+    if ADMIN_API_TOKEN and supplied and supplied == ADMIN_API_TOKEN:
+        return True
+    return PUBLIC_ENROLLMENT
+
+
 def secure_onboard():
-    try:
-        legacy.require_admin_api()
-    except Exception:
-        return _api_error("Admin provisioning authorization required", 401, "PROVISIONING_AUTH_REQUIRED")
+    if not _enrollment_authorized():
+        return _api_error("Device enrollment authorization required", 401, "PROVISIONING_AUTH_REQUIRED")
     try:
         payload = _parse_json_body()
     except ValueError as exc:
@@ -554,16 +645,32 @@ def secure_onboard():
     extra = payload.get("extra")
     if extra is not None and not isinstance(extra, (dict, list, str, int, float, bool)):
         return _api_error("extra must be JSON-serializable", 400, "INVALID_EXTRA")
-    device_id = payload.get("device_id") or str(uuid.uuid4())
+    device_id = str(payload.get("device_id") or uuid.uuid4())[:36]
     token = legacy.create_device_token()
     while Device.query.filter_by(token=token).first():
         token = legacy.create_device_token()
     try:
-        device = Device(id=device_id, token=token, owner=owner, car_name=car_name,
-                        car_model=car_model, plate=plate,
-                        extra=json.dumps(extra) if extra is not None else None)
-        db.session.add(device)
-        db.session.commit()
+        existing = Device.query.filter_by(id=device_id).first()
+        if existing:
+            # Idempotent retry: preserve identity, rotate the credential, and update metadata.
+            if (existing.plate or "").strip().upper() not in {"", str(plate or "").strip().upper()}:
+                return _api_error("device_id is already registered to another vehicle", 409, "DEVICE_ID_CONFLICT")
+            existing.token = token
+            existing.owner = owner or existing.owner
+            existing.car_name = car_name or existing.car_name
+            existing.car_model = car_model or existing.car_model
+            existing.plate = plate or existing.plate
+            existing.extra = json.dumps(extra) if extra is not None else existing.extra
+            existing.revoked = False
+            db.session.commit()
+            _clear_runtime_caches()
+            device = existing
+        else:
+            device = Device(id=device_id, token=token, owner=owner, car_name=car_name,
+                            car_model=car_model, plate=plate,
+                            extra=json.dumps(extra) if extra is not None else None)
+            db.session.add(device)
+            db.session.commit()
         return jsonify({"ok": True, "device_id": device.id, "token": device.token,
                         "owner": device.owner, "car_name": device.car_name,
                         "car_model": device.car_model, "plate": device.plate})
@@ -574,6 +681,16 @@ def secure_onboard():
 
 
 app.view_functions["onboard"] = secure_onboard
+
+
+@app.route("/enrollment/status")
+def enrollment_status():
+    return jsonify({
+        "ok": True,
+        "enrollment_available": bool(PUBLIC_ENROLLMENT or ENROLLMENT_KEY),
+        "requires_key": bool(ENROLLMENT_KEY and not PUBLIC_ENROLLMENT),
+        "mode": "public-demo" if PUBLIC_ENROLLMENT else "protected",
+    })
 
 
 def authority_vehicle_lookup():
@@ -596,6 +713,38 @@ def authority_vehicle_lookup():
 
 
 app.view_functions["vehicle_lookup"] = authority_vehicle_lookup
+
+
+@app.route("/vehicle/recover", methods=["POST"])
+def vehicle_recover():
+    if not _enrollment_authorized():
+        return _api_error("Vehicle recovery authorization required", 401, "RECOVERY_AUTH_REQUIRED")
+    try:
+        body = _parse_json_body()
+    except ValueError as exc:
+        return _api_error(str(exc), 400, "INVALID_JSON")
+    try:
+        device = legacy._find_matching_device(body.get("owner") or body.get("name"), body.get("plate"), body.get("phone_number") or body.get("phone"))
+    except Exception as exc:
+        record_system_error(exc, source="vehicle:recover", severity="WARNING")
+        return _api_error("Vehicle recovery lookup failed", 500, "RECOVERY_LOOKUP_FAILED")
+    if not device or device.revoked:
+        return _api_error("No matching active vehicle found", 404, "VEHICLE_NOT_FOUND")
+    try:
+        token = legacy.create_device_token()
+        while Device.query.filter_by(token=token).first():
+            token = legacy.create_device_token()
+        device.token = token
+        db.session.commit()
+        _clear_runtime_caches()
+        return jsonify({"ok": True, "device_id": device.id, "token": device.token,
+                        "owner": device.owner, "car_name": device.car_name,
+                        "car_model": device.car_model, "plate": device.plate, "rotated": True})
+    except Exception as exc:
+        db.session.rollback()
+        record_system_error(exc, source="vehicle:recover", severity="ERROR")
+        return _api_error("Vehicle credential recovery failed", 500, "RECOVERY_FAILED")
+
 
 # ---------------------------------------------------------------------------
 # Heartbeat / device channel
@@ -621,6 +770,41 @@ def _record_incident(kind: str, *, device_id=None, plate=None, lat=None, lon=Non
     db.session.add(incident)
     db.session.commit()
     return incident
+
+
+def _cache_live_state(snap: Snapshot, *, accuracy_m=None, sequence=None, session_id=None, source=None):
+    state = LiveVehicleState.query.filter_by(device_id=snap.device_id).first()
+    if state is None:
+        state = LiveVehicleState(device_id=snap.device_id)
+        db.session.add(state)
+    state.snapshot_id = snap.id
+    state.ts = snap.ts
+    state.lat = snap.lat
+    state.lon = snap.lon
+    state.speed_mps = snap.speed_mps or 0.0
+    state.bearing_deg = snap.bearing_deg or 0.0
+    state.heading_deg = snap.heading_deg or state.bearing_deg or 0.0
+    state.accuracy_m = float(accuracy_m) if accuracy_m is not None else None
+    state.sequence = sequence
+    state.session_id = str(session_id)[:96] if session_id else None
+    state.source = str(source)[:32] if source else None
+    state.updated_at = datetime.utcnow()
+    with _live_cache_lock:
+        _live_cache[snap.device_id] = {
+            "lat": snap.lat, "lon": snap.lon, "speed_mps": snap.speed_mps or 0.0,
+            "bearing_deg": snap.bearing_deg or 0.0, "heading_deg": snap.heading_deg or 0.0,
+            "ts": snap.ts, "raw": None, "accuracy_m": accuracy_m,
+            "sequence": sequence, "session_id": session_id, "source": source
+        }
+
+
+def _clear_runtime_caches():
+    _last_heartbeat_at.clear()
+    _last_sequence.clear()
+    with _live_cache_lock:
+        _live_cache.clear()
+    with legacy.active_devices_lock:
+        legacy.active_devices.clear()
 
 
 def secure_heartbeat():
@@ -676,25 +860,35 @@ def secure_heartbeat():
         return _api_error("Simulated/mock telemetry is disabled", 403, "SIMULATION_DISABLED")
 
     sequence = body.get("sequence")
+    session_id = str(body.get("session_id") or "legacy")[:96]
     if sequence is not None:
         try:
             sequence = int(sequence)
         except (TypeError, ValueError):
             return _api_error("sequence must be an integer", 400, "INVALID_SEQUENCE")
-        last_seq = _last_sequence.get(device_id)
+        seq_key = (device_id, session_id)
+        last_seq = _last_sequence.get(seq_key)
         if last_seq is not None and sequence <= last_seq:
             return _api_error("Duplicate or out-of-order telemetry sequence", 409, "STALE_SEQUENCE")
-        _last_sequence[device_id] = sequence
+        _last_sequence[seq_key] = sequence
 
+    accuracy_m = body.get("accuracy_m", body.get("accuracy"))
+    try:
+        accuracy_m = float(accuracy_m) if accuracy_m is not None else None
+        if accuracy_m is not None and not (0 <= accuracy_m <= 10000):
+            return _api_error("accuracy_m outside accepted range", 400, "INVALID_ACCURACY")
+    except (TypeError, ValueError):
+        return _api_error("invalid accuracy_m", 400, "INVALID_ACCURACY")
     telemetry = {
         "timestamp": body.get("timestamp") or body.get("ts"),
         "sequence": sequence,
-        "accuracy_m": body.get("accuracy_m", body.get("accuracy")),
+        "session_id": session_id,
+        "accuracy_m": accuracy_m,
         "speed_accuracy_mps": body.get("speed_accuracy_mps"),
         "bearing_accuracy_deg": body.get("bearing_accuracy_deg"),
         "elapsed_realtime_ms": body.get("elapsed_realtime_ms"),
         "is_mock": is_mock,
-        "integrity": "SIMULATION" if is_mock else ("SEQUENCED" if sequence is not None else "LEGACY_COMPAT"),
+        "integrity": "SIMULATION" if is_mock else ("VERIFIED" if sequence is not None and accuracy_m is not None else "LEGACY_COMPAT"),
         "received_at": datetime.utcnow().isoformat() + "Z",
     }
     raw = dict(body)
@@ -706,6 +900,8 @@ def secure_heartbeat():
                         speed_mps=speed_mps, bearing_deg=bearing, heading_deg=heading,
                         source=str(body.get("source") or "android")[:32], raw=json.dumps(raw))
         db.session.add(snap)
+        db.session.flush()
+        _cache_live_state(snap, accuracy_m=accuracy_m, sequence=sequence, session_id=session_id, source=body.get("source") or "android")
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
@@ -719,7 +915,7 @@ def secure_heartbeat():
 
     if time.time() - _last_cleanup_at >= CLEANUP_INTERVAL_S:
         try:
-            Snapshot.query.filter(Snapshot.ts < datetime.utcnow() - timedelta(seconds=CLEANUP_STALE_SECONDS)).delete(synchronize_session=False)
+            Snapshot.query.filter(Snapshot.ts < datetime.utcnow() - timedelta(seconds=SNAPSHOT_RETENTION_S)).delete(synchronize_session=False)
             db.session.commit()
             _last_cleanup_at = time.time()
         except Exception as exc:
@@ -787,6 +983,220 @@ app.view_functions["nearby"] = secure_nearby
 # Modern authority report / backup center
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Durable backup / restore subsystem
+# ---------------------------------------------------------------------------
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sqlite_integrity(path: Path) -> tuple[bool, str]:
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        ok = bool(result and str(result[0]).lower() == "ok")
+        return ok, str(result[0] if result else "no result")
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _make_sqlite_backup_file() -> Path:
+    src = _sqlite_path()
+    if not src or not src.exists():
+        raise RuntimeError("SQLite backend is not active or database file does not exist")
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    dest = BACKUP_DIR / f"beacon_{ts}.sqlite3"
+    source = target = None
+    try:
+        source = sqlite3.connect(str(src), timeout=15)
+        target = sqlite3.connect(str(dest), timeout=15)
+        source.backup(target)
+        target.execute("PRAGMA wal_checkpoint(FULL)")
+        target.commit()
+        ok, detail = _sqlite_integrity(dest)
+        if not ok:
+            raise RuntimeError(f"backup integrity check failed: {detail}")
+        return dest
+    finally:
+        if target is not None:
+            target.close()
+        if source is not None:
+            source.close()
+
+
+def _write_json_backup(path: Path) -> None:
+    path.write_bytes(generate_json_export_bytes())
+
+
+def _write_pdf_backup(path: Path) -> None:
+    path.write_bytes(generate_authority_pdf("backup", admin_sensitive=True))
+
+
+def _build_backup_archive() -> Path:
+    sqlite_file = _make_sqlite_backup_file() if _sqlite_path() else None
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    json_file = BACKUP_DIR / f"beacon_{ts}.json"
+    pdf_file = BACKUP_DIR / f"beacon_{ts}.pdf"
+    _write_json_backup(json_file)
+    _write_pdf_backup(pdf_file)
+    archive = BACKUP_DIR / f"beacon_full_{ts}.beaconbackup.zip"
+    manifest = {
+        "format": "beacon-backup-v2",
+        "product": "Beacon Road Safety & Coordination Platform",
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "database_backend": db.engine.url.get_backend_name(),
+        "files": [],
+    }
+    files = [(sqlite_file, "database.sqlite3"), (json_file, "data.json"), (pdf_file, "summary.pdf")]
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for source, name in files:
+            if source and source.exists():
+                zf.write(source, name)
+                manifest["files"].append({"name": name, "sha256": _sha256(source), "bytes": source.stat().st_size})
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+    _prune_backups()
+    return archive
+
+
+def _prune_backups():
+    files = sorted([p for p in BACKUP_DIR.iterdir() if p.is_file() and p.name != "incoming"], key=lambda p: p.stat().st_mtime, reverse=True)
+    keep = max(BACKUP_RETENTION_COUNT * 4, BACKUP_RETENTION_COUNT)
+    for path in files[keep:]:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+
+def _safe_zip_members(zf: zipfile.ZipFile) -> dict[str, str]:
+    selected = {}
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = Path(info.filename)
+        if name.is_absolute() or ".." in name.parts:
+            raise ValueError("backup archive contains unsafe path")
+        lower = name.name.lower()
+        suffix = name.suffix.lower()
+        if suffix in {".sqlite", ".sqlite3", ".db"} and "sqlite" not in selected:
+            selected["sqlite"] = info.filename
+        elif suffix == ".json" and lower != "manifest.json" and "json" not in selected:
+            selected["json"] = info.filename
+    return selected
+
+
+def _restore_sqlite_file(source: Path) -> dict[str, Any]:
+    target = _sqlite_path()
+    if not target:
+        raise RuntimeError("SQLite restore requires a SQLite database")
+    if not source.exists():
+        raise RuntimeError("backup file does not exist")
+    ok, detail = _sqlite_integrity(source)
+    if not ok:
+        raise RuntimeError(f"source database failed integrity check: {detail}")
+    with sqlite3.connect(str(source)) as conn:
+        tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    required = {"device", "snapshot"}
+    if not required.issubset(tables):
+        raise RuntimeError("backup is not a Beacon database (required tables missing)")
+
+    pre = _make_sqlite_backup_file() if target.exists() else None
+    tmp = target.with_suffix(target.suffix + ".restore-tmp")
+    legacy.db.session.remove()
+    legacy.db.engine.dispose()
+    try:
+        if tmp.exists():
+            tmp.unlink()
+        src_conn = sqlite3.connect(str(source), timeout=30)
+        dst_conn = sqlite3.connect(str(tmp), timeout=30)
+        try:
+            src_conn.backup(dst_conn)
+            dst_conn.commit()
+        finally:
+            dst_conn.close(); src_conn.close()
+        ok2, detail2 = _sqlite_integrity(tmp)
+        if not ok2:
+            raise RuntimeError(f"restored database failed verification: {detail2}")
+        # SQLite WAL/SHM sidecars belong to the database image. Never leave old
+        # sidecars beside a restored file, or SQLite could replay stale pages.
+        for sidecar in (Path(str(target) + "-wal"), Path(str(target) + "-shm"),
+                        Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")):
+            try:
+                if sidecar.exists(): sidecar.unlink()
+            except Exception: pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(tmp, target)
+        _clear_runtime_caches()
+        with app.app_context():
+            db.create_all()
+        return {"restored": True, "target": str(target), "pre_restore_backup": str(pre) if pre else None}
+    except Exception:
+        if tmp.exists():
+            try: tmp.unlink()
+            except Exception: pass
+        raise
+
+
+def _restore_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("not a Beacon JSON backup")
+    tables_payload = payload.get("tables")
+    if not isinstance(tables_payload, dict):
+        # Accept older/plain JSON exports shaped as {table_name: [rows...]}.
+        tables_payload = {k: v for k, v in payload.items() if isinstance(v, list)}
+    if not tables_payload:
+        raise RuntimeError("not a Beacon JSON backup")
+    aliases = {
+        "devices": "device", "snapshots": "snapshot", "roads": "road",
+        "overspeed_events": "overspeed_event", "overspeedevents": "overspeed_event",
+        "police_users": "police_user", "policeusers": "police_user",
+        "gk_users": "gk_user", "gkusers": "gk_user",
+        "watchlists": "watchlist", "plate_sightings": "plate_sighting",
+        "traffic_zones": "traffic_zone", "broadcast_messages": "broadcast_message",
+        "broadcast_deliveries": "broadcast_delivery", "admins": "admin",
+    }
+    restored = 0
+    skipped = 0
+    redacted_auth = {"admin", "police_user", "gk_user"}
+    for raw_table_name, rows in tables_payload.items():
+        table_name = aliases.get(str(raw_table_name).lower(), raw_table_name)
+        table = db.metadata.tables.get(table_name)
+        if table is None or not isinstance(rows, list):
+            continue
+        columns = {c.name: c for c in table.columns}
+        pks = [c.name for c in table.primary_key.columns]
+        for row in rows:
+            if not isinstance(row, dict):
+                skipped += 1; continue
+            if table_name in redacted_auth and row.get("password_hash") == "[redacted]":
+                skipped += 1; continue
+            values = {k: v for k, v in row.items() if k in columns and not (k == "password_hash" and v == "[redacted]")}
+            if not values:
+                skipped += 1; continue
+            try:
+                with db.session.begin_nested():
+                    existing = None
+                    if pks and all(values.get(k) is not None for k in pks):
+                        stmt = db.select(table).where(*[columns[k] == values[k] for k in pks]).limit(1)
+                        existing = db.session.execute(stmt).mappings().first()
+                    if existing:
+                        db.session.execute(table.update().where(*[columns[k] == values[k] for k in pks]).values(**{k:v for k,v in values.items() if k not in pks}))
+                    else:
+                        db.session.execute(table.insert().values(**values))
+                restored += 1
+            except Exception:
+                skipped += 1
+    db.session.commit()
+    return {"restored_rows": restored, "skipped_rows": skipped, "note": "JSON imports merge data; redacted password hashes are intentionally not restored."}
+
 def generate_json_export_bytes() -> bytes:
     data = {}
     for table in db.metadata.sorted_tables:
@@ -822,11 +1232,19 @@ def system_status() -> dict[str, Any]:
     with legacy.active_devices_lock:
         live_devices = len(legacy.active_devices)
     open_errors = SystemError.query.filter_by(resolved=False).count() if db_ok else None
+    sqlite_integrity = None
+    if db_ok and _db_is_sqlite():
+        path = _sqlite_path()
+        if path and path.exists():
+            ok_i, detail_i = _sqlite_integrity(path)
+            sqlite_integrity = {"ok": ok_i, "detail": detail_i}
+    with _live_cache_lock:
+        cache_count = len(_live_cache)
     return {
-        "ok": db_ok,
+        "ok": db_ok and (sqlite_integrity is None or sqlite_integrity.get("ok", False)),
         "time": datetime.utcnow().isoformat() + "Z",
-        "database": {"ok": db_ok, "backend": db.engine.url.get_backend_name(), "error": db_err},
-        "live": {"devices": live_devices, "connected_devices": connected_devices, "socket_connections": socket_connections},
+        "database": {"ok": db_ok, "backend": db.engine.url.get_backend_name(), "error": db_err, "sqlite_integrity": sqlite_integrity},
+        "live": {"devices": live_devices, "connected_devices": connected_devices, "socket_connections": socket_connections, "cache_entries": cache_count},
         "errors": {"open": open_errors},
         "vehicles": Device.query.count() if db_ok else None,
         "roads": Road.query.count() if db_ok else None,
@@ -921,7 +1339,7 @@ REPORTS_HTML = """
 <body><div class='wrap'><div class='top'><div><div style='font-size:12px;letter-spacing:.1em;color:#7dd3fc'>BEACON AUTHORITY</div><h1 style='margin:.1em 0'>Reports & Backups</h1><div class='muted'>Operational exports for briefings, records, diagnostics and recovery.</div></div><div class='nav'><a href='{{ home }}'>Dashboard</a><a href='{{ url_for("authority_reports") }}'>Reports</a>{% if role=='admin' %}<a href='{{ url_for("admin_errors") }}'>System errors</a>{% endif %}<a href='{{ url_for("admin_logout") }}'>Logout</a></div></div>
 <div class='grid'>
 <div class='card'><h2>PDF reports</h2><div class='muted'>Role-aware authority reports. Admin-only error details stay out of operational reports for police/GK.</div><div class='list'><a href='{{ url_for("authority_report_summary_pdf") }}'>System summary <span class='tag'>PDF</span></a><a href='{{ url_for("authority_report_incidents_pdf") }}'>Incidents & alerts <span class='tag'>PDF</span></a><a href='{{ url_for("authority_report_vehicles_pdf") }}'>Vehicle register <span class='tag'>PDF</span></a><a href='{{ url_for("authority_report_overspeeds_pdf") }}'>Overspeed events <span class='tag'>PDF</span></a>{% if role=='admin' %}<a href='{{ url_for("authority_report_errors_pdf") }}'>System errors <span class='tag'>PDF</span></a>{% endif %}<a href='{{ url_for("authority_report_backup_pdf") }}'>Backup snapshot <span class='tag'>PDF</span></a></div></div>
-<div class='card'><h2>Data backups</h2><div class='muted'>SQLite is the direct restore backup when this installation uses SQLite. JSON is a portable, redacted export.</div><div class='list'>{% if sqlite_available %}<a href='{{ url_for("admin_backup_sqlite") }}'>SQLite database <span class='tag'>.db</span></a>{% else %}<a href='#' onclick='return false' style='opacity:.5'>SQLite database unavailable — backend: {{ backend }}</a>{% endif %}<a href='{{ url_for("authority_backup_json") }}'>Operational data <span class='tag'>.json</span></a></div></div>
+<div class='card'><h2>Data backups</h2><div class='muted'>Operational exports are available to authority roles. Full database restore and bundled backups are administrator-only.</div><div class='list'>{% if role=='admin' %}<a href='{{ url_for("admin_backup_full") }}'>Full Beacon backup <span class='tag'>.zip</span></a><a href='{{ url_for("admin_backup_restore_page") }}'>Restore / manage backups</a>{% endif %}{% if sqlite_available %}<a href='{{ url_for("admin_backup_sqlite") if role=="admin" else "#" }}' {% if role!='admin' %}onclick='return false' style='opacity:.55'{% endif %}>SQLite snapshot <span class='tag'>.db</span></a>{% endif %}<a href='{{ url_for("authority_backup_json") }}'>Operational data <span class='tag'>.json</span></a></div></div></div></div>
 <div class='card'><h2>Road & legacy exports</h2><div class='muted'>Existing per-road exports remain available from the road monitoring area. New authority PDFs use the hardened report engine above.</div><div class='list'><a href='{{ url_for("admin_traffic") if role=="admin" else url_for("all_vehicles") }}'>Open vehicle / road monitoring</a>{% if role=='admin' %}<a href='{{ url_for("report_all_xlsx") }}'>Legacy full workbook <span class='tag'>XLSX</span></a>{% endif %}</div></div>
 </div></div></body></html>
 """
@@ -956,6 +1374,26 @@ def authority_report(kind):
         return _api_error("PDF generation failed", 500, "PDF_GENERATION_FAILED")
 
 
+def secure_pulse_receiver():
+    """Authenticated legacy ingestion alias that never bypasses hardened heartbeat checks."""
+    configured = os.environ.get("PULSE_TOKEN") or os.environ.get("ADMIN_API_TOKEN")
+    body = request.get_json(silent=True) or {}
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("token ") else None
+    presented = request.headers.get("X-Pulse-Token") or request.args.get("pulse_token") or token or body.get("pulse_token") or body.get("integration_token")
+    if not body:
+        return jsonify({"ok": True, "service": "pulse_receiver", "authenticated": False, "probe": True})
+    if configured:
+        try:
+            valid = bool(presented) and secrets.compare_digest(str(presented), str(configured))
+        except Exception:
+            valid = False
+        if not valid:
+            return _api_error("pulse authentication required", 401, "PULSE_AUTH_REQUIRED")
+    return secure_heartbeat()
+
+app.view_functions["pulse_receiver"] = secure_pulse_receiver
+
 # Named aliases used by the Reports HTML.
 @app.route("/authority/report/summary.pdf", endpoint="authority_report_summary_pdf")
 def authority_report_summary_pdf():
@@ -985,25 +1423,10 @@ def authority_report_backup_pdf():
 def admin_backup_sqlite():
     if _role() != "admin":
         abort(401, "Admin access required")
-    src = _sqlite_path()
-    if not src or not src.exists():
-        return _api_error("SQLite backup is unavailable for the configured database", 404, "SQLITE_BACKUP_UNAVAILABLE")
-    fd, dest = tempfile.mkstemp(prefix="beacon-sqlite-", suffix=".db")
-    os.close(fd)
     try:
-        source = sqlite3.connect(str(src))
-        target = sqlite3.connect(dest)
-        with target:
-            source.backup(target)
-        target.close(); source.close()
-        data = Path(dest).read_bytes()
-        os.unlink(dest)
-        return send_file(io.BytesIO(data), as_attachment=True,
-                         download_name=f"beacon_sqlite_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db",
-                         mimetype="application/x-sqlite3")
+        path = _make_sqlite_backup_file()
+        return send_file(path, as_attachment=True, download_name=path.name, mimetype="application/x-sqlite3")
     except Exception as exc:
-        try: os.unlink(dest)
-        except Exception: pass
         record_system_error(exc, source="backup:sqlite")
         return _api_error("SQLite backup failed", 500, "SQLITE_BACKUP_FAILED")
 
@@ -1019,6 +1442,98 @@ def admin_backup_json():
     except Exception as exc:
         record_system_error(exc, source="backup:json")
         return _api_error("JSON export failed", 500, "JSON_BACKUP_FAILED")
+
+
+@app.route("/admin/backup/full")
+def admin_backup_full():
+    if _role() != "admin":
+        abort(401, "Admin access required")
+    try:
+        archive = _build_backup_archive()
+        return send_file(archive, as_attachment=True, download_name=archive.name, mimetype="application/zip")
+    except Exception as exc:
+        record_system_error(exc, source="backup:full")
+        return _api_error("Full backup failed", 500, "FULL_BACKUP_FAILED")
+
+
+@app.route("/admin/backups")
+def admin_backups():
+    if _role() != "admin":
+        return _api_error("Admin access required", 401, "ADMIN_REQUIRED")
+    items = []
+    for p in sorted(BACKUP_DIR.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if p.is_file():
+            items.append({"name": p.name, "bytes": p.stat().st_size, "sha256": _sha256(p), "modified": datetime.utcfromtimestamp(p.stat().st_mtime).isoformat() + "Z"})
+    return jsonify({"directory": str(BACKUP_DIR), "backups": items[:200]})
+
+
+@app.route("/admin/backup/restore", methods=["POST"])
+def admin_backup_restore():
+    if _role() != "admin":
+        abort(401, "Admin access required")
+    upload = request.files.get("backup")
+    if upload is None or not upload.filename:
+        return _api_error("Select a .sqlite/.db/.json/.zip backup", 400, "BACKUP_FILE_REQUIRED")
+    original = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(upload.filename).name)
+    incoming = UPLOAD_DIR / f"{uuid.uuid4().hex}_{original}"
+    upload.save(incoming)
+    try:
+        suffix = incoming.suffix.lower()
+        if suffix in {".sqlite", ".sqlite3", ".db"}:
+            result = _restore_sqlite_file(incoming)
+        elif suffix == ".json":
+            payload = json.loads(incoming.read_text(encoding="utf-8"))
+            result = _restore_json_payload(payload)
+            result["mode"] = "merge"
+        elif suffix == ".zip" or incoming.name.lower().endswith(".beaconbackup.zip"):
+            with zipfile.ZipFile(incoming, "r") as zf:
+                selected = _safe_zip_members(zf)
+                if "sqlite" in selected:
+                    temp_source = UPLOAD_DIR / f"restore_{uuid.uuid4().hex}.sqlite3"
+                    with temp_source.open("wb") as fh:
+                        fh.write(zf.read(selected["sqlite"]))
+                    try:
+                        result = _restore_sqlite_file(temp_source)
+                        result["mode"] = "full"
+                    finally:
+                        try: temp_source.unlink()
+                        except Exception: pass
+                elif "json" in selected:
+                    payload = json.loads(zf.read(selected["json"]).decode("utf-8"))
+                    result = _restore_json_payload(payload)
+                    result["mode"] = "merge"
+                else:
+                    raise RuntimeError("backup archive has no database.sqlite3 or data.json")
+        else:
+            return _api_error("Unsupported backup file type", 400, "BACKUP_TYPE_UNSUPPORTED")
+        _prune_backups()
+        return jsonify({"ok": True, **result})
+    except Exception as exc:
+        record_system_error(exc, source="backup:restore", severity="ERROR")
+        return _api_error(str(exc), 400, "BACKUP_RESTORE_FAILED")
+    finally:
+        try: incoming.unlink()
+        except Exception: pass
+
+
+BACKUP_RESTORE_HTML = """
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Beacon — Backup & Restore</title>
+<style>body{font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,Arial;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1000px;margin:auto;padding:24px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:18px;padding:20px;margin-top:16px}.muted{color:#94a3b8;line-height:1.5}.btn{display:inline-block;background:#11698e;color:#fff;border:1px solid #1f8fb8;padding:11px 14px;border-radius:10px;font-weight:800;text-decoration:none;cursor:pointer}.warn{background:#3b2610;border-color:#8a5a13}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input[type=file]{width:100%;padding:14px;border:1px dashed #36556d;border-radius:12px;background:#081827;color:#cfe7f3;box-sizing:border-box}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;background:#081827;padding:12px;border-radius:10px;overflow:auto}</style></head>
+<body><div class='wrap'><div class='row'><a class='btn' href='{{ url_for("dashboard") }}'>Dashboard</a><a class='btn' href='{{ url_for("authority_reports") }}'>Reports</a><a class='btn' href='{{ url_for("admin_errors") }}'>System errors</a></div>
+<div class='card'><h1>Backup & Restore</h1><p class='muted'>Full backup bundles SQLite, JSON and PDF. SQLite/.db/.sqlite3 restores are full verified replacements and automatically create a pre-restore backup. JSON restores merge non-sensitive records and skip redacted credentials.</p>
+<div class='row'><a class='btn' href='{{ url_for("admin_backup_full") }}'>Create full backup</a><a class='btn' href='{{ url_for("admin_backup_sqlite") }}'>SQLite only</a><a class='btn' href='{{ url_for("admin_backup_json") }}'>JSON export</a><a class='btn' href='{{ url_for("authority_report_backup_pdf") }}'>PDF snapshot</a></div></div>
+<div class='card'><h2>Restore a backup</h2><form method='post' enctype='multipart/form-data' action='{{ url_for("admin_backup_restore") }}'><input type='file' name='backup' accept='.sqlite,.sqlite3,.db,.json,.zip' required><div class='row' style='margin-top:12px'><button class='btn warn' type='submit' onclick='return confirm("A verified SQLite restore will replace the current database after creating a pre-restore backup. Continue?")'>Validate & Restore</button></div></form><div id='msg' class='muted' style='margin-top:12px'></div></div>
+<div class='card'><h2>Saved backup files</h2><pre id='files' class='mono'>Loading…</pre></div>
+<script>async function load(){const r=await fetch('{{ url_for("admin_backups") }}',{cache:'no-store'});const j=await r.json();document.getElementById('files').textContent=(j.backups||[]).map(x=>x.name+'\n  '+x.bytes+' bytes\n  '+x.sha256).join('\n\n')||'No backups yet';}load();</script>
+</div></body></html>
+"""
+
+@app.route("/admin/backup-restore")
+def admin_backup_restore_page():
+    if _role() != "admin":
+        return redirect(url_for("admin_login", next=request.path))
+    return render_template_string(BACKUP_RESTORE_HTML)
 
 @app.route("/authority/backup/json", endpoint="authority_backup_json")
 def authority_backup_json():
@@ -1161,11 +1676,11 @@ app.view_functions["admin_admins"] = admin_users_v2
 # Police / GK live consoles
 # ---------------------------------------------------------------------------
 POLICE_HTML = """
-<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Police Operations</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.grid{display:grid;grid-template-columns:1.5fr .8fr;gap:14px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.feed{max-height:620px;overflow:auto;display:flex;flex-direction:column;gap:10px}.event{border:1px solid #29435a;background:#081827;border-radius:12px;padding:12px}.critical{border-color:#7f1d1d}.muted{color:#94a3b8}.tag{display:inline-block;padding:4px 7px;border-radius:999px;background:#173047;color:#bfe8ff;font-size:11px}.empty{text-align:center;padding:30px;color:#94a3b8}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON POLICE</div><h1>Police Operations</h1><div class='muted'>Live watchlist, LPR and safety event feed for the authenticated police session.</div></div><div class='nav'><a href='{{ url_for("all_vehicles") }}'>Vehicle search</a><a href='{{ url_for("authority_reports") }}'>Reports</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='grid'><div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operations</h2><span class='tag' id='authState'>Connecting…</span></div><div id='feed' class='feed'><div class='empty'>Waiting for live events…</div></div></div><div><div class='card'><h2>Session health</h2><p>Role: <strong>Police</strong></p><p>Live channel: <strong id='socket'>Connecting</strong></p><p>Platform: <strong id='health'>Checking</strong></p><a class='nav' style='display:inline-block;margin-top:8px' href='{{ url_for("authority_report_incidents_pdf") }}'>Download incident PDF</a></div><div class='card' style='margin-top:14px'><h2>What this console receives</h2><div class='muted'>Watchlist hits, plate sightings, overspeed events and server-inferred accident alerts. The channel uses the authenticated police session—no administrator API token is required.</div></div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(title,d,critical){if(feed.querySelector('.empty'))feed.innerHTML='';const e=document.createElement('div');e.className='event'+(critical?' critical':'');e.innerHTML='<strong>'+esc(title)+'</strong><div class="muted" style="margin-top:5px">'+esc(d.plate||d.watch_plate||d.device_id||'')+' · '+esc(d.ts||'')+'</div><div style="margin-top:7px">'+esc(d.watch_label||d.reason||'Operational event')+'</div>';feed.prepend(e);}s.on('connect',()=>{document.getElementById('socket').textContent='Connected';s.emit('police_auth_v2',{});});s.on('police_auth_ok_v2',()=>{document.getElementById('authState').textContent='Authorized';});s.on('police_auth_failed_v2',()=>{document.getElementById('authState').textContent='Denied';});s.on('disconnect',()=>{document.getElementById('socket').textContent='Disconnected';document.getElementById('authState').textContent='Disconnected';});s.on('watch_hit',d=>add('WATCHLIST HIT',d,true));s.on('plate_sighting',d=>add('PLATE SIGHTING',d,false));s.on('overspeed_alert',d=>add('OVERSPEED',d,false));s.on('accident_alert',d=>add('ACCIDENT ALERT',d,true));async function health(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('health').textContent=j.ok?'Healthy':'Degraded';}catch(e){document.getElementById('health').textContent='Unavailable';}}health();setInterval(health,5000);</script></body></html>
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Police Operations</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.grid{display:grid;grid-template-columns:1.5fr .8fr;gap:14px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.feed{max-height:620px;overflow:auto;display:flex;flex-direction:column;gap:10px}.event{border:1px solid #29435a;background:#081827;border-radius:12px;padding:12px}.critical{border-color:#7f1d1d}.muted{color:#94a3b8}.tag{display:inline-block;padding:4px 7px;border-radius:999px;background:#173047;color:#bfe8ff;font-size:11px}.empty{text-align:center;padding:30px;color:#94a3b8}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON POLICE</div><h1>Police Operations</h1><div class='muted'>Live watchlist, LPR and safety event feed for the authenticated police session.</div></div><div class='nav'><a href='{{ url_for("all_vehicles") }}'>Vehicle search</a><a href='{{ url_for("authority_reports") }}'>Reports</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='grid'><div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operations</h2><span class='tag' id='authState'>Connecting…</span></div><div id='feed' class='feed'><div class='empty'>Waiting for live events…</div></div></div><div><div class='card'><h2>Session health</h2><p>Role: <strong>Police</strong></p><p>Live channel: <strong id='socket'>Connecting</strong></p><p>Platform: <strong id='health'>Checking</strong></p><a class='nav' style='display:inline-block;margin-top:8px' href='{{ url_for("authority_report_incidents_pdf") }}'>Download incident PDF</a></div><div class='card' style='margin-top:14px'><h2>What this console receives</h2><div class='muted'>Watchlist hits, plate sightings, overspeed events and server-inferred accident alerts. The channel uses the authenticated police session—no administrator API token is required.</div></div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(title,d,critical){if(feed.querySelector('.empty'))feed.innerHTML='';const e=document.createElement('div');e.className='event'+(critical?' critical':'');e.innerHTML='<strong>'+esc(title)+'</strong><div class="muted" style="margin-top:5px">'+esc(d.plate||d.watch_plate||d.device_id||'')+' · '+esc(d.ts||'')+'</div><div style="margin-top:7px">'+esc(d.watch_label||d.reason||'Operational event')+'</div>';feed.prepend(e);}function reportClientError(message,stack){fetch('/authority/client-error',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,source:location.pathname,stack:stack||''})}).catch(()=>{});}window.addEventListener('error',e=>reportClientError(e.message||'window error',e.error?.stack));window.addEventListener('unhandledrejection',e=>reportClientError(String(e.reason||'unhandled promise rejection'),e.reason?.stack));s.on('connect',()=>{document.getElementById('socket').textContent='Connected';s.emit('police_auth_v2',{});});s.on('police_auth_ok_v2',()=>{document.getElementById('authState').textContent='Authorized';});s.on('police_auth_failed_v2',()=>{document.getElementById('authState').textContent='Denied';});s.on('disconnect',()=>{document.getElementById('socket').textContent='Disconnected';document.getElementById('authState').textContent='Disconnected';});s.on('watch_hit',d=>add('WATCHLIST HIT',d,true));s.on('plate_sighting',d=>add('PLATE SIGHTING',d,false));s.on('overspeed_alert',d=>add('OVERSPEED',d,false));s.on('accident_alert',d=>add('ACCIDENT ALERT',d,true));async function health(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('health').textContent=j.ok?'Healthy':'Degraded';}catch(e){document.getElementById('health').textContent='Unavailable';}}health();setInterval(health,5000);</script></body></html>
 """
 
 GK_HTML = """
-<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Command Center</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.k{font-size:11px;color:#8da5bb;text-transform:uppercase;letter-spacing:.1em}.v{font-size:27px;font-weight:900;margin-top:4px}.feed{margin-top:14px;display:flex;flex-direction:column;gap:9px;max-height:500px;overflow:auto}.event{padding:12px;background:#081827;border:1px solid #29435a;border-radius:12px}.muted{color:#94a3b8;line-height:1.5}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.cards{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON COMMAND</div><h1>GK / Command Center</h1><div class='muted'>System-wide situational view with authorized communications and reporting.</div></div><div class='nav'><a href='{{ url_for("authority_reports") }}'>Reports & backups</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='cards'><div class='card'><div class='k'>Live devices</div><div class='v' id='live'>—</div></div><div class='card'><div class='k'>Active incidents</div><div class='v' id='incidents'>—</div></div><div class='card'><div class='k'>Open system errors</div><div class='v' id='errors'>—</div></div><div class='card'><div class='k'>Database</div><div class='v' id='db'>—</div></div></div><div class='card' style='margin-top:14px'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operational feed</h2><a class='btn' href='{{ url_for("authority_report_incidents_pdf") }}'>Incident PDF</a></div><div id='feed' class='feed'><div class='muted'>Waiting for command events…</div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function add(t,d){if(feed.children.length===1&&feed.firstElementChild.classList.contains('muted'))feed.innerHTML='';const e=document.createElement('div');e.className='event';e.innerHTML='<strong>'+t+'</strong><div class="muted">'+(d.device_id||d.plate||'')+' · '+(d.ts||'')+'</div><div>'+ (d.reason||d.watch_label||'Operational event')+'</div>';feed.prepend(e);}s.on('connect',()=>s.emit('gk_auth_v2',{}));s.on('watch_hit',d=>add('WATCHLIST HIT',d));s.on('overspeed_alert',d=>add('OVERSPEED',d));s.on('accident_alert',d=>add('ACCIDENT ALERT',d));async function load(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('live').textContent=j.live?.devices??'—';document.getElementById('incidents').textContent=j.incidents??'—';document.getElementById('errors').textContent=j.errors?.open??'—';document.getElementById('db').textContent=j.database?.ok?'OK':'DOWN';}catch(e){}}load();setInterval(load,5000);</script></body></html>
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — Command Center</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0}.wrap{max-width:1320px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn{background:#11698e;color:#fff;text-decoration:none;border:1px solid #1f8fb8;padding:10px 13px;border-radius:10px;font-weight:800}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}.card{background:#0d1d2e;border:1px solid #20394f;border-radius:16px;padding:16px}.k{font-size:11px;color:#8da5bb;text-transform:uppercase;letter-spacing:.1em}.v{font-size:27px;font-weight:900;margin-top:4px}.feed{margin-top:14px;display:flex;flex-direction:column;gap:9px;max-height:500px;overflow:auto}.event{padding:12px;background:#081827;border:1px solid #29435a;border-radius:12px}.muted{color:#94a3b8;line-height:1.5}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.cards{grid-template-columns:1fr}}</style></head><body><div class='wrap'><div class='top'><div><div style='font-size:12px;color:#7dd3fc;letter-spacing:.1em'>BEACON COMMAND</div><h1>GK / Command Center</h1><div class='muted'>System-wide situational view with authorized communications and reporting.</div></div><div class='nav'><a href='{{ url_for("authority_reports") }}'>Reports & backups</a><a href='{{ url_for("admin_logout") }}'>Logout</a></div></div><div class='cards'><div class='card'><div class='k'>Live devices</div><div class='v' id='live'>—</div></div><div class='card'><div class='k'>Active incidents</div><div class='v' id='incidents'>—</div></div><div class='card'><div class='k'>Open system errors</div><div class='v' id='errors'>—</div></div><div class='card'><div class='k'>Database</div><div class='v' id='db'>—</div></div></div><div class='card' style='margin-top:14px'><div style='display:flex;justify-content:space-between;align-items:center'><h2>Live operational feed</h2><a class='btn' href='{{ url_for("authority_report_incidents_pdf") }}'>Incident PDF</a></div><div id='feed' class='feed'><div class='muted'>Waiting for command events…</div></div></div></div><script src='/socket.io/socket.io.js'></script><script>const s=io();const feed=document.getElementById('feed');function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));}function add(t,d){if(feed.children.length===1&&feed.firstElementChild.classList.contains('muted'))feed.innerHTML='';const e=document.createElement('div');e.className='event';e.innerHTML='<strong>'+esc(t)+'</strong><div class="muted">'+esc(d.device_id||d.plate||'')+' · '+esc(d.ts||'')+'</div><div>'+esc(d.reason||d.watch_label||'Operational event')+'</div>';feed.prepend(e);}function reportClientError(message,stack){fetch('/authority/client-error',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,source:location.pathname,stack:stack||''})}).catch(()=>{});}window.addEventListener('error',e=>reportClientError(e.message||'window error',e.error?.stack));window.addEventListener('unhandledrejection',e=>reportClientError(String(e.reason||'unhandled promise rejection'),e.reason?.stack));s.on('connect',()=>s.emit('gk_auth_v2',{}));s.on('watch_hit',d=>add('WATCHLIST HIT',d));s.on('overspeed_alert',d=>add('OVERSPEED',d));s.on('accident_alert',d=>add('ACCIDENT ALERT',d));async function load(){try{const r=await fetch('/authority/status',{cache:'no-store'});const j=await r.json();document.getElementById('live').textContent=j.live?.devices??'—';document.getElementById('incidents').textContent=j.incidents??'—';document.getElementById('errors').textContent=j.errors?.open??'—';document.getElementById('db').textContent=j.database?.ok?'OK':'DOWN';}catch(e){reportClientError(e.message,'health');}}load();setInterval(load,5000);</script></body></html>
 """
 
 
@@ -1337,14 +1852,39 @@ def _beacon_exception(exc):
     <!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Beacon — System Error</title><style>body{font-family:Inter,system-ui;background:#06111f;color:#e5eefb;margin:0;padding:30px}.card{max-width:760px;margin:auto;background:#0d1d2e;border:1px solid #29435a;border-radius:18px;padding:24px}a{color:#7dd3fc}</style></head><body><div class='card'><h1>Beacon recovered from a system error</h1><p>The operation failed safely and was logged.</p><p><strong>Request ID:</strong> {{ rid }}</p><p><a href='{{ url_for("index") }}'>Return to Beacon</a></p></div></body></html>
     """, rid=rid), 500
 
+@app.route("/healthz")
+def healthz():
+    try:
+        db.session.execute(db.text("SELECT 1"))
+        if _db_is_sqlite():
+            path = _sqlite_path()
+            if path and path.exists():
+                ok_i, detail_i = _sqlite_integrity(path)
+                if not ok_i:
+                    return jsonify({"ok": False, "service": "beacon-cloud", "error": detail_i}), 503
+        return jsonify({"ok": True, "service": "beacon-cloud", "version": BEACON_VERSION if "BEACON_VERSION" in globals() else "booting", "time": datetime.utcnow().isoformat() + "Z"})
+    except Exception as exc:
+        record_system_error(exc, source="healthz", severity="CRITICAL")
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+
+
 # ---------------------------------------------------------------------------
 # Final initialization and metadata
 # ---------------------------------------------------------------------------
 with app.app_context():
     db.create_all()
+    try:
+        if _db_is_sqlite():
+            with db.engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+                conn.exec_driver_sql("PRAGMA busy_timeout=10000")
+                conn.commit()
+    except Exception as exc:
+        record_system_error(exc, source="database:sqlite-pragmas", severity="WARNING")
 
 # Store a small version marker for status/reporting.
-BEACON_VERSION = "2026.09-repair"
+BEACON_VERSION = "2026.09.25-repair-v2"
 
 if __name__ == "__main__":
     legacy.socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG", "0") == "1")

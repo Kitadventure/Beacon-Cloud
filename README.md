@@ -22,12 +22,12 @@ Beacon is a real-time road-safety, vehicle-intelligence and incident-coordinatio
 ## First-time setup
 
 1. Copy `.env.example` to your deployment environment.
-2. Set a strong `FLASK_SECRET`. The server refuses a production start without it.
-3. Install dependencies with Python 3.11+.
+2. Set a strong `FLASK_SECRET` for stable sessions. When it is omitted, Beacon generates a durable random secret under its data directory; a persistent Render disk is therefore important.
+3. Install dependencies with Python 3.13+ and use the supplied Render/Python configuration.
 4. Start the service with the Procfile command or `python app.py` for local development.
 5. Visit `/register` once to create the first administrator. Public registration closes after the first admin exists.
 6. From Access Management, create Police and GK/Command accounts.
-7. Provision devices through an authenticated `/onboard` request and keep the returned device token private.
+7. For demos, public device enrollment/recovery is enabled by default; for a controlled deployment set `PUBLIC_ENROLLMENT=0` and provide `ENROLLMENT_KEY`. Keep every returned device token private.
 
 ## Authority screens
 
@@ -56,4 +56,4 @@ The new entrypoint is intentionally a compatibility wrapper so an existing Beaco
 
 ## Verification in this distribution
 
-The repaired Python entrypoint and preserved legacy source are syntax-checked with `py_compile`. Full runtime/integration testing requires the declared Python dependencies and a configured database/server environment. The supplied Android archive did not contain its original `app/src` source tree, so the mobile ZIP contains a clean protocol-compatible source reconstruction and cannot be honestly described as byte-for-byte recovery of unavailable source.
+The repaired Python entrypoint and preserved legacy source are syntax-checked with `py_compile`; the supplied backup verifier is also included. Full runtime/integration testing requires the declared Python dependencies and a configured database/server environment. The supplied `app.zip` did contain the original Overtaking Assistant source, mixed together with an unrelated RealMart module, so the mobile ZIP now contains the recovered Overtaking source as a clean standalone Android project and excludes the unrelated RealMart build.

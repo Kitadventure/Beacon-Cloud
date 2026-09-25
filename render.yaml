@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: beacon-cloud
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 --worker-class gthread --threads 50 app:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    disk:
+      name: beacon-data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: BEACON_DATA_DIR
+        value: /var/data
+      - key: BEACON_BACKUP_DIR
+        value: /var/data/backups
+      - key: PUBLIC_ENROLLMENT
+        value: "1"
+      - key: SESSION_COOKIE_SECURE
+        value: "1"
+      - key: FLASK_DEBUG
+        value: "0"

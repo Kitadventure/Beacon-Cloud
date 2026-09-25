@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parent
 app = (ROOT / 'app.py').read_text()
 legacy = (ROOT / 'app_legacy.py').read_text()
 checks = {
-    'secure secret requirement': 'must be configured' in app and 'dev-secret-change-me' not in app,
+    'secure secret requirement': 'FLASK_SECRET' in app and 'secrets.token_urlsafe' in app and 'dev-secret-change-me' not in app,
     'no bootstrap default': 'ChangeMeTemp@123' not in app and 'ChangeMeTemp@123' not in legacy,
     'police role socket': 'police_auth_v2' in app and 'session.get("auth_role")' in app,
     'gk role socket': 'gk_auth_v2' in app,

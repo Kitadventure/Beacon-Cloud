@@ -24,6 +24,7 @@ import json
 import time
 from collections import defaultdict
 import io
+from pathlib import Path
 
 from flask import (
     Flask, request, jsonify, render_template_string, abort,
@@ -56,7 +57,10 @@ except Exception:
 # -------------------------
 # Configuration (tunable)
 # -------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///beacon.db")
+_default_data_dir = Path(os.environ.get("BEACON_DATA_DIR") or ("/var/data" if Path("/var/data").is_dir() else str(Path(__file__).resolve().parent / "data")))
+_default_data_dir.mkdir(parents=True, exist_ok=True)
+_default_sqlite_path = _default_data_dir / "beacon.db"
+DATABASE_URL = os.environ.get("DATABASE_URL") or f"sqlite:///{_default_sqlite_path.as_posix()}"
 CLEANUP_STALE_SECONDS = int(os.environ.get("CLEANUP_STALE_SECONDS", "12"))  # remove snapshots older than this
 NEARBY_DEFAULT_RADIUS_M = float(os.environ.get("NEARBY_DEFAULT_RADIUS_M", "1000"))  # 1 km default per your spec
 HEARTBEAT_MIN_INTERVAL_S = float(os.environ.get("HEARTBEAT_MIN_INTERVAL_S", "0.5"))  # basic rate-limit
@@ -183,6 +187,14 @@ class TrafficZone(db.Model):
     radius_m = db.Column(db.Float, nullable=True)
     notes = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Watchlist(db.Model):
+    __tablename__ = "watchlist"
+    id = db.Column(db.String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+    plate = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    label = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
 
 class BootstrapState(db.Model):
@@ -1320,8 +1332,25 @@ def heartbeat():
 
 @app.route("/pulse_receiver", methods=["POST"])
 def pulse_receiver():
-    # Backward-compatible alias for older clients that still post here.
-    return heartbeat()
+    # Legacy compatibility endpoint. It accepts only a configured integration token
+    # and then delegates to the hardened /heartbeat pipeline in app.py.
+    configured = os.environ.get("PULSE_TOKEN") or os.environ.get("ADMIN_API_TOKEN")
+    body = request.get_json(silent=True) or {}
+    auth_header = request.headers.get("Authorization", "")
+    bearer = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("token ") else None
+    presented = (
+        request.headers.get("X-Pulse-Token")
+        or request.args.get("pulse_token")
+        or bearer
+        or body.get("pulse_token")
+        or body.get("integration_token")
+    )
+    if configured and presented and secrets.compare_digest(str(presented), str(configured)):
+        # app.py replaces this endpoint at import time with secure_pulse_receiver.
+        return heartbeat()
+    if not body:
+        return jsonify({"ok": True, "service": "pulse_receiver", "authenticated": False, "probe": True})
+    return jsonify({"ok": False, "error": "pulse authentication required", "code": "PULSE_AUTH_REQUIRED"}), 401
 
 # -------------------------
 # Nearby & compute_for_device functions (unchanged)
@@ -1800,7 +1829,7 @@ DASHBOARD_HTML = """
     if (currentTileLayer) map.removeLayer(currentTileLayer);
     currentTileLayer = tileLayers[key];
     currentTileLayer.addTo(map);
-    mapStyle.value = key;
+    if (mapStyle) mapStyle.value = key;
     localStorage.setItem('allVehiclesMapStyle', key);
   }
   let marker = null;
